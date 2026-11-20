@@ -396,4 +396,54 @@ std::span<const std::byte> GgufFile::tensor_data(
                          static_cast<std::size_t>(info.nbytes));
 }
 
+std::string_view tensor_type_name(TensorType t) {
+    switch (t) {
+        case TensorType::kF32: return "f32";
+        case TensorType::kF16: return "f16";
+        case TensorType::kBF16: return "bf16";
+        case TensorType::kQ4_0: return "q4_0";
+        case TensorType::kQ4_1: return "q4_1";
+        case TensorType::kQ5_0: return "q5_0";
+        case TensorType::kQ5_1: return "q5_1";
+        case TensorType::kQ8_0: return "q8_0";
+        case TensorType::kQ8_1: return "q8_1";
+        case TensorType::kQ2_K: return "q2_k";
+        case TensorType::kQ3_K: return "q3_k";
+        case TensorType::kQ4_K: return "q4_k";
+        case TensorType::kQ5_K: return "q5_k";
+        case TensorType::kQ6_K: return "q6_k";
+        case TensorType::kQ8_K: return "q8_k";
+        case TensorType::kIQ2_XXS: return "iq2_xxs";
+        case TensorType::kIQ2_XS: return "iq2_xs";
+        case TensorType::kIQ3_XXS: return "iq3_xxs";
+        case TensorType::kIQ1_S: return "iq1_s";
+        case TensorType::kIQ4_NL: return "iq4_nl";
+        case TensorType::kIQ3_S: return "iq3_s";
+        case TensorType::kIQ2_S: return "iq2_s";
+        case TensorType::kIQ4_XS: return "iq4_xs";
+        case TensorType::kIQ1_M: return "iq1_m";
+        case TensorType::kTQ1_0: return "tq1_0";
+        case TensorType::kTQ2_0: return "tq2_0";
+    }
+    return "unknown";
+}
+
+TensorType main_tensor_type(const GgufFile& g) {
+    std::map<TensorType, std::uint64_t> bytes;
+    g.for_each_file([&](const GgufFile& f) {
+        for (const TensorInfo& t : f.tensors()) {
+            bytes[t.type] += t.nbytes;
+        }
+    });
+    TensorType best = TensorType::kF32;
+    std::uint64_t most = 0;
+    for (const auto& [type, n] : bytes) {
+        if (n > most) {
+            best = type;
+            most = n;
+        }
+    }
+    return best;
+}
+
 }  // namespace locus::gguf

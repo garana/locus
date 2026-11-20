@@ -18,6 +18,7 @@
 #include "locus/server/engine_group.hpp"
 #include "locus/server/engine_loop.hpp"
 #include "locus/server/gen_reply.hpp"
+#include "locus/server/model_headers.hpp"
 #include "locus/tok/tokenizer.hpp"
 #include "locus/video/ffmpeg.hpp"
 
@@ -276,6 +277,12 @@ class OpenAiServer {
     /** Builds the dispatch + auth-head handlers into route_handler_ /
      * auth_head_ (called once, from the ctor). */
     void install_routes();
+    /** Fills the *_headers_ below from the loaded models' GGUFs (called
+     * once, from the ctor, after every model is loaded). */
+    void build_model_headers();
+    /** Sets X-Model and X-Model-Files from h; nothing when h is empty. */
+    static void set_model_headers(http::ServerResponse& res,
+                                  const ModelHeaders& h);
     /** Constructs http_ bound to host:port and starts it; @returns the
      * bound port (>0) or -1. */
     int build_and_start(const std::string& host, int port);
@@ -437,6 +444,13 @@ class OpenAiServer {
     std::unique_ptr<gguf::GgufFile> qwen_vision_gguf_;
     std::unique_ptr<image::QwenVision> qwen_vision_;
     std::mutex vision_mu_;
+
+    // X-Model and X-Model-Files (i#1107) for each kind of reply: the
+    // chat model (with the mmproj), embeddings, rerank, classify,
+    // speech, Janus images, the --image-model pipeline and video.
+    ModelHeaders text_headers_, embed_headers_, rerank_headers_,
+        classify_headers_, audio_headers_, janus_headers_, image_headers_,
+        video_headers_;
     std::unique_ptr<kv::PagedKvCache> vision_cache_;
     model::TransformerModel::Workspace vision_ws_;
 };

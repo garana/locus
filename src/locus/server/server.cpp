@@ -1367,6 +1367,7 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         qwen_vision_ = std::move(v);
         qwen_vision_gguf_ = std::move(vg);
     }
+    build_model_headers();
     // Hardware names for /metrics (i#285), read once here: the GPU
     // names take the GPU lock, which a scrape must never wait on. Only
     // devices this server uses: the language model's GPU backend, and
@@ -1393,6 +1394,60 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         devices_.push_back({"vulkan", backend::vulkan_device_name()});
     }
     install_routes();
+}
+
+void OpenAiServer::build_model_headers() {
+    // The X-Model token of a GGUF: its general.architecture.
+    const auto arch_of = [](const std::string& path) {
+        const auto g = gguf::GgufFile::open(path);
+        return std::string(g.get_string("general.architecture").value_or(""));
+    };
+    if (!opt_.model_path.empty()) {
+        std::vector<std::string> files{opt_.model_path};
+        if (qwen_vision_) files.push_back(opt_.mmproj_path);
+        text_headers_ = model_headers(arch_of(opt_.model_path), files);
+        if (snac_) {
+            audio_headers_ = model_headers(
+                text_headers_.model,
+                std::vector<std::string>{opt_.model_path,
+                                         opt_.audio_decoder_path});
+        }
+        if (janus_) {
+            janus_headers_ = model_headers(
+                "janus-pro",
+                std::vector<std::string>{opt_.model_path,
+                                         opt_.image_decoder_path});
+        }
+    }
+    for (auto [path, out] :
+         {std::pair{&opt_.embedding_model_path, &embed_headers_},
+          std::pair{&opt_.rerank_model_path, &rerank_headers_},
+          std::pair{&opt_.image_classifier_path, &classify_headers_}}) {
+        if (!path->empty()) {
+            *out = model_headers(arch_of(*path),
+                                 std::vector<std::string>{*path});
+        }
+    }
+    if (!opt_.image_model_dir.empty()) {
+        const std::string token =
+            qwen_edit_    ? "qwen-image-edit"
+            : qwen_image_ ? "qwen-image"
+            : flux_       ? (flux_->may_edit() ? "flux-kontext" : "flux")
+                          : "pixart";
+        image_headers_ =
+            model_headers(token, gguf_files_in(opt_.image_model_dir));
+    }
+    if (!opt_.video_model_dir.empty()) {
+        video_headers_ =
+            model_headers("ltx-video", gguf_files_in(opt_.video_model_dir));
+    }
+}
+
+void OpenAiServer::set_model_headers(http::ServerResponse& res,
+                                     const ModelHeaders& h) {
+    if (h.model.empty() && h.files.empty()) return;
+    res.set_header("X-Model", h.model);
+    res.set_header("X-Model-Files", h.files);
 }
 
 std::vector<std::pair<std::string, std::string>> OpenAiServer::engines()
@@ -3075,6 +3130,7 @@ void OpenAiServer::install_routes() {
                                         {"index", i},
                                         {"embedding", std::move(e)}});
                     }
+                    set_model_headers(res, classify_headers_);
                     res.set_content(
                         json{{"object", "list"},
                              {"data", data},
@@ -3098,6 +3154,7 @@ void OpenAiServer::install_routes() {
                              {"index", i},
                              {"embedding", embed_text(inputs[i])}});
                     }
+                    set_model_headers(res, text_headers_);
                     res.set_content(
                         json{{"object", "list"},
                              {"data", data},
@@ -3119,6 +3176,7 @@ void OpenAiServer::install_routes() {
                                     {"index", i},
                                     {"embedding", std::move(vectors[i])}});
                 }
+                set_model_headers(res, embed_headers_);
                 res.set_content(
                     json{{"object", "list"},
                          {"data", data},
@@ -3683,6 +3741,7 @@ void OpenAiServer::install_routes() {
                 }
                 const auto png = image::encode_png(rgb, side, side);
                 res.set_header("X-Image-Seed", std::to_string(p.seed));
+                set_model_headers(res, image_headers_);
                 res.set_header(
                     "Server-Timing",
                     "encode;dur=" + std::to_string(took.encode) +
@@ -3825,6 +3884,10 @@ void OpenAiServer::install_routes() {
                 }
                 const auto png = image::encode_png(rgb, p.width, p.height);
                 res.set_header("X-Image-Seed", std::to_string(p.seed));
+                set_model_headers(res, image_headers_);
+                if (!picks.empty()) {
+                    res.set_header("X-Image-Lora", lora_header(picks));
+                }
                 res.set_header(
                     "Server-Timing",
                     "encode;dur=" + std::to_string(took.encode) +
@@ -3915,6 +3978,7 @@ void OpenAiServer::install_routes() {
             }
             const auto png = image::encode_png(rgb, w, h);
             res.set_header("X-Image-Seed", std::to_string(p.seed));
+            set_model_headers(res, image_headers_);
             res.set_header("Server-Timing",
                            "encode;dur=" + std::to_string(took.encode) +
                                ", denoise;dur=" +
@@ -4057,6 +4121,7 @@ void OpenAiServer::install_routes() {
                 // The seed actually used, so any image can be replayed;
                 // and where the time went (codes, then pixels).
                 res.set_header("X-Image-Seed", std::to_string(p.seed));
+                set_model_headers(res, janus_headers_);
                 res.set_header("Server-Timing", "generate;dur=" +
                                                     ms(t0, t1) +
                                                     ", decode;dur=" +
@@ -4302,6 +4367,7 @@ void OpenAiServer::install_routes() {
             }
             const auto png = image::encode_png(rgb, w, h);
             res.set_header("X-Image-Seed", std::to_string(p.seed));
+            set_model_headers(res, image_headers_);
             res.set_header("Server-Timing",
                            "encode;dur=" + std::to_string(took.encode) +
                                ", denoise;dur=" +
@@ -4611,6 +4677,32 @@ void OpenAiServer::install_routes() {
                       handle_video_by_id, handle_video_content](
                          const http::Request& req, http::ServerResponse& res,
                          const http::RequestContext& ctx) {
+        // Which models answer (i#1107). The embeddings and image handlers
+        // set their own: the request's model picks which one runs.
+        switch (route_of(req.method, req.path)) {
+            case Route::kCompletions:
+            case Route::kChat:
+            case Route::kMessages:
+            case Route::kResponses:
+                set_model_headers(res, text_headers_);
+                break;
+            case Route::kRerank:
+                set_model_headers(res, rerank_headers_);
+                break;
+            case Route::kClassify:
+                set_model_headers(res, classify_headers_);
+                break;
+            case Route::kAudioSpeech:
+                set_model_headers(res, audio_headers_);
+                break;
+            case Route::kVideos:
+            case Route::kVideoById:
+            case Route::kVideoContent:
+                set_model_headers(res, video_headers_);
+                break;
+            default:
+                break;
+        }
         switch (route_of(req.method, req.path)) {
             case Route::kHealth:      handle_health(req, res); break;
             case Route::kModels:      handle_models(req, res); break;
