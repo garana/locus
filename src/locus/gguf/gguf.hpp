@@ -38,33 +38,101 @@ enum class ValueType : std::uint32_t {
     kFloat64 = 12,
 };
 
-/** ggml tensor data type ids (subset locus can size-check). */
+/**
+ * ggml tensor data type ids (subset locus can size-check).
+ *
+ * A quantized type stores the weights in blocks. Each block holds a
+ * few scales (and sometimes a minimum) plus one small integer code per
+ * weight; a weight is rebuilt as scale * code, or scale * code - min.
+ * "bpw" below is the bits per weight, scales included: block bytes * 8
+ * / block weights. d is the block scale, m the block minimum.
+ *
+ * The name says the family:
+ * - Qn_0: blocks of 32 weights, an f16 d, n-bit codes centered on
+ *   zero (weight = d * code).
+ * - Qn_1: as Qn_0, plus an f16 m (weight = d * code + m).
+ * - Qn_K ("k-quants"): super-blocks of 256 weights cut into sub-blocks
+ *   of 16 or 32; each sub-block has its own small scale (and min),
+ *   themselves scaled by an f16 d (and dmin) of the super-block.
+ * - IQn ("i-quants"): super-blocks of 256 (IQ4_NL: blocks of 32);
+ *   groups of 4 or 8 weights share one index into a fixed table of
+ *   value patterns, plus sign bits; 1.5625 to 4.5 bpw. _XXS, _XS, _S
+ *   and _M name variants of one width, from fewest to most bits.
+ * - TQn_0: ternary weights (each -1, 0 or +1, times d), for BitNet
+ *   b1.58 models.
+ *
+ * A file named after a recipe (Q4_K_M, Q5_K_S) mixes several of these
+ * types, chosen per tensor.
+ */
 enum class TensorType : std::uint32_t {
+    /** IEEE 754 32-bit float; 32 bpw, no loss. */
     kF32 = 0,
+    /** IEEE 754 16-bit float; 16 bpw. */
     kF16 = 1,
+    /** 4-bit codes, weight = d * (code - 8); 4.5 bpw. */
     kQ4_0 = 2,
+    /** 4-bit codes, weight = d * code + m; 5 bpw. locus does not
+     *  compute with it. */
     kQ4_1 = 3,
+    /** 5-bit codes, weight = d * (code - 16); 5.5 bpw. */
     kQ5_0 = 6,
+    /** 5-bit codes, weight = d * code + m; 6 bpw. locus does not
+     *  compute with it. */
     kQ5_1 = 7,
+    /** 8-bit signed codes, weight = d * code; 8.5 bpw. */
     kQ8_0 = 8,
+    /** Q8_0 plus the block's sum; 9 bpw. ggml uses it for
+     *  activations; locus does not compute with it. */
     kQ8_1 = 9,
+    /** 2-bit codes; 16 sub-blocks of 16 weights, each with a 4-bit
+     *  scale and a 4-bit min; 2.625 bpw. */
     kQ2_K = 10,
+    /** 3-bit codes; 16 sub-blocks of 16 weights with 6-bit scales;
+     *  3.4375 bpw. */
     kQ3_K = 11,
+    /** 4-bit codes; 8 sub-blocks of 32 weights, each with a 6-bit
+     *  scale and a 6-bit min; 4.5 bpw. */
     kQ4_K = 12,
+    /** 5-bit codes, sub-blocks as Q4_K; 5.5 bpw. */
     kQ5_K = 13,
+    /** 6-bit codes; 16 sub-blocks of 16 weights with 8-bit scales;
+     *  6.5625 bpw. */
     kQ6_K = 14,
+    /** 8-bit codes, an f32 d and the sum of each 16 codes; 9.125 bpw.
+     *  locus quantizes activations to it for k-quant dot products. */
     kQ8_K = 15,
+    /** 8 weights per index into a 256-entry table, a 4-bit scale per
+     *  32 weights; 2.0625 bpw. */
     kIQ2_XXS = 16,
+    /** 8 weights per index into a 512-entry table, a 4-bit scale per
+     *  16 weights; 2.3125 bpw. */
     kIQ2_XS = 17,
+    /** 4 weights per index into a 256-entry table, a 4-bit scale per
+     *  32 weights; 3.0625 bpw. */
     kIQ3_XXS = 18,
+    /** 8 weights (each -1, 0 or +1, plus a shift) per index into a
+     *  2048-entry table, a 3-bit scale per 32 weights; 1.5625 bpw. */
     kIQ1_S = 19,
+    /** Blocks of 32: 4-bit codes mapped through a fixed table of 16
+     *  unevenly spaced values ("non-linear"), times an f16 d; 4.5 bpw. */
     kIQ4_NL = 20,
+    /** 4 weights per index into a 512-entry table, a 4-bit scale per
+     *  32 weights; 3.4375 bpw. */
     kIQ3_S = 21,
+    /** 8 weights per index into a 1024-entry table, a 4-bit scale per
+     *  16 weights; 2.5625 bpw. */
     kIQ2_S = 22,
+    /** IQ4_NL's 16-value table in super-blocks of 256, a 6-bit scale
+     *  per 32 weights; 4.25 bpw. */
     kIQ4_XS = 23,
+    /** IQ1_S's table, a 3-bit scale per 16 weights; 1.75 bpw. */
     kIQ1_M = 29,
+    /** bfloat16: the top 16 bits of an f32 (same range, fewer digits);
+     *  16 bpw. */
     kBF16 = 30,
+    /** Ternary, 5 weights packed per byte in base 3; 1.6875 bpw. */
     kTQ1_0 = 34,
+    /** Ternary, 2 bits per weight; 2.0625 bpw. */
     kTQ2_0 = 35,
 };
 
