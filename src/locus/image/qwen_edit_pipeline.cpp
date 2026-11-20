@@ -40,6 +40,7 @@ std::unique_ptr<QwenEditPipeline> QwenEditPipeline::load_dir(
     }
     std::sort(paths.begin(), paths.end());
     std::vector<std::unique_ptr<gguf::GgufFile>> files;
+    std::vector<std::string> used;
     const gguf::GgufFile *lm = nullptr, *vision = nullptr, *dit = nullptr,
                          *vae = nullptr;
     for (const auto& path : paths) {
@@ -64,6 +65,7 @@ std::unique_ptr<QwenEditPipeline> QwenEditPipeline::load_dir(
         }
         *slot = g.get();
         files.push_back(std::move(g));
+        used.push_back(path.string());
     }
     if (lm == nullptr || vision == nullptr || dit == nullptr ||
         vae == nullptr) {
@@ -73,6 +75,7 @@ std::unique_ptr<QwenEditPipeline> QwenEditPipeline::load_dir(
     }
     auto p = from_parts(*lm, *vision, *dit, *vae, *lm);
     p->files_ = std::move(files);
+    p->paths_ = std::move(used);
     return p;
 }
 

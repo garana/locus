@@ -131,7 +131,13 @@ TEST_CASE("pixart pipeline draws the reference image",
     for (const char* p : parts) {
         fs::create_symlink(fs::absolute(models / p), d / p);
     }
+    // A GGUF of another kind in the folder is skipped, and not listed.
+    fs::copy_file(kDir + "golden/flux_synth.gguf", d / "zz-other.gguf");
     const auto pipe = PixArtPipeline::load_dir(d.string());
+    REQUIRE(pipe->file_paths().size() == 3);
+    for (const std::string& p : pipe->file_paths()) {
+        REQUIRE(fs::path(p).filename() != "zz-other.gguf");
+    }
     REQUIRE(pipe->image_size() == 512);
     REQUIRE(pipe->default_guidance() == 4.5f);
     PixArtPipeline::Request req;

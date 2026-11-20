@@ -3,7 +3,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "locus/gguf/gguf.hpp"
 #include "locus/image/lora.hpp"
@@ -33,6 +32,13 @@ struct ModelHeaders {
 std::string sf_string(std::string_view s);
 
 /**
+ * @param s The text.
+ * @returns Whether s is a structured field token (RFC 8941): a letter
+ *     or "*", then letters, digits and !#$%&'*+-.^_`|~:/ only.
+ */
+bool is_sf_token(std::string_view s);
+
+/**
  * One item of the X-Model-Files header: the file name, quoted, then
  * `name` (general.name), `version` (general.version, else the first 12
  * hex digits of general.source.revision) when the GGUF has them, and
@@ -51,19 +57,14 @@ std::string model_file_item(std::string_view file, const gguf::GgufFile& g);
  * Builds the headers of a reply from the GGUFs it uses. Reads only the
  * files' metadata and tensor tables (they are mapped, not read).
  *
- * @param model The X-Model token.
+ * @param model The X-Model token; left empty (so the reply has no
+ *     X-Model) when it is not an is_sf_token, as a GGUF's architecture
+ *     with a CR or LF would break the header.
  * @param paths The GGUF paths, in the order to list them.
  * @returns The headers.
  */
 ModelHeaders model_headers(std::string model,
                            std::span<const std::string> paths);
-
-/**
- * @param dir A model directory.
- * @returns Its "*.gguf" files, sorted by name, so the header lists
- *     them in a stable order.
- */
-std::vector<std::string> gguf_files_in(const std::string& dir);
 
 /**
  * The X-Image-Lora header of a FLUX reply: each LoRA's name, quoted,

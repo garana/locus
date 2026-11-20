@@ -12,7 +12,7 @@
 
 using locus::gguf::GgufFile;
 using locus::gguf::TensorType;
-using locus::server::gguf_files_in;
+using locus::server::is_sf_token;
 using locus::server::lora_header;
 using locus::server::model_file_item;
 using locus::server::model_headers;
@@ -107,22 +107,38 @@ TEST_CASE("a model file item names the file and its type",
     }
 }
 
-TEST_CASE("model headers list a folder's GGUFs by name", "[model_headers]") {
+TEST_CASE("model headers list the given GGUFs in order", "[model_headers]") {
     const auto dir = std::filesystem::temp_directory_path() /
                      "locus-model-headers-test";
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     write_file(dir / "b-vae.gguf", mixed_gguf({{"general.name", "vae"}}));
     write_file(dir / "a-dit.gguf", mixed_gguf({{"general.name", "dit"}}));
-    write_file(dir / "notes.txt", {});
-    const auto files = gguf_files_in(dir.string());
-    REQUIRE(files.size() == 2);
+    const std::vector<std::string> files{(dir / "a-dit.gguf").string(),
+                                         (dir / "b-vae.gguf").string()};
     const auto h = model_headers("qwen-image", files);
     CHECK(h.model == "qwen-image");
     CHECK(h.files ==
           "\"a-dit.gguf\";name=\"dit\";type=q4_k, "
           "\"b-vae.gguf\";name=\"vae\";type=q4_k");
+    // An architecture that is not a token leaves X-Model out; the
+    // files are still listed.
+    const auto bad = model_headers("llama\r\nX-Evil: 1", files);
+    CHECK(bad.model.empty());
+    CHECK(bad.files == h.files);
+    CHECK(model_headers("", files).model.empty());
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("structured field tokens", "[model_headers]") {
+    for (const char* ok : {"llama", "qwen2vl", "t5encoder", "autoencoder_kl",
+                           "qwen-image-edit", "*x", "a:b/c.d"}) {
+        CHECK(is_sf_token(ok));
+    }
+    for (const char* no : {"", "2llama", "-x", "a b", "a\"b", "a,b", "a;b",
+                           "a\r\nb", "caf\xc3\xa9"}) {
+        CHECK_FALSE(is_sf_token(no));
+    }
 }
 
 TEST_CASE("the LoRA header lists each name and scale", "[model_headers]") {

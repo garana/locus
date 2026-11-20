@@ -95,6 +95,7 @@ std::unique_ptr<FluxPipeline> FluxPipeline::load_dir(const std::string& dir) {
         }
         *slot = g.get();
         p->files_.push_back(std::move(g));
+        p->paths_.push_back(path.string());
     }
     if (t5 == nullptr || clip == nullptr || dit == nullptr || vae == nullptr) {
         throw gguf::Error("flux: " + dir +
