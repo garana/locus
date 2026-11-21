@@ -39,11 +39,15 @@ struct ChatTurn {
  * @param system The system prompt (kJanusSystemPrompt by default in
  *     the reference); empty for none.
  * @param eos The end-of-sentence token's text.
+ * @param content When set, receives the ranges of the client's text
+ *     (the system prompt and the turns, less the image placeholders),
+ *     for janus_chat_ids.
  * @throws std::invalid_argument on an unknown role, no turns, or a
  *     last turn that is not the user's.
  */
 std::string janus_chat_text(std::span<const ChatTurn> turns,
-                            std::string_view system, std::string_view eos);
+                            std::string_view system, std::string_view eos,
+                            std::vector<tok::TextRange>* content = nullptr);
 
 /**
  * Tokenizes the prompt text (with BOS) and expands each
@@ -51,11 +55,12 @@ std::string janus_chat_text(std::span<const ChatTurn> turns,
  * <end_of_image>, as the reference's add_image_token does.
  *
  * @param n_images Set to the number of images in the prompt.
+ * @param content The client's text ranges: control-token text there
+ *     stays text, so a turn cannot open a role.
  * @returns The ids; image k fills the k-th run of placeholders.
  */
-std::vector<tok::TokenId> janus_chat_ids(const tok::Tokenizer& tok,
-                                         std::string_view text,
-                                         const JanusVision& v,
-                                         std::size_t& n_images);
+std::vector<tok::TokenId> janus_chat_ids(
+    const tok::Tokenizer& tok, std::string_view text, const JanusVision& v,
+    std::size_t& n_images, std::span<const tok::TextRange> content = {});
 
 }  // namespace locus::image

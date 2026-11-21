@@ -8,7 +8,8 @@
 namespace locus::image {
 
 std::string qwen_vl_chat_text(std::span<const ChatTurn> turns,
-                              const std::optional<std::string>& system) {
+                              const std::optional<std::string>& system,
+                              std::vector<tok::TextRange>* content) {
     if (turns.empty()) {
         throw std::invalid_argument("qwen vl chat: no turns");
     }
@@ -17,7 +18,16 @@ std::string qwen_vl_chat_text(std::span<const ChatTurn> turns,
             "qwen vl chat: the last turn must be the user's");
     }
     std::string out = "<|im_start|>system\n";
-    out += system ? std::string_view(*system) : kQwenVlSystemPrompt;
+    // Appends the client's text and records its range.
+    const auto put = [&](std::string_view s) {
+        if (content) content->push_back({out.size(), out.size() + s.size()});
+        out += s;
+    };
+    if (system) {
+        put(*system);
+    } else {
+        out += kQwenVlSystemPrompt;
+    }
     out += "<|im_end|>\n";
     for (const ChatTurn& t : turns) {
         if (t.role != "user" && t.role != "assistant") {
@@ -30,7 +40,7 @@ std::string qwen_vl_chat_text(std::span<const ChatTurn> turns,
         std::string_view rest = t.text;
         for (;;) {
             const auto at = rest.find(kImagePlaceholder);
-            out += rest.substr(0, at);
+            put(rest.substr(0, at));
             if (at == std::string_view::npos) break;
             out += "<|vision_start|><|image_pad|><|vision_end|>";
             rest.remove_prefix(at + kImagePlaceholder.size());
@@ -65,13 +75,14 @@ QwenVlImage qwen_vl_image(const QwenVision& v, const Rgb8& img,
 
 QwenVlPrompt qwen_vl_chat_ids(
     const tok::Tokenizer& tok, std::string_view text,
-    std::span<const std::pair<std::uint32_t, std::uint32_t>> grids) {
+    std::span<const std::pair<std::uint32_t, std::uint32_t>> grids,
+    std::span<const tok::TextRange> content) {
     const auto pad = tok.encode("<|image_pad|>", false);
     if (pad.size() != 1) {
         throw std::invalid_argument(
             "qwen vl chat: the tokenizer has no <|image_pad|> token");
     }
-    const auto ids = tok.encode(text, false);
+    const auto ids = tok.encode_literal(text, false, content);
     QwenVlPrompt p;
     p.ids.reserve(ids.size());
     std::uint32_t pos = 0;

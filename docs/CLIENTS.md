@@ -431,6 +431,9 @@ calling. Reliable agent use therefore needs a capable instruct model.
   the server's output cap applies (`--max-tokens`, default 1024).
 - Chat formatting: the chat endpoints use the chat template the GGUF
   carries, matched to a known family (DESIGN.md 4.5); an unknown
-  template falls back to plain concatenation.
+  template falls back to plain concatenation. A control token's text
+  in a message (such as `<|im_start|>`) is encoded as plain text, so a
+  message cannot open a new role; `/v1/completions` takes its prompt
+  as written.
 
 See docs/COMPARISON.md for how locus compares to other engines.
