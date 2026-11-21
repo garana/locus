@@ -1221,6 +1221,8 @@ struct VulkanContext::Impl {
     VkDeviceSize allocated = 0;
     /** fail_allocations_for_test: make_buffer calls left to fail. */
     int fail_allocations = 0;
+    /** fail_submits_for_test: end_batch submits left to fail. */
+    int fail_submits = 0;
     /** The heap of the memory type make_buffer last allocated from;
      *  ~0u before the first buffer (i#364). */
     std::uint32_t buffer_heap = ~0u;
@@ -1831,6 +1833,15 @@ struct VulkanContext::Impl {
         stage_in_flight.clear();
     }
 
+    /** The batch that recorded stage_in_flight's copies did not run (or
+     *  may not have): copy them again in the next one. Their staging is
+     *  still there, so a second copy is harmless. */
+    void requeue_staged() {
+        pending_stage.insert(pending_stage.end(), stage_in_flight.begin(),
+                             stage_in_flight.end());
+        stage_in_flight.clear();
+    }
+
     /**
      * Records the copy of every pending staged buffer into its local
      * one, then one transfer-to-compute barrier, in the open batch. The
@@ -2179,6 +2190,10 @@ void VulkanContext::fail_allocations_for_test(int n) {
     impl_->fail_allocations = n;
 }
 
+void VulkanContext::fail_submits_for_test(int n) {
+    impl_->fail_submits = n;
+}
+
 VulkanContext::Buffer VulkanContext::import_host(const void* ptr,
                                                  std::size_t bytes,
                                                  std::size_t mapped) {
@@ -2389,12 +2404,28 @@ void VulkanContext::end_batch() {
                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             im.qpool, last_ts);
     }
+    // A throw from here to the wait may leave the batch's staged
+    // copies unrun: copy them again in the next batch (i#1137).
+    struct RequeueOnThrow {
+        Impl& im;
+        bool armed = true;
+        ~RequeueOnThrow() {
+            if (armed) {
+                im.requeue_staged();
+            }
+        }
+    } requeue{im};
     check(vkEndCommandBuffer(im.batch_cmd), "end cmd");
     const clock::time_point t1 = clock::now();
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &im.batch_cmd;
+    if (im.fail_submits > 0) {
+        // fail_submits_for_test: fail as vkQueueSubmit would.
+        --im.fail_submits;
+        throw std::runtime_error("vulkan: submit (VkResult -4)");
+    }
     if (im.spin_wait) {
         check(vkResetFences(im.device, 1, &im.batch_fence), "reset fence");
         check(vkQueueSubmit(im.queue, 1, &si, im.batch_fence), "submit");
@@ -2421,6 +2452,7 @@ void VulkanContext::end_batch() {
               "submit");
         check(vkQueueWaitIdle(im.queue), "wait idle");
     }
+    requeue.armed = false;
     ++im.prof.batches;
     // The batch's staging copies are done: free their buffers.
     im.finish_staged();
@@ -2523,10 +2555,7 @@ void VulkanContext::abandon_batch() {
         im.batch_cmd = VK_NULL_HANDLE;
     }
     // Their copies never ran: copy them in the next batch instead.
-    im.pending_stage.insert(im.pending_stage.end(),
-                            im.stage_in_flight.begin(),
-                            im.stage_in_flight.end());
-    im.stage_in_flight.clear();
+    im.requeue_staged();
 }
 
 bool VulkanContext::moltenvk() const { return impl_->moltenvk; }
@@ -2710,6 +2739,7 @@ VulkanContext::Buffer VulkanContext::create_buffer(std::size_t, MemKind) {
     no_kernels();
 }
 void VulkanContext::fail_allocations_for_test(int) { no_kernels(); }
+void VulkanContext::fail_submits_for_test(int) { no_kernels(); }
 VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
                                                  std::size_t) {
     no_kernels();
