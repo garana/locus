@@ -1168,7 +1168,29 @@ struct VulkanContext::Impl {
          *  it (an import binds buf below the tensor, at the memory
          *  alignment, and starts here). */
         VkDeviceSize desc_off = 0;
+        /** mem is device-local, not mappable (split_memory weights). */
+        bool local = false;
+        /** While a local buffer's first copy is not recorded: the
+         *  host-visible buffer `map` points into, `stage_bytes` long. */
+        VkBuffer stage_buf = VK_NULL_HANDLE;
+        VkDeviceMemory stage_mem = VK_NULL_HANDLE;
+        VkDeviceSize stage_bytes = 0;
     };
+
+    /**
+     * The mappable memory is not the device's own (a discrete GPU): its
+     * first HOST_VISIBLE and HOST_COHERENT type is not DEVICE_LOCAL, and
+     * a DEVICE_LOCAL type exists. Weights and tables then live in
+     * device-local memory, filled through a staging buffer (i#1121).
+     * LOCUS_VK_HOST_WEIGHTS=1 keeps them in mappable memory.
+     */
+    bool split_memory = false;
+    /** The DEVICE_LOCAL memory type's heap (split_memory). */
+    std::uint32_t local_heap = ~0u;
+    /** Local buffers whose staging copy is not recorded yet. */
+    std::vector<HostBuffer*> pending_stage;
+    /** Staging buffers copied in the open batch, freed once it ends. */
+    std::vector<std::pair<VkBuffer, VkDeviceMemory>> stage_retire;
 
     /** VK_EXT_external_memory_host enabled: import_host works. */
     bool has_host_import = false;
@@ -1478,6 +1500,31 @@ struct VulkanContext::Impl {
         check(vkCreateDevice(phys, &dci, nullptr, &device),
               "create device");
         vkGetDeviceQueue(device, queue_family, 0, &queue);
+        {
+            VkPhysicalDeviceMemoryProperties mp;
+            vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+            const VkMemoryPropertyFlags host =
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            bool host_is_local = false;
+            for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+                if ((mp.memoryTypes[i].propertyFlags & host) == host) {
+                    host_is_local = (mp.memoryTypes[i].propertyFlags &
+                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) !=
+                                    0;
+                    break;
+                }
+            }
+            for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+                if ((mp.memoryTypes[i].propertyFlags &
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+                    local_heap = mp.memoryTypes[i].heapIndex;
+                    break;
+                }
+            }
+            split_memory = !host_is_local && local_heap != ~0u &&
+                           std::getenv("LOCUS_VK_HOST_WEIGHTS") == nullptr;
+        }
 
         VkCommandPoolCreateInfo cpi{};
         cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1661,11 +1708,140 @@ struct VulkanContext::Impl {
         vkDestroyShaderModule(device, sm, nullptr);
     }
 
+    /**
+     * A device-local buffer of `size` bytes and the host-visible
+     * staging buffer its first fill goes through (split_memory): `map`
+     * points into the staging buffer until record_staged copies it.
+     *
+     * @param size The bytes.
+     * @param kind What it holds (weights or a table).
+     * @returns The buffer, or one with no `buf` when either allocation
+     *     fails (out of device memory), with nothing left behind.
+     */
+    HostBuffer make_local(VkDeviceSize size, MemKind kind) {
+        HostBuffer b;
+        b.kind = kind;
+        b.local = true;
+        VkPhysicalDeviceMemoryProperties props;
+        vkGetPhysicalDeviceMemoryProperties(phys, &props);
+        const auto pick = [&](std::uint32_t bits,
+                              VkMemoryPropertyFlags want) {
+            for (std::uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+                if ((bits & (1u << i)) &&
+                    (props.memoryTypes[i].propertyFlags & want) == want) {
+                    return i;
+                }
+            }
+            return ~0u;
+        };
+        // One buffer and its memory; false (nothing kept) on failure.
+        const auto make = [&](VkBufferUsageFlags usage,
+                              VkMemoryPropertyFlags want, VkBuffer& buf,
+                              VkDeviceMemory& mem, VkDeviceSize& bytes) {
+            VkBufferCreateInfo bci{};
+            bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bci.size = size;
+            bci.usage = usage;
+            bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            if (vkCreateBuffer(device, &bci, nullptr, &buf) != VK_SUCCESS) {
+                buf = VK_NULL_HANDLE;
+                return false;
+            }
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(device, buf, &req);
+            VkMemoryAllocateInfo mai{};
+            mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = pick(req.memoryTypeBits, want);
+            if (mai.memoryTypeIndex == ~0u ||
+                vkAllocateMemory(device, &mai, nullptr, &mem) != VK_SUCCESS) {
+                mem = VK_NULL_HANDLE;
+                vkDestroyBuffer(device, buf, nullptr);
+                buf = VK_NULL_HANDLE;
+                return false;
+            }
+            if (vkBindBufferMemory(device, buf, mem, 0) != VK_SUCCESS) {
+                vkFreeMemory(device, mem, nullptr);
+                vkDestroyBuffer(device, buf, nullptr);
+                buf = VK_NULL_HANDLE;
+                mem = VK_NULL_HANDLE;
+                return false;
+            }
+            bytes = req.size;
+            return true;
+        };
+        VkDeviceSize stage_alloc = 0;
+        if (!make(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, b.buf, b.mem,
+                  b.bytes)) {
+            return HostBuffer{};
+        }
+        if (!make(VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  b.stage_buf, b.stage_mem, stage_alloc) ||
+            vkMapMemory(device, b.stage_mem, 0, VK_WHOLE_SIZE, 0, &b.map) !=
+                VK_SUCCESS) {
+            if (b.stage_mem != VK_NULL_HANDLE) {
+                vkFreeMemory(device, b.stage_mem, nullptr);
+                vkDestroyBuffer(device, b.stage_buf, nullptr);
+            }
+            vkFreeMemory(device, b.mem, nullptr);
+            vkDestroyBuffer(device, b.buf, nullptr);
+            return HostBuffer{};
+        }
+        b.stage_bytes = size;
+        gpu_metrics(GpuApi::kVulkan)
+            .add_bytes(kind, static_cast<std::int64_t>(b.bytes));
+        return b;
+    }
+
+    /** Frees a staging buffer (and unmaps it). */
+    void free_stage(VkBuffer buf, VkDeviceMemory mem) {
+        vkUnmapMemory(device, mem);
+        vkFreeMemory(device, mem, nullptr);
+        vkDestroyBuffer(device, buf, nullptr);
+    }
+
+    /**
+     * Records the copy of every pending staged buffer into its local
+     * one, then one transfer-to-compute barrier, in the open batch. The
+     * staging buffers are freed after the batch completes (end_batch),
+     * and `map` is cleared: a local buffer is written once.
+     */
+    void record_staged() {
+        for (HostBuffer* hb : pending_stage) {
+            const VkBufferCopy region{0, 0, hb->stage_bytes};
+            vkCmdCopyBuffer(batch_cmd, hb->stage_buf, hb->buf, 1, &region);
+            stage_retire.emplace_back(hb->stage_buf, hb->stage_mem);
+            hb->stage_buf = VK_NULL_HANDLE;
+            hb->stage_mem = VK_NULL_HANDLE;
+            hb->map = nullptr;
+        }
+        pending_stage.clear();
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(batch_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb,
+                             0, nullptr, 0, nullptr);
+    }
+
     HostBuffer make_buffer(VkDeviceSize size, MemKind kind) {
         if (fail_allocations > 0) {
             // fail_allocations_for_test: fail as the device would.
             --fail_allocations;
             throw std::runtime_error("vulkan: allocate memory");
+        }
+        if (split_memory &&
+            (kind == MemKind::kWeights || kind == MemKind::kTable)) {
+            HostBuffer lb = make_local(size, kind);
+            if (lb.buf != VK_NULL_HANDLE) {
+                return lb;
+            }
+            // The device's memory is full: mappable memory, as before.
         }
         HostBuffer b;
         b.kind = kind;
@@ -1858,7 +2034,17 @@ struct VulkanContext::Impl {
             gpu_metrics(GpuApi::kVulkan)
                 .add_bytes(b.kind, -static_cast<std::int64_t>(b.bytes));
         }
-        if (b.mem != VK_NULL_HANDLE && b.imported) {
+        if (b.local) {
+            // Never copied: drop it from the pending list with its
+            // staging buffer.
+            std::erase(pending_stage, &b);
+            if (b.stage_buf != VK_NULL_HANDLE) {
+                free_stage(b.stage_buf, b.stage_mem);
+            }
+            if (b.mem != VK_NULL_HANDLE) {
+                vkFreeMemory(device, b.mem, nullptr);
+            }
+        } else if (b.mem != VK_NULL_HANDLE && b.imported) {
             vkFreeMemory(device, b.mem, nullptr);
         } else if (b.mem != VK_NULL_HANDLE) {
             allocated -= b.bytes;
@@ -1874,6 +2060,16 @@ struct VulkanContext::Impl {
     ~Impl() {
         if (device != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device);
+            for (HostBuffer* hb : pending_stage) {
+                free_stage(hb->stage_buf, hb->stage_mem);
+                hb->stage_buf = VK_NULL_HANDLE;
+                hb->stage_mem = VK_NULL_HANDLE;
+            }
+            pending_stage.clear();
+            for (const auto& [buf, mem] : stage_retire) {
+                free_stage(buf, mem);
+            }
+            stage_retire.clear();
             if (qpool != VK_NULL_HANDLE) {
                 vkDestroyQueryPool(device, qpool, nullptr);
             }
@@ -1953,6 +2149,9 @@ VulkanContext::~VulkanContext() = default;
 VulkanContext::Buffer VulkanContext::create_buffer(std::size_t bytes,
                                                    MemKind kind) {
     auto* hb = new Impl::HostBuffer(impl_->make_buffer(bytes, kind));
+    if (hb->stage_buf != VK_NULL_HANDLE) {
+        impl_->pending_stage.push_back(hb);  // copied at the next record
+    }
     return Buffer{hb};
 }
 
@@ -1971,6 +2170,10 @@ VulkanContext::Buffer VulkanContext::import_host(const void* ptr,
 }
 
 bool VulkanContext::host_import() const { return impl_->has_host_import; }
+
+bool VulkanContext::device_local_weights() const {
+    return impl_->split_memory;
+}
 
 bool VulkanContext::timestamps() const {
     return impl_->qpool != VK_NULL_HANDLE;
@@ -2060,6 +2263,9 @@ void VulkanContext::dispatch(Kernel k,
         // Not built here (an f16 kernel without shaderFloat16).
         throw std::runtime_error(std::string("vulkan: kernel ") + kd.name +
                                  " is not built on this device");
+    }
+    if (!im.pending_stage.empty()) {
+        im.record_staged();
     }
 
     Impl::SetKey key{static_cast<int>(k), {}};
@@ -2196,6 +2402,11 @@ void VulkanContext::end_batch() {
         check(vkQueueWaitIdle(im.queue), "wait idle");
     }
     ++im.prof.batches;
+    // The batch's staging copies are done: free their buffers.
+    for (const auto& [buf, mem] : im.stage_retire) {
+        im.free_stage(buf, mem);
+    }
+    im.stage_retire.clear();
     const clock::time_point t2 = clock::now();
     GpuMetrics& gm = gpu_metrics(GpuApi::kVulkan);
     const auto ns = [](clock::duration d) {
@@ -2318,7 +2529,9 @@ bool VulkanContext::matmul_prefetch() const {
 
 std::uint64_t VulkanContext::memory_available() const {
     const Impl& im = *impl_;
-    const std::uint32_t heap = im.host_heap();
+    // Weights live in the device's own heap on a split_memory device.
+    const std::uint32_t heap = im.split_memory ? im.local_heap
+                                               : im.host_heap();
     if (im.has_budget) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
         budget.sType =
@@ -2373,6 +2586,9 @@ void VulkanContext::copy_buffer(Buffer src, std::size_t src_off,
                                 Buffer dst, std::size_t dst_off,
                                 std::size_t bytes) {
     Impl& im = *impl_;
+    if (!im.pending_stage.empty()) {
+        im.record_staged();
+    }
     VkMemoryBarrier mb{};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -2474,6 +2690,7 @@ VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
     no_kernels();
 }
 bool VulkanContext::host_import() const { no_kernels(); }
+bool VulkanContext::device_local_weights() const { no_kernels(); }
 bool VulkanContext::moltenvk() const { no_kernels(); }
 bool VulkanContext::timestamps() const { no_kernels(); }
 void VulkanContext::destroy_buffer(Buffer) { no_kernels(); }
