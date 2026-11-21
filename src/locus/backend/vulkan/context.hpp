@@ -469,6 +469,12 @@ class VulkanContext {
     void fail_allocations_for_test(int n);
 
     /**
+     * Test seam (i#1137): the next `n` end_batch calls throw at the
+     * submit, as a failed vkQueueSubmit does; 0 clears it.
+     */
+    void fail_submits_for_test(int n);
+
+    /**
      * Wraps host memory [ptr, ptr + bytes) as a buffer without copying
      * (VK_EXT_external_memory_host: on unified memory the GPU reads the
      * mmap'd weights in place). Imports the whole pages from ptr's page
@@ -492,8 +498,8 @@ class VulkanContext {
     /**
      * @returns Whether weights and tables live in device-local memory,
      *     filled through a staging buffer (a discrete GPU, i#1121):
-     *     mapped() of such a buffer is valid until the next dispatch
-     *     or copy records its copy.
+     *     mapped() of such a buffer is valid until the batch that
+     *     copies it completes.
      */
     bool device_local_weights() const;
 

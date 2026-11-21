@@ -281,6 +281,14 @@ TEST_CASE("vulkan weights written through mapped reach the kernel",
                          locus::backend::vk::Kernel::kMatvecF32, rows));
         ctx.abandon_batch();
     }
+    // A batch whose submit fails (i#1137): its copy may not have run,
+    // so the next batch must make it too.
+    {
+        ctx.fail_submits_for_test(1);
+        REQUIRE_THROWS_WITH(ctx.matvec_f32(wb, rows, cols, xb, ob),
+                            Catch::Matchers::ContainsSubstring("submit"));
+        ctx.fail_submits_for_test(0);
+    }
     // Twice: the first batch records the copy, the second reads the
     // device-local buffer alone.
     for (int pass = 0; pass < 2; ++pass) {
