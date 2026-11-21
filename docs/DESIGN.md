@@ -475,7 +475,9 @@ device memory still runs.
   toward the pool budget or the MoE expert fit. Qwen3-Coder-30B Q4_K_M
   on an M4 Max: peak footprint 21.2 GB to 2.8 GB, and a cold first
   prefill 18.6 s to 7.4 s, at the same speed once warm.
-  `LOCUS_VK_NO_IMPORT=1` keeps the copies. Unmapping a model file
+  `LOCUS_VK_NO_IMPORT=1` keeps the copies; the NVIDIA proprietary
+  driver always does, as it fails to import a file mapping and then
+  every later allocation (#1122). Unmapping a model file
   calls a hook (`sys::set_unmap_hook`) that drops every pool buffer
   over its pages first, imports and copies alike, so no buffer
   outlives the memory it reads and a later mapping at the same

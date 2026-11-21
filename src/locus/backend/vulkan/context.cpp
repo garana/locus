@@ -412,7 +412,9 @@ namespace {
 
 void check(VkResult r, const char* what) {
     if (r != VK_SUCCESS) {
-        throw std::runtime_error(std::string("vulkan: ") + what);
+        throw std::runtime_error(std::string("vulkan: ") + what +
+                                 " (VkResult " +
+                                 std::to_string(static_cast<int>(r)) + ")");
     }
 }
 
@@ -1457,6 +1459,13 @@ struct VulkanContext::Impl {
                 moltenvk = dp.driverID == VK_DRIVER_ID_MOLTENVK;
                 serial_dispatch =
                     moltenvk && std::getenv("LOCUS_VK_BARRIERS") == nullptr;
+                // NVIDIA's driver fails to import a file mapping
+                // (VK_ERROR_OUT_OF_DEVICE_MEMORY), and after one failed
+                // import every later allocation of the device fails the
+                // same way (i#1122): copy the weights there instead.
+                if (dp.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+                    has_host_import = false;
+                }
             }
         }
         {
