@@ -2056,6 +2056,11 @@ void VulkanContext::dispatch(Kernel k,
         push.size() * 4 != kd.push_bytes) {
         throw std::runtime_error("vulkan: dispatch shape");
     }
+    if (p.pipeline == VK_NULL_HANDLE) {
+        // Not built here (an f16 kernel without shaderFloat16).
+        throw std::runtime_error(std::string("vulkan: kernel ") + kd.name +
+                                 " is not built on this device");
+    }
 
     Impl::SetKey key{static_cast<int>(k), {}};
     for (std::size_t i = 0; i < buffers.size(); ++i) {
