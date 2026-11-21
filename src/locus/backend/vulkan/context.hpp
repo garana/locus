@@ -343,7 +343,8 @@ class VulkanContext {
      * memory_available_from() (mem_fit.hpp): VK_EXT_memory_budget
      * when the device has it, else 3/4 of the heap minus this
      * context's allocations (the heap backing its host-visible
-     * buffers).
+     * buffers, or on a discrete GPU the device-local heap its weights
+     * use).
      *
      * @returns Available bytes (0 when exhausted).
      */
@@ -481,6 +482,14 @@ class VulkanContext {
 
     /** @returns Whether import_host can work on this device. */
     bool host_import() const;
+
+    /**
+     * @returns Whether weights and tables live in device-local memory,
+     *     filled through a staging buffer (a discrete GPU, i#1121):
+     *     mapped() of such a buffer is valid until the next dispatch
+     *     or copy records its copy.
+     */
+    bool device_local_weights() const;
 
     /**
      * @returns Whether batches can carry GPU timestamps (device time):

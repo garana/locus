@@ -6,8 +6,10 @@
 #include <mach-o/dyld.h>
 #endif
 
+#include <bit>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <span>
 #include <stdexcept>
@@ -234,4 +236,67 @@ TEST_CASE("LOCUS_VK_PROFILE still reports at exit", "[vulkan][device]") {
     REQUIRE(WIFEXITED(r.status));
     REQUIRE(WEXITSTATUS(r.status) == 0);
     REQUIRE(r.err.find("vk-profile:") != std::string::npos);
+}
+
+// i#1121: weights written through mapped() reach the kernel, on a
+// discrete GPU through the staging copy into device-local memory, also
+// after a batch that recorded the copy was abandoned; and a staged
+// buffer destroyed before any copy leaves nothing behind.
+TEST_CASE("vulkan weights written through mapped reach the kernel",
+          "[vulkan][device]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    using locus::backend::MemKind;
+    VulkanContext ctx;
+    INFO("device-local weights: " << ctx.device_local_weights());
+    const std::uint32_t rows = 37, cols = 64;
+    std::vector<float> w(std::size_t{rows} * cols), x(cols);
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        w[i] = static_cast<float>(static_cast<int>(i % 7) - 3) * 0.25f;
+    }
+    for (std::uint32_t i = 0; i < cols; ++i) {
+        x[i] = static_cast<float>(i % 5) - 2.0f;
+    }
+    // Never copied: destroyed while it is still staged.
+    auto dropped = ctx.create_buffer(w.size() * 4, MemKind::kWeights);
+    REQUIRE(ctx.mapped(dropped) != nullptr);
+    ctx.destroy_buffer(dropped);
+
+    auto wb = ctx.create_buffer(w.size() * 4, MemKind::kWeights);
+    std::memcpy(ctx.mapped(wb), w.data(), w.size() * 4);
+    auto xb = ctx.create_buffer(x.size() * 4);
+    std::memcpy(ctx.mapped(xb), x.data(), x.size() * 4);
+    auto ob = ctx.create_buffer(std::size_t{rows} * 4);
+    // A batch that records the copy, then is abandoned (an exception
+    // out of a forward): the copy never ran, so the next batch must
+    // still make it.
+    {
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+        const std::uint32_t push[] = {
+            rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
+        ctx.dispatch(locus::backend::vk::Kernel::kMatvecF32, bufs, push,
+                     VulkanContext::matvec_groups(
+                         locus::backend::vk::Kernel::kMatvecF32, rows));
+        ctx.abandon_batch();
+    }
+    // Twice: the first batch records the copy, the second reads the
+    // device-local buffer alone.
+    for (int pass = 0; pass < 2; ++pass) {
+        CAPTURE(pass);
+        std::memset(ctx.mapped(ob), 0, std::size_t{rows} * 4);
+        ctx.matvec_f32(wb, rows, cols, xb, ob);
+        const auto* got = static_cast<const float*>(ctx.mapped(ob));
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            float want = 0.0f;
+            for (std::uint32_t c = 0; c < cols; ++c) {
+                want += w[std::size_t{r} * cols + c] * x[c];
+            }
+            REQUIRE(got[r] == Catch::Approx(want).margin(1e-4));
+        }
+    }
+    for (auto b : {wb, xb, ob}) {
+        ctx.destroy_buffer(b);
+    }
 }

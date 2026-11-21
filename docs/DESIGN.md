@@ -463,6 +463,15 @@ device memory still runs.
   host-coherent unified memory) is 0.28% of compute with an unbounded
   pool and 4.5% even under heavy paging, so prefetch could gain at
   most a few percent.
+- Where the device's mappable memory is not its own (a discrete GPU:
+  the first HOST_VISIBLE, HOST_COHERENT type is not DEVICE_LOCAL),
+  weights and tables live in DEVICE_LOCAL memory. The upload writes a
+  host-visible staging buffer, the next dispatch records its copy, and
+  the staging buffer is freed when that batch ends; a full device
+  falls back to mappable memory. Activations, KV and scratch stay
+  mappable. GTX 750 Ti, Llama 3.2 1B decode: Q8_0 4.8 to 25.2 tok/s,
+  Q4_K_M 6.9 to 23.6 (#1121). `LOCUS_VK_HOST_WEIGHTS=1` keeps the
+  weights in mappable memory.
 - Vulkan uploads only the routed experts of a token, not every expert
   of the layer (6 of 64 on DeepSeek-V2-Lite).
 - Where the device has `VK_EXT_external_memory_host` (MoltenVK),
