@@ -7,12 +7,19 @@
 #endif
 
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan_forward.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/backend/vulkan/context.hpp"
 
 using locus::backend::vk::VulkanContext;
@@ -103,10 +110,75 @@ TEST_CASE("vulkan exit child builds the state and keeps a pool", "[.]") {
     REQUIRE(pool != nullptr);
 }
 
+// i#1119: the child of the profile test below. One forward on the
+// backend, so LOCUS_VK_PROFILE has a batch to report at exit.
+TEST_CASE("vulkan exit child runs one forward", "[.]") {
+    const std::string path =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/stories260K.gguf";
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+    std::vector<float> logits(model.hparams().n_vocab);
+    auto c = model.make_cache();
+    locus::kv::PagedKvCache::Seq s;
+    REQUIRE(c.ensure_capacity(s, 1));
+    REQUIRE(locus::backend::vulkan_forward(model, 1, c, s, logits));
+    c.release(s);
+}
+
+namespace {
+
+/** A child's wait status and what it wrote to stderr. */
+struct ChildRun {
+    int status = 0;
+    std::string err;
+};
+
+/**
+ * Runs the hidden test case `name` in a fresh exec of this binary, with
+ * LOCUS_VK_PROFILE=1 set when `profile`, so the child's driver starts
+ * clean.
+ *
+ * @param exe This binary (self_exe()).
+ * @param name The test case to run.
+ * @param profile Whether to set LOCUS_VK_PROFILE=1 in the child.
+ * @returns The wait status and the child's stderr.
+ */
+ChildRun run_child(const std::string& exe, const char* name, bool profile) {
+    int fds[2];
+    REQUIRE(::pipe(fds) == 0);
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ::close(fds[0]);
+        const int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            ::dup2(devnull, 1);
+        }
+        ::dup2(fds[1], 2);
+        if (profile) {
+            ::setenv("LOCUS_VK_PROFILE", "1", 1);
+        }
+        ::execl(exe.c_str(), "locus_tests", name,
+                static_cast<char*>(nullptr));
+        _exit(127);  // exec failed
+    }
+    REQUIRE(pid >= 0);
+    ::close(fds[1]);
+    ChildRun r;
+    char buf[4096];
+    for (ssize_t n; (n = ::read(fds[0], buf, sizeof buf)) > 0;) {
+        r.err.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(fds[0]);
+    REQUIRE(::waitpid(pid, &r.status, 0) == pid);
+    return r;
+}
+
+}  // namespace
+
 // i#1119: a process that used the backend exits 0. A static State was
 // destroyed from the exit handlers, after the NVIDIA driver's own
 // teardown, and every such process died with SIGSEGV after its work.
-// The child is a fresh exec of this binary, so the driver starts clean.
 TEST_CASE("a process that used vulkan exits cleanly", "[vulkan][device]") {
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device / kernels not built");
@@ -115,22 +187,30 @@ TEST_CASE("a process that used vulkan exits cleanly", "[vulkan][device]") {
     if (exe.empty()) {
         SKIP("this OS gives no path to the test binary");
     }
-    const pid_t pid = ::fork();
-    if (pid == 0) {
-        const int devnull = ::open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            ::dup2(devnull, 1);
-            ::dup2(devnull, 2);
-        }
-        ::execl(exe.c_str(), "locus_tests",
-                "vulkan exit child builds the state and keeps a pool",
-                static_cast<char*>(nullptr));
-        _exit(127);  // exec failed
+    const auto r = run_child(
+        exe, "vulkan exit child builds the state and keeps a pool", false);
+    CAPTURE(WIFSIGNALED(r.status) ? WTERMSIG(r.status) : 0, r.err);
+    REQUIRE(WIFEXITED(r.status));
+    REQUIRE(WEXITSTATUS(r.status) == 0);
+}
+
+// i#1119: the States are never destroyed, so their reports print from
+// an exit handler instead of ~State: LOCUS_VK_PROFILE still prints.
+TEST_CASE("LOCUS_VK_PROFILE still reports at exit", "[vulkan][device]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
     }
-    REQUIRE(pid >= 0);
-    int status = 0;
-    REQUIRE(::waitpid(pid, &status, 0) == pid);
-    CAPTURE(WIFSIGNALED(status) ? WTERMSIG(status) : 0);
-    REQUIRE(WIFEXITED(status));
-    REQUIRE(WEXITSTATUS(status) == 0);
+    if (!std::filesystem::exists(std::string(LOCUS_SOURCE_DIR) +
+                                 "/tests/models/stories260K.gguf")) {
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
+    }
+    const std::string exe = self_exe();
+    if (exe.empty()) {
+        SKIP("this OS gives no path to the test binary");
+    }
+    const auto r = run_child(exe, "vulkan exit child runs one forward", true);
+    CAPTURE(r.err);
+    REQUIRE(WIFEXITED(r.status));
+    REQUIRE(WEXITSTATUS(r.status) == 0);
+    REQUIRE(r.err.find("vk-profile:") != std::string::npos);
 }

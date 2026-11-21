@@ -246,6 +246,9 @@ std::vector<const void*>* kv_frees() {
     return v;
 }
 
+/** Prints each live State's reports at exit (defined after states()). */
+void report_states();
+
 struct State {
     VulkanContext ctx;
     /** The device index this State runs on. */
@@ -270,6 +273,11 @@ struct State {
             sys::set_unmap_hook(&on_unmap);
         }
         g_state_alive[device].store(true);
+        // The States are never destroyed (states()), so their reports
+        // print from here at exit. Registered after ctx loaded the
+        // driver, it runs before the driver's own exit handlers.
+        static std::once_flag report_once;
+        std::call_once(report_once, [] { std::atexit(report_states); });
     }
     ~State() {
         g_state_alive[device].store(false);
@@ -820,6 +828,20 @@ void drain_kv_frees(State& s) {
 std::unique_ptr<State>* states() {
     static auto* s = new std::unique_ptr<State>[kMaxDevices];
     return s;
+}
+
+/** The pool budget line and LOCUS_VK_PROFILE's report of every live
+ *  State, which ~State printed when the States were destroyed at exit.
+ *  Both only read counters (no Vulkan call), and no lock is taken: the
+ *  process is exiting, and a thread stuck in a backend call must not
+ *  hang it. */
+void report_states() {
+    for (int d = 0; d < kMaxDevices; ++d) {
+        if (const auto& s = states()[d]) {
+            s->pool.report();
+            s->ctx.report_profile();
+        }
+    }
 }
 
 /** @returns The calling thread's device's State, made on first use
