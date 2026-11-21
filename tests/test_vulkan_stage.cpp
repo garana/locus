@@ -517,15 +517,6 @@ TEST_CASE("vulkan decode attention merges its partials in rounds",
         return all;
     };
     const auto want = run(0);
-    // NVIDIA's math drifts more between the merge orders: on a GTX 750
-    // Ti the F16 KV, cap 2 rounds reach 1.1e-4 of the norm (the same
-    // no-f16 path stays under 1e-5 on MoltenVK, i#1123); the argmax
-    // below still has to match.
-    const double tol =
-        locus::backend::vulkan_device_name().find("NVIDIA") !=
-                std::string::npos
-            ? 3e-4
-            : 1e-5;
     for (const std::uint32_t cap : {1u, 2u}) {
         CAPTURE(cap);
         const auto got = run(cap);
@@ -539,7 +530,7 @@ TEST_CASE("vulkan decode attention merges its partials in rounds",
                 err += d * d;
                 norm += double{w[v]} * w[v];
             }
-            CHECK(std::sqrt(err) <= tol * std::sqrt(norm));
+            CHECK(std::sqrt(err) <= 1e-5 * std::sqrt(norm));
             CHECK(std::max_element(o.begin(), o.end()) - o.begin() ==
                   std::max_element(w.begin(), w.end()) - w.begin());
         }
