@@ -131,8 +131,8 @@ TEST_CASE("a request decodes the same alone or batched: Q8_0 and Q4_K_M",
           "[batch][invariance][e2e]") {
     // The scalar backend takes hours on these; stories260K covers it.
     // On Vulkan a model is batch-invariant in batch-invariant mode
-    // (#432; the default on Apple GPUs and V3D, and there not for a
-    // lone K-quant sequence), which these legs set.
+    // (#432; the default on Apple, V3D and NVIDIA GPUs, and there not
+    // for a lone K-quant sequence), which these legs set.
     struct Mode {
         Mode() { locus::backend::vulkan_set_batch_invariant(true); }
         ~Mode() { locus::backend::vulkan_reset_batch_invariant(); }
@@ -147,7 +147,8 @@ TEST_CASE("a request decodes the same alone or batched: Q8_0 and Q4_K_M",
     }
 }
 
-TEST_CASE("vulkan batch-invariant mode defaults on for Apple and V3D",
+TEST_CASE("vulkan batch-invariant mode defaults on for Apple V3D and "
+          "NVIDIA",
           "[batch][invariance][vulkan]") {
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device");
@@ -161,7 +162,8 @@ TEST_CASE("vulkan batch-invariant mode defaults on for Apple and V3D",
     const std::string name = locus::backend::vulkan_device_name();
     INFO("device " << name);
     const bool want = name.find("Apple") != std::string::npos ||
-                      name.find("V3D") != std::string::npos;
+                      name.find("V3D") != std::string::npos ||
+                      name.find("NVIDIA") != std::string::npos;
     CHECK(locus::backend::vulkan_batch_invariant() == want);
     if (env != nullptr) {
         ::setenv("LOCUS_VK_BATCH_INVARIANT", saved.c_str(), 1);
