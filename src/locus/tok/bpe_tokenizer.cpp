@@ -580,7 +580,7 @@ std::vector<TokenId> BpeTokenizer::encode(std::string_view text,
 
 std::vector<TokenId> BpeTokenizer::encode_literal(
     std::string_view text, bool add_bos,
-    std::span<const TextRange> literal) const {
+    std::span<const TextRange> literal, bool user_defined) const {
     std::vector<TokenId> out;
     if (add_bos && cfg_.add_bos) {
         out.push_back(cfg_.bos);
@@ -592,17 +592,19 @@ std::vector<TokenId> BpeTokenizer::encode_literal(
         return false;
     };
     // Split on special tokens (longest first), BPE in between. A
-    // control token's match that overlaps a literal range is skipped.
+    // control token's match that overlaps a literal range is skipped,
+    // and so is a user-defined one's when user_defined is set.
     std::size_t at = 0;
     while (at < text.size()) {
         std::size_t sp_pos = std::string_view::npos;
         std::size_t sp_idx = 0;
         for (std::size_t k = 0; k < specials_.size(); ++k) {
             const std::string_view sp = specials_[k].first;
-            const bool control =
-                type_of(specials_[k].second) == TokenType::kControl;
+            const TokenType t = type_of(specials_[k].second);
+            const bool skip = t == TokenType::kControl ||
+                              (user_defined && t == TokenType::kUserDefined);
             std::size_t p = text.find(sp, at);
-            while (control && p != std::string_view::npos &&
+            while (skip && p != std::string_view::npos &&
                    in_literal(p, p + sp.size())) {
                 p = text.find(sp, p + 1);
             }

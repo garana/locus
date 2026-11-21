@@ -52,7 +52,8 @@ class BpeTokenizer final : public Tokenizer {
                                 bool add_bos) const override;
     std::vector<TokenId> encode_literal(
         std::string_view text, bool add_bos,
-        std::span<const TextRange> literal) const override;
+        std::span<const TextRange> literal,
+        bool user_defined = false) const override;
     std::string decode(std::span<const TokenId> ids) const override;
     std::string_view piece(TokenId id) const override;
 

@@ -85,6 +85,8 @@ TEST_CASE("bpe encode_literal keeps control-token text in a range as text",
     // User-defined tokens still match in a range.
     const TextRange u[] = {{0, 3}};
     REQUIRE(tok.encode_literal("<u>", false, u) == V{2});
+    // ...unless user_defined is set (i#1131).
+    REQUIRE(tok.encode_literal("<u>", false, u, true) == V{5, 9, 8});
     // No ranges: the same ids as encode().
     REQUIRE(tok.encode_literal("a<|x|>b", false, {}) == V{3, 1, 4});
 }

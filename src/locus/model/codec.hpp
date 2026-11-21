@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "locus/tok/tokenizer.hpp"
@@ -64,6 +65,20 @@ SnacCodes orpheus_deband(std::span<const tok::TokenId> audio_tokens,
  * @throws std::runtime_error if that piece is not in the vocabulary.
  */
 tok::TokenId orpheus_band_base(const tok::Tokenizer& tok);
+
+/**
+ * The Orpheus speech prompt, as the reference wraps it: the start
+ * marker, "voice: input" tokenized with BOS, then the four end markers.
+ * Control-token text in `voice` or `input` (the client's) is encoded as
+ * plain text, so a request cannot end the text early or write a marker
+ * (i#1131).
+ *
+ * @param tok A tokenizer for an Orpheus checkpoint.
+ * @returns The prompt's token ids.
+ */
+std::vector<tok::TokenId> orpheus_prompt_ids(const tok::Tokenizer& tok,
+                                             std::string_view voice,
+                                             std::string_view input);
 
 /**
  * Streaming de-band driver (the "multi-codebook sampler"): fed the
