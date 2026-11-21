@@ -474,6 +474,10 @@ class VulkanContext {
      */
     void fail_submits_for_test(int n);
 
+    /** @returns Command buffers allocated and not yet freed (tests:
+     *  a failed batch must leave none behind, i#1140). */
+    int command_buffers_for_test() const;
+
     /**
      * Wraps host memory [ptr, ptr + bytes) as a buffer without copying
      * (VK_EXT_external_memory_host: on unified memory the GPU reads the
