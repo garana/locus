@@ -1189,8 +1189,13 @@ struct VulkanContext::Impl {
     std::uint32_t local_heap = ~0u;
     /** Local buffers whose staging copy is not recorded yet. */
     std::vector<HostBuffer*> pending_stage;
-    /** Staging buffers copied in the open batch, freed once it ends. */
-    std::vector<std::pair<VkBuffer, VkDeviceMemory>> stage_retire;
+    /** Local buffers whose copy is recorded in the open batch: their
+     *  staging is freed once it completes (end_batch), and they go back
+     *  to pending_stage if it is abandoned. */
+    std::vector<HostBuffer*> stage_in_flight;
+    /** Bytes of device-local memory held (split_memory), for
+     *  memory_available() without VK_EXT_memory_budget. */
+    VkDeviceSize local_allocated = 0;
 
     /** VK_EXT_external_memory_host enabled: import_host works. */
     bool has_host_import = false;
@@ -1792,6 +1797,7 @@ struct VulkanContext::Impl {
             return HostBuffer{};
         }
         b.stage_bytes = size;
+        local_allocated += b.bytes;
         gpu_metrics(GpuApi::kVulkan)
             .add_bytes(kind, static_cast<std::int64_t>(b.bytes));
         return b;
@@ -1804,20 +1810,38 @@ struct VulkanContext::Impl {
         vkDestroyBuffer(device, buf, nullptr);
     }
 
+    /** hb's staging buffer, freed; its `map` cleared. */
+    void drop_stage(HostBuffer& hb) {
+        if (hb.stage_buf != VK_NULL_HANDLE) {
+            free_stage(hb.stage_buf, hb.stage_mem);
+        }
+        hb.stage_buf = VK_NULL_HANDLE;
+        hb.stage_mem = VK_NULL_HANDLE;
+        hb.map = nullptr;
+    }
+
+    /** The batch that copied stage_in_flight completed: free their
+     *  staging. */
+    void finish_staged() {
+        for (HostBuffer* hb : stage_in_flight) {
+            drop_stage(*hb);
+        }
+        stage_in_flight.clear();
+    }
+
     /**
      * Records the copy of every pending staged buffer into its local
      * one, then one transfer-to-compute barrier, in the open batch. The
-     * staging buffers are freed after the batch completes (end_batch),
-     * and `map` is cleared: a local buffer is written once.
+     * buffers stay in stage_in_flight with their staging until the
+     * batch completes (finish_staged frees it and clears `map`: a local
+     * buffer is written once), or go back to pending_stage if it is
+     * abandoned, so an abandoned batch never leaves a buffer unfilled.
      */
     void record_staged() {
         for (HostBuffer* hb : pending_stage) {
             const VkBufferCopy region{0, 0, hb->stage_bytes};
             vkCmdCopyBuffer(batch_cmd, hb->stage_buf, hb->buf, 1, &region);
-            stage_retire.emplace_back(hb->stage_buf, hb->stage_mem);
-            hb->stage_buf = VK_NULL_HANDLE;
-            hb->stage_mem = VK_NULL_HANDLE;
-            hb->map = nullptr;
+            stage_in_flight.push_back(hb);
         }
         pending_stage.clear();
         VkMemoryBarrier mb{};
@@ -2035,13 +2059,12 @@ struct VulkanContext::Impl {
                 .add_bytes(b.kind, -static_cast<std::int64_t>(b.bytes));
         }
         if (b.local) {
-            // Never copied: drop it from the pending list with its
-            // staging buffer.
+            // Still staged: off its list, with its staging buffer.
             std::erase(pending_stage, &b);
-            if (b.stage_buf != VK_NULL_HANDLE) {
-                free_stage(b.stage_buf, b.stage_mem);
-            }
+            std::erase(stage_in_flight, &b);
+            drop_stage(b);
             if (b.mem != VK_NULL_HANDLE) {
+                local_allocated -= b.bytes;
                 vkFreeMemory(device, b.mem, nullptr);
             }
         } else if (b.mem != VK_NULL_HANDLE && b.imported) {
@@ -2061,15 +2084,10 @@ struct VulkanContext::Impl {
         if (device != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device);
             for (HostBuffer* hb : pending_stage) {
-                free_stage(hb->stage_buf, hb->stage_mem);
-                hb->stage_buf = VK_NULL_HANDLE;
-                hb->stage_mem = VK_NULL_HANDLE;
+                drop_stage(*hb);
             }
             pending_stage.clear();
-            for (const auto& [buf, mem] : stage_retire) {
-                free_stage(buf, mem);
-            }
-            stage_retire.clear();
+            finish_staged();
             if (qpool != VK_NULL_HANDLE) {
                 vkDestroyQueryPool(device, qpool, nullptr);
             }
@@ -2403,10 +2421,7 @@ void VulkanContext::end_batch() {
     }
     ++im.prof.batches;
     // The batch's staging copies are done: free their buffers.
-    for (const auto& [buf, mem] : im.stage_retire) {
-        im.free_stage(buf, mem);
-    }
-    im.stage_retire.clear();
+    im.finish_staged();
     const clock::time_point t2 = clock::now();
     GpuMetrics& gm = gpu_metrics(GpuApi::kVulkan);
     const auto ns = [](clock::duration d) {
@@ -2505,6 +2520,11 @@ void VulkanContext::abandon_batch() {
         vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
         im.batch_cmd = VK_NULL_HANDLE;
     }
+    // Their copies never ran: copy them in the next batch instead.
+    im.pending_stage.insert(im.pending_stage.end(),
+                            im.stage_in_flight.begin(),
+                            im.stage_in_flight.end());
+    im.stage_in_flight.clear();
 }
 
 bool VulkanContext::moltenvk() const { return impl_->moltenvk; }
@@ -2546,7 +2566,8 @@ std::uint64_t VulkanContext::memory_available() const {
     VkPhysicalDeviceMemoryProperties props;
     vkGetPhysicalDeviceMemoryProperties(im.phys, &props);
     return memory_available_from(false, props.memoryHeaps[heap].size,
-                                 im.allocated);
+                                 im.split_memory ? im.local_allocated
+                                                 : im.allocated);
 }
 
 std::uint64_t VulkanContext::memory_used() const {

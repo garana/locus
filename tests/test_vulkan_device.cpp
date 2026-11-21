@@ -6,6 +6,7 @@
 #include <mach-o/dyld.h>
 #endif
 
+#include <bit>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -238,8 +239,9 @@ TEST_CASE("LOCUS_VK_PROFILE still reports at exit", "[vulkan][device]") {
 }
 
 // i#1121: weights written through mapped() reach the kernel, on a
-// discrete GPU through the staging copy into device-local memory, and
-// a staged buffer destroyed before any copy leaves nothing behind.
+// discrete GPU through the staging copy into device-local memory, also
+// after a batch that recorded the copy was abandoned; and a staged
+// buffer destroyed before any copy leaves nothing behind.
 TEST_CASE("vulkan weights written through mapped reach the kernel",
           "[vulkan][device]") {
     if (!VulkanContext::available()) {
@@ -266,6 +268,19 @@ TEST_CASE("vulkan weights written through mapped reach the kernel",
     auto xb = ctx.create_buffer(x.size() * 4);
     std::memcpy(ctx.mapped(xb), x.data(), x.size() * 4);
     auto ob = ctx.create_buffer(std::size_t{rows} * 4);
+    // A batch that records the copy, then is abandoned (an exception
+    // out of a forward): the copy never ran, so the next batch must
+    // still make it.
+    {
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+        const std::uint32_t push[] = {
+            rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
+        ctx.dispatch(locus::backend::vk::Kernel::kMatvecF32, bufs, push,
+                     VulkanContext::matvec_groups(
+                         locus::backend::vk::Kernel::kMatvecF32, rows));
+        ctx.abandon_batch();
+    }
     // Twice: the first batch records the copy, the second reads the
     // device-local buffer alone.
     for (int pass = 0; pass < 2; ++pass) {
