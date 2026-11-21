@@ -2047,11 +2047,13 @@ int batch_invariant_state() {
         } else {
             // On by default where a lone sequence was measured to cost
             // little in this mode: Apple GPUs (M2 Pro level, M4 Max
-            // -5%) and V3D (2.3% for a lone Q8_0 sequence with the NT 1
-            // build, i#791); off elsewhere.
+            // -5%), V3D (2.3% for a lone Q8_0 sequence with the NT 1
+            // build, i#791) and NVIDIA (a lone Q8_0 decode 6% faster on
+            // a GTX 750 Ti, i#977); off elsewhere.
             const std::string name = vulkan_device_name();
             v = name.find("Apple") != std::string::npos ||
-                        name.find("V3D") != std::string::npos
+                        name.find("V3D") != std::string::npos ||
+                        name.find("NVIDIA") != std::string::npos
                     ? 2
                     : 0;
         }

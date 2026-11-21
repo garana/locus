@@ -590,9 +590,10 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   in one dispatch, and Q8_0 q, k and v in another). In batch-invariant
   mode a lone sequence takes the multi-sequence kernels too, so a
   request's logits are bit-identical alone and batched. It is the
-  default on Apple GPUs and on V3D, where a lone sequence costs little
-  (on V3D 2.3% for a lone Q8_0 sequence with the NT 1 build below);
-  elsewhere a lone sequence keeps the single-sequence forward.
+  default on Apple GPUs, on V3D and on NVIDIA GPUs, where a lone
+  sequence costs little (on V3D 2.3% for a lone Q8_0 sequence with the
+  NT 1 build below; on a GTX 750 Ti a lone Q8_0 decode is 6% faster,
+  #977); elsewhere a lone sequence keeps the single-sequence forward.
   On V3D the kernel's v3d driver can reset the GPU for a "hang" in the
   middle of a long compute job (a 274 ms conv dispatch, about once in
   30), and the job's remaining workgroups never run, without an error
