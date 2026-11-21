@@ -47,20 +47,22 @@ namespace {
 
 constexpr std::size_t kBlk = 34;  // f16 scale + 32 int8
 
-/** A block's f16 scale, through the hardware convert (exact). */
-float scale_of(const std::byte* blk) {
-    std::uint16_t h;
-    std::memcpy(&h, blk, sizeof(h));
-    return vget_lane_f32(
-        vget_low_f32(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(h)))), 0);
+/** Block b's f16 scales of 4 rows, through one hardware convert
+ *  (exact). */
+inline float32x4_t scales4(const std::byte* const rows[4], std::size_t b) {
+    std::uint16_t h[4];
+    for (int k = 0; k < 4; ++k) {
+        std::memcpy(&h[k], rows[k] + b * kBlk, sizeof(h[k]));
+    }
+    return vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(h)));
 }
 
 /**
  * The 4 x 4 transpose of 32-bit words: out[k] holds word k of a, b, c
  * and d, in that order.
  */
-void transpose4(int8x16_t a, int8x16_t b, int8x16_t c, int8x16_t d,
-                int8x16_t out[4]) {
+inline void transpose4(int8x16_t a, int8x16_t b, int8x16_t c, int8x16_t d,
+                       int8x16_t out[4]) {
     const int32x4_t t0 =
         vtrn1q_s32(vreinterpretq_s32_s8(a), vreinterpretq_s32_s8(b));
     const int32x4_t t1 =
@@ -93,44 +95,41 @@ void quad_rows(const Mat& w, std::uint32_t r0, std::size_t nb,
     }
 }
 
-/**
- * Block b of 4 rows interleaved: wv[k] holds bytes 4k .. 4k + 3 of
- * each row (k < 8), ws the 4 rows' scales.
- */
-void quad_block(const std::byte* const rows[4], std::size_t b,
-                int8x16_t wv[8], float ws[4]) {
-    int8x16_t lo[4], hi[4];
-    for (int k = 0; k < 4; ++k) {
-        const std::byte* blk = rows[k] + b * kBlk;
-        const auto* q = reinterpret_cast<const std::int8_t*>(blk + 2);
-        lo[k] = vld1q_s8(q);
-        hi[k] = vld1q_s8(q + 16);
-        ws[k] = scale_of(blk);
-    }
-    transpose4(lo[0], lo[1], lo[2], lo[3], wv);
-    transpose4(hi[0], hi[1], hi[2], hi[3], wv + 4);
+/** Block b's 32 quants of row k as two vectors. */
+inline void row_quants(const std::byte* const rows[4], int k, std::size_t b,
+                       int8x16_t& lo, int8x16_t& hi) {
+    const auto* q =
+        reinterpret_cast<const std::int8_t*>(rows[k] + b * kBlk + 2);
+    lo = vld1q_s8(q);
+    hi = vld1q_s8(q + 16);
 }
 
 /**
  * Rows r0 .. r0 + 3 of w packed for quad_tokens: block b's 8 vectors
- * at qw + b * 128 and its 4 scales at qs + b * 4.
+ * at qw + b * 128 (vector k holding bytes 4k .. 4k + 3 of each row) and
+ * its 4 scales at qs + b * 4.
  */
 void pack_quad(const Mat& w, std::uint32_t r0, std::size_t nb,
                std::int8_t* qw, float* qs) {
     const std::byte* rows[4];
     quad_rows(w, r0, nb, rows);
     for (std::size_t b = 0; b < nb; ++b) {
-        int8x16_t wv[8];
-        quad_block(rows, b, wv, qs + b * 4);
+        int8x16_t lo[4], hi[4], wv[8];
+        for (int k = 0; k < 4; ++k) {
+            row_quants(rows, k, b, lo[k], hi[k]);
+        }
+        transpose4(lo[0], lo[1], lo[2], lo[3], wv);
+        transpose4(hi[0], hi[1], hi[2], hi[3], wv + 4);
         for (int k = 0; k < 8; ++k) {
             vst1q_s8(qw + b * 128 + k * 16, wv[k]);
         }
+        vst1q_f32(qs + b * 4, scales4(rows, b));
     }
 }
 
 /**
- * One block's step for one token, shared by both kernels below: the
- * 4 rows' exact integer dots (wv against activation bytes 4k ..
+ * One block's step of a packed quad for one token: the 4 rows' exact
+ * integer dots (wv against activation bytes 4k ..
  * 4k + 3: lane k of x0 for k < 4, lane k - 4 of x1 after), times
  * d_w * d_x per row, then added to sum: a multiply, then an add (no
  * fused multiply-add), per lane.
@@ -152,10 +151,11 @@ inline float32x4_t quad_step(float32x4_t sum, const int8x16_t wv[8],
 }
 
 /**
- * Rows r0 .. r0 + 3 against one token, interleaving each block in
- * registers (no packed copy): the decode path, where a packed quad
- * would serve one token only. The same quad_step as quad_tokens, so
- * the same bits.
+ * Rows r0 .. r0 + 3 against one token, from the weight rows as stored
+ * (no transpose): the decode path, where a packed quad would serve one
+ * token only. Each row's block dot is two plain sdot, and three
+ * pairwise adds fold the 4 rows' lanes into one vector of the 4 exact
+ * integer dots; the float steps are quad_step's, so the same bits.
  */
 float32x4_t quad_direct(const Mat& w, std::uint32_t r0, std::size_t nb,
                         const float* d, const std::int8_t* q) {
@@ -163,11 +163,18 @@ float32x4_t quad_direct(const Mat& w, std::uint32_t r0, std::size_t nb,
     quad_rows(w, r0, nb, rows);
     float32x4_t sum = vdupq_n_f32(0.0f);
     for (std::size_t b = 0; b < nb; ++b) {
-        int8x16_t wv[8];
-        float ws[4];
-        quad_block(rows, b, wv, ws);
-        sum = quad_step(sum, wv, vld1q_f32(ws), vld1q_s8(q + b * 32),
-                        vld1q_s8(q + b * 32 + 16), d[b]);
+        const int8x16_t x0 = vld1q_s8(q + b * 32);
+        const int8x16_t x1 = vld1q_s8(q + b * 32 + 16);
+        int32x4_t s[4];
+        for (int k = 0; k < 4; ++k) {
+            int8x16_t lo, hi;
+            row_quants(rows, k, b, lo, hi);
+            s[k] = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, x0), hi, x1);
+        }
+        const int32x4_t isum = vpaddq_s32(vpaddq_s32(s[0], s[1]),
+                                          vpaddq_s32(s[2], s[3]));
+        const float32x4_t sc = vmulq_n_f32(scales4(rows, b), d[b]);
+        sum = vaddq_f32(sum, vmulq_f32(vcvtq_f32_s32(isum), sc));
     }
     return sum;
 }
@@ -200,11 +207,12 @@ void quad_tokens(const std::int8_t* qw, const float* qs, std::size_t nb,
 
 /**
  * Tokens per tile: as many quantized activation rows (cols bytes each)
- * as fit about 32 KiB, beside the packed quad, in a 64 KiB L1.
+ * as fit about 64 KiB, as the baseline kernels' tile, so each quad is
+ * packed once per 64 tokens at most widths.
  */
 std::uint32_t token_tile(std::size_t cols) {
     return static_cast<std::uint32_t>(
-        std::clamp<std::size_t>((std::size_t{32} << 10) / cols, 4, 64));
+        std::clamp<std::size_t>((std::size_t{64} << 10) / cols, 4, 64));
 }
 
 /**
