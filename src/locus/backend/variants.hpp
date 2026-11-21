@@ -97,6 +97,21 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
 }  // namespace neon_i8mm
 #endif
+#if defined(LOCUS_HAS_NEON_DOTPROD_FAST_VARIANT)
+/**
+ * Q8_0 weights through sdot by lane on four interleaved rows
+ * (matvec_neon_dotprod_fast.cpp), in neon_i8mm's float order: the
+ * registry uses them only under cpu_fast() on a CPU with dotprod and
+ * no i8mm. A token gets the same bits alone or batched, and the same
+ * as neon_i8mm's. Other weight types go to the baseline kernels.
+ */
+namespace neon_dotprod_fast {
+void matvec_neon_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out);
+void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
+                           std::span<float> out_batch, std::uint32_t n);
+}  // namespace neon_dotprod_fast
+#endif
 #endif
 
 #if defined(__x86_64__)

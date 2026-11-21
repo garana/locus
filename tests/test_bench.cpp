@@ -185,11 +185,27 @@ TEST_CASE("bench: neon q8k IQ TQ and Q2_K", "[.][bench]") {
 TEST_CASE("bench: neon q8k block-32 prefill batch", "[.][bench]") {
     // i#1076: Qwen2.5 0.5B's FFN up projection (4864 x 896) against a
     // 64-token batch, one thread, ns per token; against 64 one-token
-    // calls. The best backend's ops, so the dotprod kernels where the
-    // CPU has them.
+    // calls. The best backend's ops (the dotprod kernels where the CPU
+    // has them; under LOCUS_CPU_FAST its fast path), then the dotprod
+    // fast path itself where it is built.
     using TT = locus::gguf::TensorType;
-    const auto& ops = locus::backend::best_backend().ops;
-    REQUIRE(ops.matvec_q8k_batch != nullptr);
+    struct Path {
+        const char* name;
+        void (*one)(const Mat&, std::span<const float>, std::span<float>);
+        void (*batch)(const Mat&, std::span<const float>, std::span<float>,
+                      std::uint32_t);
+    };
+    const auto& best = locus::backend::best_backend().ops;
+    REQUIRE(best.matvec_q8k_batch != nullptr);
+    std::vector<Path> paths{{"best", best.matvec_q8k, best.matvec_q8k_batch}};
+#if defined(LOCUS_HAS_NEON_DOTPROD_FAST_VARIANT)
+    if (locus::sys::detect().dotprod) {
+        paths.push_back({"dotprod_fast",
+                         &locus::backend::neon_dotprod_fast::matvec_neon_q8k,
+                         &locus::backend::neon_dotprod_fast::
+                             matvec_batch_neon_q8k});
+    }
+#endif
     const std::uint32_t rows = 4864, cols = 896;
     constexpr std::uint32_t kN = 64;
     std::mt19937 rng(1076);
@@ -207,21 +223,23 @@ TEST_CASE("bench: neon q8k block-32 prefill batch", "[.][bench]") {
         auto w = make_kquant(rows, cols * 8, bytes, 0, -1, 9);
         Mat m{type, w.data(), rows, cols};
         std::vector<float> out(rows);
-        const double one = time_matvec(
-            ops.matvec_q8k, m, std::span<const float>(xb.data(), cols), out,
-            iters);
-        ops.matvec_q8k_batch(m, xb, ob, kN);  // warm
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < iters; ++i) {
-            ops.matvec_q8k_batch(m, xb, ob, kN);
+        for (const Path& p : paths) {
+            const double one = time_matvec(
+                p.one, m, std::span<const float>(xb.data(), cols), out,
+                iters);
+            p.batch(m, xb, ob, kN);  // warm
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i) {
+                p.batch(m, xb, ob, kN);
+            }
+            const double b = std::chrono::duration<double, std::nano>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count() /
+                             iters / kN;
+            WARN(name << " " << p.name << " " << rows << "x" << cols
+                      << ": one-token " << one << "ns; batched " << kN
+                      << ": " << b << "ns/token (" << one / b << "x)");
         }
-        const double b = std::chrono::duration<double, std::nano>(
-                             std::chrono::steady_clock::now() - t0)
-                             .count() /
-                         iters / kN;
-        WARN(name << " " << rows << "x" << cols << ": one-token " << one
-                  << "ns; batched " << kN << ": " << b << "ns/token ("
-                  << one / b << "x)");
     }
     SUCCEED();
 }

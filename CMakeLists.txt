@@ -306,6 +306,23 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
         target_compile_definitions(locus PUBLIC
             LOCUS_HAS_NEON_I8MM_VARIANT=1)
     endif()
+    # sdot by lane on four interleaved rows: Q8_0 in the same float
+    # order as neon_i8mm, used only under LOCUS_CPU_FAST on a CPU with
+    # dotprod and no i8mm.
+    check_cxx_source_compiles("
+        #include <arm_neon.h>
+        __attribute__((target(\"arch=armv8.2-a+dotprod\")))
+        int32x4_t f(int32x4_t a, int8x16_t b, int8x16_t c) {
+            return vdotq_laneq_s32(a, b, c, 1);
+        }
+        int main() { return 0; }" LOCUS_CC_DOTPROD_LANE_TARGET)
+    if(LOCUS_CC_DOTPROD_LANE_TARGET)
+        list(APPEND LOCUS_SIMD_VARIANTS "neon_dotprod_fast")
+        target_sources(locus PRIVATE
+            src/locus/backend/matvec_neon_dotprod_fast.cpp)
+        target_compile_definitions(locus PUBLIC
+            LOCUS_HAS_NEON_DOTPROD_FAST_VARIANT=1)
+    endif()
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
