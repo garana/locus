@@ -104,4 +104,24 @@ SnacCodes OrpheusCodecSampler::codes_lenient() const {
         true);
 }
 
+std::vector<tok::TokenId> orpheus_prompt_ids(const tok::Tokenizer& tok,
+                                             std::string_view voice,
+                                             std::string_view input) {
+    constexpr tok::TokenId kStart = 128259;
+    constexpr tok::TokenId kEnd[4] = {128009, 128260, 128261, 128257};
+    std::string text(voice);
+    text += ": ";
+    const tok::TextRange client[] = {
+        {0, voice.size()}, {text.size(), text.size() + input.size()}};
+    text += input;
+    const auto body =
+        tok.encode_literal(text, true, client, /*user_defined=*/true);
+    std::vector<tok::TokenId> ids;
+    ids.reserve(body.size() + 5);
+    ids.push_back(kStart);
+    ids.insert(ids.end(), body.begin(), body.end());
+    for (const auto e : kEnd) ids.push_back(e);
+    return ids;
+}
+
 }  // namespace locus::model

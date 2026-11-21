@@ -3425,18 +3425,7 @@ void OpenAiServer::install_routes() {
                         "response_format must be wav or pcm");
                 }
 
-                // Orpheus reference prompt wrapping: a start marker, the
-                // "voice: text" tokenization (with BOS), then the four
-                // end markers.
-                constexpr tok::TokenId kStart = 128259;
-                const tok::TokenId kEnd[4] = {128009, 128260, 128261,
-                                              128257};
-                auto btoks = tok_.encode(voice + ": " + input, true);
-                std::vector<tok::TokenId> ids;
-                ids.reserve(btoks.size() + 5);
-                ids.push_back(kStart);
-                ids.insert(ids.end(), btoks.begin(), btoks.end());
-                for (auto e : kEnd) ids.push_back(e);
+                auto ids = model::orpheus_prompt_ids(tok_, voice, input);
 
                 // Sampling. Defaults are the Orpheus reference settings
                 // (temperature 0.6, top_p 0.8, repetition penalty 1.3);

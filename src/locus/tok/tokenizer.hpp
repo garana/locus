@@ -44,16 +44,21 @@ class Tokenizer {
     /**
      * As encode(), but a control token's text that overlaps one of
      * `literal`'s ranges is encoded as plain text, so a chat message
-     * cannot open a role (i#1128). User-defined tokens still match.
-     * Tokenizers without a special-token pass encode as encode().
+     * cannot open a role (i#1128). User-defined tokens still match,
+     * unless `user_defined` is set. Tokenizers without a special-token
+     * pass encode as encode().
      *
      * @param literal Ranges of `text` that came from a client.
+     * @param user_defined Also keep user-defined tokens' text as text
+     *     (Orpheus' speech markers and audio codes are user-defined).
      * @returns Token ids; prepends BOS when add_bos.
      */
     virtual std::vector<TokenId> encode_literal(
         std::string_view text, bool add_bos,
-        std::span<const TextRange> literal) const {
+        std::span<const TextRange> literal,
+        bool user_defined = false) const {
         (void)literal;
+        (void)user_defined;
         return encode(text, add_bos);
     }
 

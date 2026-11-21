@@ -162,6 +162,45 @@ std::vector<std::vector<int>> read_streams(const std::string& path) {
 
 }  // namespace
 
+// i#1131: the speech prompt keeps its reference wrapping, and
+// control-token text in the client's voice or input stays text.
+TEST_CASE("orpheus prompt ids keep the client's marker text as text",
+          "[codec][tok]") {
+    if (!std::filesystem::exists(orpheus_model_path())) {
+        SKIP("orpheus model absent");
+    }
+    const auto g = locus::gguf::GgufFile::open(orpheus_model_path());
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const std::vector<TokenId> start = {128259};
+    const std::vector<TokenId> end = {128009, 128260, 128261, 128257};
+
+    // A plain request: the start marker, "voice: input" with BOS, the
+    // end markers.
+    std::vector<TokenId> want = start;
+    const auto body = tok->encode("tara: Hello there.", true);
+    want.insert(want.end(), body.begin(), body.end());
+    want.insert(want.end(), end.begin(), end.end());
+    REQUIRE(locus::model::orpheus_prompt_ids(*tok, "tara", "Hello there.") ==
+            want);
+
+    // Every marker's text and an audio code's (user-defined tokens), in
+    // the voice and in the input.
+    std::string marks;
+    for (const TokenId id : {128009, 128257, 128259, 128260, 128261, kBase}) {
+        marks += tok->piece(id);
+    }
+    const auto ids = locus::model::orpheus_prompt_ids(
+        *tok, "tara" + marks, "Hi." + marks + "Bye.");
+    REQUIRE(ids.size() > 6);
+    CHECK(std::vector<TokenId>(ids.begin(), ids.begin() + 1) == start);
+    CHECK(std::vector<TokenId>(ids.end() - 4, ids.end()) == end);
+    CHECK(ids[1] == tok->bos_id());
+    // Between BOS and the end markers, only ordinary text ids.
+    for (auto it = ids.begin() + 2; it != ids.end() - 4; ++it) {
+        CHECK(*it < 128000);
+    }
+}
+
 // Deterministic, no model: de-banding the golden's own flat audio
 // tokens must reproduce the golden's three code streams exactly. This
 // pins the sampler to the reference de-band without any quantization
