@@ -42,11 +42,14 @@ inline constexpr std::uint64_t kQwenVlMaxPixels = 12845056;
  * expands the pad to the image's tokens.
  *
  * @param turns The conversation; the last turn must be the user's.
+ * @param content When set, receives the ranges of the client's text
+ *     (the system prompt and the turns), for qwen_vl_chat_ids.
  * @throws std::invalid_argument on an unknown role, no turns, or a
  *     last turn that is not the user's.
  */
 std::string qwen_vl_chat_text(std::span<const ChatTurn> turns,
-                              const std::optional<std::string>& system);
+                              const std::optional<std::string>& system,
+                              std::vector<tok::TextRange>* content = nullptr);
 
 /** One image as the processor prepares it. */
 struct QwenVlImage {
@@ -99,12 +102,15 @@ struct QwenVlPrompt {
  * from s + max(rows, cols).
  *
  * @param grids Each image's merged rows and columns, in order.
+ * @param content The client's text ranges: control-token text there
+ *     stays text, so a turn cannot add a pad or open a role.
  * @throws std::invalid_argument when the tokenizer has no single
  *     <|image_pad|> token, or the pads and the grids differ in count.
  */
 QwenVlPrompt qwen_vl_chat_ids(
     const tok::Tokenizer& tok, std::string_view text,
-    std::span<const std::pair<std::uint32_t, std::uint32_t>> grids);
+    std::span<const std::pair<std::uint32_t, std::uint32_t>> grids,
+    std::span<const tok::TextRange> content = {});
 
 /**
  * The prompt's prefill: each image through the vision tower, its rows

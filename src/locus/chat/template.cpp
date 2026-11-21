@@ -55,13 +55,25 @@ ChatTemplate ChatTemplate::from_gguf(const gguf::GgufFile& g) {
 
 std::string ChatTemplate::apply(std::span<const Message> messages,
                                 bool add_assistant_prompt) const {
-    std::string out;
+    return render(messages, add_assistant_prompt).text;
+}
+
+ChatTemplate::Prompt ChatTemplate::render(
+    std::span<const Message> messages, bool add_assistant_prompt) const {
+    Prompt p;
+    std::string& out = p.text;
+    // Appends message text and records its range.
+    const auto put = [&](std::string_view s) {
+        p.content.push_back({out.size(), out.size() + s.size()});
+        out += s;
+    };
     switch (family_) {
         case Family::kLlama3: {
             for (const Message& m : messages) {
                 out += "<|start_header_id|>" + m.role +
-                       "<|end_header_id|>\n\n" + m.content +
-                       "<|eot_id|>";
+                       "<|end_header_id|>\n\n";
+                put(m.content);
+                out += "<|eot_id|>";
             }
             if (add_assistant_prompt) {
                 out += "<|start_header_id|>assistant"
@@ -71,8 +83,9 @@ std::string ChatTemplate::apply(std::span<const Message> messages,
         }
         case Family::kChatML: {
             for (const Message& m : messages) {
-                out += "<|im_start|>" + m.role + "\n" +
-                       m.content + "<|im_end|>\n";
+                out += "<|im_start|>" + m.role + "\n";
+                put(m.content);
+                out += "<|im_end|>\n";
             }
             if (add_assistant_prompt) {
                 out += "<|im_start|>assistant\n";
@@ -81,8 +94,9 @@ std::string ChatTemplate::apply(std::span<const Message> messages,
         }
         case Family::kZephyr: {
             for (const Message& m : messages) {
-                out += "<|" + m.role + "|>\n" + m.content +
-                       "</s>\n";
+                out += "<|" + m.role + "|>\n";
+                put(m.content);
+                out += "</s>\n";
             }
             if (add_assistant_prompt) {
                 out += "<|assistant|>\n";
@@ -98,13 +112,17 @@ std::string ChatTemplate::apply(std::span<const Message> messages,
                 } else if (m.role == "user") {
                     out += "[INST] ";
                     if (!system.empty()) {
-                        out += "<<SYS>>\n" + system +
-                               "\n<</SYS>>\n\n";
+                        out += "<<SYS>>\n";
+                        put(system);
+                        out += "\n<</SYS>>\n\n";
                         system.clear();
                     }
-                    out += m.content + " [/INST]";
+                    put(m.content);
+                    out += " [/INST]";
                 } else {
-                    out += " " + m.content + " ";
+                    out += " ";
+                    put(m.content);
+                    out += " ";
                 }
             }
             break;
@@ -112,11 +130,15 @@ std::string ChatTemplate::apply(std::span<const Message> messages,
         case Family::kDeepSeek: {
             for (const Message& m : messages) {
                 if (m.role == "user") {
-                    out += kDsUser + m.content;
+                    out += kDsUser;
+                    put(m.content);
                 } else if (m.role == "assistant") {
-                    out += kDsAssistant + m.content + kDsEos;
+                    out += kDsAssistant;
+                    put(m.content);
+                    out += kDsEos;
                 } else {
-                    out += m.content + "\n\n";
+                    put(m.content);
+                    out += "\n\n";
                 }
             }
             if (add_assistant_prompt) {
@@ -127,11 +149,16 @@ std::string ChatTemplate::apply(std::span<const Message> messages,
         case Family::kDeepSeek2: {
             for (const Message& m : messages) {
                 if (m.role == "user") {
-                    out += "User: " + m.content + "\n\n";
+                    out += "User: ";
+                    put(m.content);
+                    out += "\n\n";
                 } else if (m.role == "assistant") {
-                    out += "Assistant: " + m.content + kDsEos;
+                    out += "Assistant: ";
+                    put(m.content);
+                    out += kDsEos;
                 } else {
-                    out += m.content + "\n\n";
+                    put(m.content);
+                    out += "\n\n";
                 }
             }
             if (add_assistant_prompt) {
@@ -142,11 +169,15 @@ std::string ChatTemplate::apply(std::span<const Message> messages,
         case Family::kDeepSeekCoder: {
             for (const Message& m : messages) {
                 if (m.role == "user") {
-                    out += "### Instruction:\n" + m.content + "\n";
+                    out += "### Instruction:\n";
+                    put(m.content);
+                    out += "\n";
                 } else if (m.role == "assistant") {
-                    out += "### Response:\n" + m.content + "\n<|EOT|>\n";
+                    out += "### Response:\n";
+                    put(m.content);
+                    out += "\n<|EOT|>\n";
                 } else {
-                    out += m.content;
+                    put(m.content);
                 }
             }
             if (add_assistant_prompt) {
@@ -159,12 +190,12 @@ std::string ChatTemplate::apply(std::span<const Message> messages,
                 if (!out.empty()) {
                     out += "\n";
                 }
-                out += m.content;
+                put(m.content);
             }
             break;
         }
     }
-    return out;
+    return p;
 }
 
 std::string_view ChatTemplate::name() const {

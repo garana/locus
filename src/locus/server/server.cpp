@@ -1664,13 +1664,13 @@ void OpenAiServer::qwen_vision_chat(bool anthropic, const VisionChat& chat,
                                                     decoded.back());
             grids.emplace_back(h / ps / mg, w / ps / mg);
         }
-        const auto p = image::qwen_vl_chat_ids(
-            tok_,
-            image::qwen_vl_chat_text(
-                chat.turns, chat.has_system
-                                ? std::optional<std::string>(chat.system)
-                                : std::nullopt),
-            grids);
+        std::vector<tok::TextRange> content;
+        const std::string text = image::qwen_vl_chat_text(
+            chat.turns,
+            chat.has_system ? std::optional<std::string>(chat.system)
+                            : std::nullopt,
+            &content);
+        const auto p = image::qwen_vl_chat_ids(tok_, text, grids, content);
 
         if (!vision_cache_) {
             vision_cache_ =
@@ -1789,13 +1789,15 @@ void OpenAiServer::vision_chat(bool anthropic, const VisionChat& chat,
             embs.push_back(vision_->align(
                 vision_->features(vision_->to_pixels(sq.rgb), op), op));
         }
+        std::vector<tok::TextRange> content;
         const std::string text = image::janus_chat_text(
             chat.turns,
             chat.has_system ? std::string_view(chat.system)
                             : image::kJanusSystemPrompt,
-            tok_.piece(tok_.eos_id()));
+            tok_.piece(tok_.eos_id()), &content);
         std::size_t n_images = 0;
-        const auto ids = image::janus_chat_ids(tok_, text, *vision_, n_images);
+        const auto ids =
+            image::janus_chat_ids(tok_, text, *vision_, n_images, content);
         if (n_images != embs.size()) {
             throw std::runtime_error("vision chat: image count mismatch");
         }
@@ -2422,7 +2424,9 @@ void OpenAiServer::install_routes() {
                          const http::RequestContext& ctx, bool chat) {
         auth_event("create", chat ? "chat" : "completion", ctx.identity);
         json body;
-        std::string prompt;
+        // A raw /v1/completions prompt has no content ranges: there the
+        // client writes the control tokens on purpose.
+        chat::ChatTemplate::Prompt prompt;
         std::uint32_t max_tokens = 16;
         bool stream = false;
         std::vector<ToolSpec> tools;
@@ -2452,14 +2456,14 @@ void OpenAiServer::install_routes() {
                                  render_tools_system(tools) +
                                      (tool_history ? kToolResultNote : "")});
                 }
-                prompt = opt_.chat_template.apply(msgs);
+                prompt = opt_.chat_template.render(msgs);
             } else if (!chat) {
                 if (!body.contains("prompt") ||
                     !body["prompt"].is_string()) {
                     throw std::invalid_argument(
                         "prompt must be a string");
                 }
-                prompt = body["prompt"].get<std::string>();
+                prompt.text = body["prompt"].get<std::string>();
             }
             max_tokens =
                 read_max_tokens(body, opt_.max_tokens_cap, max_tokens);
@@ -2482,7 +2486,8 @@ void OpenAiServer::install_routes() {
         auto [sampling, seed] = parse_sampling(body);
         std::unique_ptr<model::TokenConstraint> constraint =
             output_constraint(std::move(grammar));
-        auto prompt_ids = tok_.encode(prompt, true);
+        auto prompt_ids =
+            tok_.encode_literal(prompt.text, true, prompt.content);
         const std::uint32_t n_prompt =
             static_cast<std::uint32_t>(prompt_ids.size());
         // Reject a prompt the KV pool can never hold BEFORE it enters
@@ -2758,7 +2763,7 @@ void OpenAiServer::install_routes() {
                                   http::ServerResponse& res,
                                   const http::RequestContext& ctx) {
         auth_event("create", "messages", ctx.identity);
-        std::string prompt;
+        chat::ChatTemplate::Prompt prompt;
         std::uint32_t max_tokens = 16;
         std::uint32_t input_tokens = 0;
         bool stream = false;
@@ -2791,12 +2796,12 @@ void OpenAiServer::install_routes() {
                                  render_tools_system(tools) +
                                      (tool_history ? kToolResultNote : "")});
                 }
-                prompt = opt_.chat_template.apply(msgs);
+                prompt = opt_.chat_template.render(msgs);
                 max_tokens = read_count(body, "max_tokens",
                                         opt_.max_tokens_cap, max_tokens);
                 stream = body.value("stream", false);
                 std::tie(sampling, seed) = parse_sampling(body);
-                ids = tok_.encode(prompt, true);
+                ids = tok_.encode_literal(prompt.text, true, prompt.content);
                 input_tokens = static_cast<std::uint32_t>(ids.size());
             }
         } catch (const std::exception& e) {
@@ -4175,8 +4180,9 @@ void OpenAiServer::install_routes() {
                 rq.max_output_tokens.value_or(opt_.max_tokens_cap),
                 opt_.max_tokens_cap));
         auto [sampling, seed] = parse_sampling(body);
+        const auto prompt = opt_.chat_template.render(rq.messages);
         auto prompt_ids =
-            tok_.encode(opt_.chat_template.apply(rq.messages), true);
+            tok_.encode_literal(prompt.text, true, prompt.content);
         const auto n_prompt = static_cast<std::uint32_t>(prompt_ids.size());
         if (const std::string why = loop_.admit_error(n_prompt);
             !why.empty()) {

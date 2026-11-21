@@ -3,8 +3,10 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "locus/gguf/gguf.hpp"
+#include "locus/tok/tokenizer.hpp"
 
 namespace locus::chat {
 
@@ -24,7 +26,8 @@ struct Message {
  *
  * BOS is never emitted here -- the tokenizer adds it via
  * encode(add_bos). Role markers that are control tokens are
- * matched by the BPE special-token pass during encoding.
+ * matched by the BPE special-token pass during encoding; render()
+ * marks the message text, which encode_literal() keeps as text.
  */
 class ChatTemplate {
   public:
@@ -53,6 +56,20 @@ class ChatTemplate {
      */
     std::string apply(std::span<const Message> messages,
                       bool add_assistant_prompt = true) const;
+
+    /** A rendered prompt and where its message text lies. */
+    struct Prompt {
+        std::string text;
+        /** Byte ranges of `text` copied from message content. */
+        std::vector<tok::TextRange> content;
+    };
+
+    /**
+     * As apply(), and records each message's content range, for
+     * tok::Tokenizer::encode_literal().
+     */
+    Prompt render(std::span<const Message> messages,
+                  bool add_assistant_prompt = true) const;
 
     Family family() const { return family_; }
 

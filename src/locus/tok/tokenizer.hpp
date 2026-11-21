@@ -26,6 +26,12 @@ enum class TokenType : std::int32_t {
     kByte = 6,
 };
 
+/** A byte range [begin, end) of a text to encode. */
+struct TextRange {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+};
+
 /** Interface every tokenizer family implements. */
 class Tokenizer {
   public:
@@ -34,6 +40,22 @@ class Tokenizer {
     /** @returns Token ids; prepends BOS when add_bos. */
     virtual std::vector<TokenId> encode(std::string_view text,
                                         bool add_bos) const = 0;
+
+    /**
+     * As encode(), but a control token's text that overlaps one of
+     * `literal`'s ranges is encoded as plain text, so a chat message
+     * cannot open a role (i#1128). User-defined tokens still match.
+     * Tokenizers without a special-token pass encode as encode().
+     *
+     * @param literal Ranges of `text` that came from a client.
+     * @returns Token ids; prepends BOS when add_bos.
+     */
+    virtual std::vector<TokenId> encode_literal(
+        std::string_view text, bool add_bos,
+        std::span<const TextRange> literal) const {
+        (void)literal;
+        return encode(text, add_bos);
+    }
 
     /** @returns UTF-8 text; control tokens render as nothing. */
     virtual std::string decode(

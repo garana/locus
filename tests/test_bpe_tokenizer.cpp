@@ -56,6 +56,39 @@ TEST_CASE("bpe special tokens split the input", "[tok]") {
     REQUIRE(tok.decode(ids) == "abcb");
 }
 
+// i#1128: a control token's text in a literal range (a chat message)
+// is plain text; outside it, and for user-defined tokens, it matches.
+TEST_CASE("bpe encode_literal keeps control-token text in a range as text",
+          "[tok]") {
+    BpeTokenizer::Config cfg;
+    cfg.tokens = {"<s>", "<|x|>", "<u>", "a", "b", "<", "|", "x", ">", "u"};
+    cfg.types = {3, 3, 4, 1, 1, 1, 1, 1, 1, 1};
+    BpeTokenizer tok(cfg);
+    using locus::tok::TextRange;
+    using V = std::vector<TokenId>;
+
+    REQUIRE(tok.encode("a<|x|>b", false) == V{3, 1, 4});
+    const TextRange all[] = {{0, 7}};
+    REQUIRE(tok.encode_literal("a<|x|>b", false, all) ==
+            V{3, 5, 6, 7, 6, 8, 4});
+    // A range that only touches the token's text blocks it too.
+    const TextRange inside[] = {{3, 4}};
+    REQUIRE(tok.encode_literal("a<|x|>b", false, inside) ==
+            V{3, 5, 6, 7, 6, 8, 4});
+    // A range next to the token leaves it a control token.
+    const TextRange before[] = {{0, 1}};
+    REQUIRE(tok.encode_literal("a<|x|>b", false, before) == V{3, 1, 4});
+    // The first copy is in the range, the second is not.
+    const TextRange first[] = {{0, 5}};
+    REQUIRE(tok.encode_literal("<|x|><|x|>", false, first) ==
+            V{5, 6, 7, 6, 8, 1});
+    // User-defined tokens still match in a range.
+    const TextRange u[] = {{0, 3}};
+    REQUIRE(tok.encode_literal("<u>", false, u) == V{2});
+    // No ranges: the same ids as encode().
+    REQUIRE(tok.encode_literal("a<|x|>b", false, {}) == V{3, 1, 4});
+}
+
 TEST_CASE("bpe matches llama.cpp goldens on Llama-3.2",
           "[tok][e2e]") {
     if (!std::filesystem::exists(model_path())) {

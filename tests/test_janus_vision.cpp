@@ -171,10 +171,15 @@ TEST_CASE("janus chat ids match the reference prompt",
         g, static_cast<std::uint32_t>(*g.get_uint("llama.embedding_length")));
     const std::vector<locus::image::ChatTurn> turns = {
         {"user", "<image_placeholder>\nWhat is on the table?"}};
+    // The client's text ranges (i#1128) leave the placeholder out, so
+    // it still expands.
+    std::vector<locus::tok::TextRange> content;
     const std::string text = locus::image::janus_chat_text(
-        turns, locus::image::kJanusSystemPrompt, tok->piece(tok->eos_id()));
+        turns, locus::image::kJanusSystemPrompt, tok->piece(tok->eos_id()),
+        &content);
     std::size_t images = 0;
-    const auto ids = locus::image::janus_chat_ids(*tok, text, v, images);
+    const auto ids =
+        locus::image::janus_chat_ids(*tok, text, v, images, content);
     REQUIRE(images == 1);
     REQUIRE(ids == std::vector<locus::tok::TokenId>(ref.prompt.begin(),
                                                     ref.prompt.end()));
