@@ -389,6 +389,12 @@ class VulkanContext {
     /** @returns The device's name (VkPhysicalDeviceProperties). */
     const std::string& device_name() const;
 
+    /** PCI vendor id of NVIDIA (VkPhysicalDeviceProperties::vendorID). */
+    static constexpr std::uint32_t kVendorNvidia = 0x10DE;
+
+    /** @returns The device's PCI vendor id (VkPhysicalDeviceProperties). */
+    std::uint32_t vendor_id() const;
+
     /**
      * @returns Whether the quantized matmuls prefetch the next stage
      * into registers: on except on V3D, LOCUS_VK_MATMUL_PREFETCH=0 or

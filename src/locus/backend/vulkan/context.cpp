@@ -1109,6 +1109,7 @@ struct VulkanContext::Impl {
     /** Device maxComputeSharedMemorySize (bytes), read at init. */
     std::uint32_t max_shared_mem = 0;
     std::string device_name;  ///< VkPhysicalDeviceProperties::deviceName
+    std::uint32_t vendor_id = 0;  ///< VkPhysicalDeviceProperties::vendorID
     /** Whether the matmul smaller-tile step-down has been logged. */
     bool matmul_stepdown_logged = false;
     std::chrono::steady_clock::time_point batch_t0;
@@ -1546,6 +1547,7 @@ struct VulkanContext::Impl {
             vkGetPhysicalDeviceProperties(phys, &pp);
             max_shared_mem = pp.limits.maxComputeSharedMemorySize;
             device_name = pp.deviceName;
+            vendor_id = pp.vendorID;
             const char* e = std::getenv("LOCUS_VK_MATMUL_PREFETCH");
             matmul_prefetch =
                 e != nullptr ? std::string_view(e) != "0"
@@ -2543,6 +2545,8 @@ const std::string& VulkanContext::device_name() const {
     return impl_->device_name;
 }
 
+std::uint32_t VulkanContext::vendor_id() const { return impl_->vendor_id; }
+
 bool VulkanContext::matmul_prefetch() const {
     return impl_->matmul_prefetch;
 }
@@ -2742,6 +2746,7 @@ bool VulkanContext::serial_dispatch() const { no_kernels(); }
 bool VulkanContext::has_f16() const { no_kernels(); }
 bool VulkanContext::small_variant(Kernel) const { no_kernels(); }
 const std::string& VulkanContext::device_name() const { no_kernels(); }
+std::uint32_t VulkanContext::vendor_id() const { no_kernels(); }
 bool VulkanContext::matmul_prefetch() const { no_kernels(); }
 const VulkanContext::Profile& VulkanContext::profile() const {
     no_kernels();
