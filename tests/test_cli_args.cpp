@@ -447,6 +447,38 @@ TEST_CASE("locus-run exits 2 on a negative numeric flag", "[cli]") {
     REQUIRE(WEXITSTATUS(rc) == 2);
 }
 
+TEST_CASE("locus-run fails with a reason on a prompt over the KV pool",
+          "[cli]") {
+    // i#1118: the engine refuses a prompt the pool can never hold, and
+    // locus-run used to print nothing and exit 0.
+    const std::string model =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/stories260K.gguf";
+    if (!std::filesystem::exists(model)) {
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
+    }
+    std::string prompt;
+    for (int i = 0; i < 20; ++i) {
+        prompt += "Once upon a time ";
+    }
+    const auto log = std::filesystem::temp_directory_path() /
+                     ("locus_run_pool_" + std::to_string(::getpid()));
+    const std::string cmd = std::string("'") + LOCUS_RUN_BIN +
+                            "' --backend scalar --ctx 32 '" + model + "' '" +
+                            prompt + "' 4 >/dev/null 2>'" + log.string() +
+                            "'";
+    INFO(cmd);
+    const int rc = std::system(cmd.c_str());
+    std::ifstream in(log);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    std::filesystem::remove(log);
+    INFO(text);
+    REQUIRE(WIFEXITED(rc));
+    REQUIRE(WEXITSTATUS(rc) == 1);
+    CHECK(text.find("KV blocks but the pool holds only") != std::string::npos);
+    CHECK(text.find("--ctx") != std::string::npos);
+}
+
 TEST_CASE("the speculative flag parses", "[cli]") {
     std::array<const char*, 3> argv1 = {"prog", "--speculative",
                                         "m.gguf"};
