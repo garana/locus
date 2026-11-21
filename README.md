@@ -142,7 +142,10 @@ as llama.cpp does; `LOCUS_F32_ACTIVATIONS=1` selects f32 activations.
 (today every CPU softmax: attention, including the image and video
 models', MoE routing and the image encoders, about 2x faster; and on
 ARM CPUs with i8mm, such as the M2 and later, Q8_0 weights through
-`smmla`, about 27% faster prefill on an M2 Pro; on Apple, prefill
+`smmla`, about 27% faster prefill on an M2 Pro; on ARM CPUs with
+dotprod but no i8mm, such as the Raspberry Pi 5, Q8_0 weights by `sdot`
+lane on four interleaved rows, in the `smmla` path's float order, about
+51% faster prefill and 10% slower decode on Qwen2.5 0.5B; on Apple, prefill
 matmuls of 32 tokens or more through Accelerate's `cblas_sgemm` in
 2048-token chunks, about 26% faster on a 1680-token prompt on an M2
 Pro; on x86 CPUs with AVX but not AVX2, one-token Q4_K and Q6_K rows
