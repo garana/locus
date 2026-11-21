@@ -15,6 +15,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan/context.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
@@ -163,7 +164,8 @@ TEST_CASE("vulkan batch-invariant mode defaults on for Apple V3D and "
     INFO("device " << name);
     const bool want = name.find("Apple") != std::string::npos ||
                       name.find("V3D") != std::string::npos ||
-                      name.find("NVIDIA") != std::string::npos;
+                      locus::backend::vulkan_device_vendor() ==
+                          locus::backend::vk::VulkanContext::kVendorNvidia;
     CHECK(locus::backend::vulkan_batch_invariant() == want);
     if (env != nullptr) {
         ::setenv("LOCUS_VK_BATCH_INVARIANT", saved.c_str(), 1);

@@ -294,6 +294,12 @@ bool vulkan_backend_usable();
  */
 std::string vulkan_device_name();
 
+/**
+ * @returns The Vulkan device's PCI vendor id (0x10DE for NVIDIA), or 0
+ *     when no device is usable; opens the device as vulkan_device_name.
+ */
+std::uint32_t vulkan_device_vendor();
+
 /** A Vulkan device with a compute queue (i#572). */
 struct VulkanDeviceInfo {
     std::string name;

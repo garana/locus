@@ -2053,7 +2053,7 @@ int batch_invariant_state() {
             const std::string name = vulkan_device_name();
             v = name.find("Apple") != std::string::npos ||
                         name.find("V3D") != std::string::npos ||
-                        name.find("NVIDIA") != std::string::npos
+                        vulkan_device_vendor() == VulkanContext::kVendorNvidia
                     ? 2
                     : 0;
         }
@@ -2387,6 +2387,14 @@ std::string vulkan_device_name() {
     }
     std::lock_guard lk(state_mu());
     return state().ctx.device_name();
+}
+
+std::uint32_t vulkan_device_vendor() {
+    if (!vulkan_backend_usable()) {
+        return 0;
+    }
+    std::lock_guard lk(state_mu());
+    return state().ctx.vendor_id();
 }
 
 std::vector<VulkanDeviceInfo> vulkan_devices() {
