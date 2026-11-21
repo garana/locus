@@ -27,7 +27,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
 #include <span>
 #include <vector>
 
@@ -50,11 +49,17 @@ constexpr std::size_t kBlk = 34;  // f16 scale + 32 int8
 /** Block b's f16 scales of 4 rows, through one hardware convert
  *  (exact). */
 inline float32x4_t scales4(const std::byte* const rows[4], std::size_t b) {
-    std::uint16_t h[4];
-    for (int k = 0; k < 4; ++k) {
-        std::memcpy(&h[k], rows[k] + b * kBlk, sizeof(h[k]));
-    }
-    return vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(h)));
+    // Lane loads straight from the blocks: a copy through a stack
+    // array stalls on the store-to-load path of in-order-ish cores.
+    const auto at = [&](int k) {
+        return reinterpret_cast<const std::uint16_t*>(rows[k] + b * kBlk);
+    };
+    uint16x4_t h = vdup_n_u16(0);
+    h = vld1_lane_u16(at(0), h, 0);
+    h = vld1_lane_u16(at(1), h, 1);
+    h = vld1_lane_u16(at(2), h, 2);
+    h = vld1_lane_u16(at(3), h, 3);
+    return vcvt_f32_f16(vreinterpret_f16_u16(h));
 }
 
 /**
@@ -151,32 +156,38 @@ inline float32x4_t quad_step(float32x4_t sum, const int8x16_t wv[8],
 }
 
 /**
- * Rows r0 .. r0 + 3 against one token, from the weight rows as stored
- * (no transpose): the decode path, where a packed quad would serve one
- * token only. Each row's block dot is two plain sdot, and three
- * pairwise adds fold the 4 rows' lanes into one vector of the 4 exact
- * integer dots; the float steps are quad_step's, so the same bits.
+ * Q quads of rows from r0 (4 * Q rows) against one token, from the
+ * weight rows as stored (no transpose): the decode path, where a
+ * packed quad would serve one token only. Each row's block dot is two
+ * plain sdot, and three pairwise adds fold a quad's 4 rows into one
+ * vector of their exact integer dots; the float steps are quad_step's,
+ * so the same bits. Two quads per pass load each activation block once
+ * for 8 rows and give the core two independent sums.
  */
-float32x4_t quad_direct(const Mat& w, std::uint32_t r0, std::size_t nb,
-                        const float* d, const std::int8_t* q) {
-    const std::byte* rows[4];
-    quad_rows(w, r0, nb, rows);
-    float32x4_t sum = vdupq_n_f32(0.0f);
+template <int Q>
+void quad_direct(const Mat& w, std::uint32_t r0, std::size_t nb,
+                 const float* d, const std::int8_t* q, float32x4_t sum[Q]) {
+    const std::byte* rows[Q][4];
+    for (int g = 0; g < Q; ++g) {
+        quad_rows(w, r0 + 4 * g, nb, rows[g]);
+        sum[g] = vdupq_n_f32(0.0f);
+    }
     for (std::size_t b = 0; b < nb; ++b) {
         const int8x16_t x0 = vld1q_s8(q + b * 32);
         const int8x16_t x1 = vld1q_s8(q + b * 32 + 16);
-        int32x4_t s[4];
-        for (int k = 0; k < 4; ++k) {
-            int8x16_t lo, hi;
-            row_quants(rows, k, b, lo, hi);
-            s[k] = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, x0), hi, x1);
+        for (int g = 0; g < Q; ++g) {
+            int32x4_t s[4];
+            for (int k = 0; k < 4; ++k) {
+                int8x16_t lo, hi;
+                row_quants(rows[g], k, b, lo, hi);
+                s[k] = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, x0), hi, x1);
+            }
+            const int32x4_t isum = vpaddq_s32(vpaddq_s32(s[0], s[1]),
+                                              vpaddq_s32(s[2], s[3]));
+            const float32x4_t sc = vmulq_n_f32(scales4(rows[g], b), d[b]);
+            sum[g] = vaddq_f32(sum[g], vmulq_f32(vcvtq_f32_s32(isum), sc));
         }
-        const int32x4_t isum = vpaddq_s32(vpaddq_s32(s[0], s[1]),
-                                          vpaddq_s32(s[2], s[3]));
-        const float32x4_t sc = vmulq_n_f32(scales4(rows, b), d[b]);
-        sum = vaddq_f32(sum, vmulq_f32(vcvtq_f32_s32(isum), sc));
     }
-    return sum;
 }
 
 /**
@@ -237,8 +248,17 @@ void q8_0_rows(const Mat& w, const float* d, const std::int8_t* q,
         }
     };
     if (n == 1) {
-        for (std::uint32_t r0 = 0; r0 < w.rows; r0 += 4) {
-            store(r0, 0, quad_direct(w, r0, nb, d, q));
+        std::uint32_t r0 = 0;
+        for (; r0 + 8 <= w.rows; r0 += 8) {
+            float32x4_t sum[2];
+            quad_direct<2>(w, r0, nb, d, q, sum);
+            store(r0, 0, sum[0]);
+            store(r0 + 4, 0, sum[1]);
+        }
+        for (; r0 < w.rows; r0 += 4) {
+            float32x4_t sum[1];
+            quad_direct<1>(w, r0, nb, d, q, sum);
+            store(r0, 0, sum[0]);
         }
         return;
     }
