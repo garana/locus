@@ -12,6 +12,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -23,6 +24,10 @@
 #include "locus/backend/vulkan/context.hpp"
 
 using locus::backend::vk::VulkanContext;
+
+// The process environment, for the exec'd children (no header declares
+// it on macOS).
+extern char** environ;
 
 namespace {
 
@@ -145,6 +150,26 @@ struct ChildRun {
  * @returns The wait status and the child's stderr.
  */
 ChildRun run_child(const std::string& exe, const char* name, bool profile) {
+    // The child's argv and environment are built here, before fork: the
+    // binary has other threads, so the child may only make
+    // async-signal-safe calls (no malloc, so no setenv) until execve.
+    std::vector<std::string> env_s;
+    for (char** e = environ; *e != nullptr; ++e) {
+        if (std::string_view(*e).starts_with("LOCUS_VK_PROFILE=")) {
+            continue;
+        }
+        env_s.emplace_back(*e);
+    }
+    if (profile) {
+        env_s.emplace_back("LOCUS_VK_PROFILE=1");
+    }
+    std::vector<char*> envp;
+    for (auto& s : env_s) {
+        envp.push_back(s.data());
+    }
+    envp.push_back(nullptr);
+    std::string arg0 = "locus_tests", arg1 = name;
+    char* argv[] = {arg0.data(), arg1.data(), nullptr};
     int fds[2];
     REQUIRE(::pipe(fds) == 0);
     const pid_t pid = ::fork();
@@ -155,11 +180,7 @@ ChildRun run_child(const std::string& exe, const char* name, bool profile) {
             ::dup2(devnull, 1);
         }
         ::dup2(fds[1], 2);
-        if (profile) {
-            ::setenv("LOCUS_VK_PROFILE", "1", 1);
-        }
-        ::execl(exe.c_str(), "locus_tests", name,
-                static_cast<char*>(nullptr));
+        ::execve(exe.c_str(), argv, envp.data());
         _exit(127);  // exec failed
     }
     REQUIRE(pid >= 0);
