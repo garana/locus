@@ -387,6 +387,12 @@ TEST_CASE("vulkan split dispatches give the bits of a whole one",
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
+    // NVIDIA's driver (580, GTX 750 Ti) runs a vkCmdDispatchBase piece
+    // as if its base were 0, with no validation error (i#1123). The
+    // split is for V3D and runs elsewhere only when forced, as here.
+    if (VulkanContext().device_name().find("NVIDIA") != std::string::npos) {
+        SKIP("the NVIDIA driver does not apply vkCmdDispatchBase's base");
+    }
     std::mt19937 rng(682);
     const std::uint32_t in_ch = 8, hw = 12, out_ch = 200, k = 3;
     const std::uint32_t o = hw - k + 1;  // stride 1, no padding

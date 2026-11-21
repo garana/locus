@@ -972,6 +972,10 @@ TEST_CASE("bench: vulkan matmul throughput", "[.][bench][vulkan]") {
           Type{"q4_k", locus::gguf::TensorType::kQ4_K, Kernel::kMatmulQ4_K},
           Type{"q6_k", locus::gguf::TensorType::kQ6_K,
                Kernel::kMatmulQ6_K}}) {
+        // A device without shaderFloat16 builds no f16 kernel (q8_0h).
+        if (VulkanContext::kernel_needs_f16(ty.kernel) && !ctx.has_f16()) {
+            continue;
+        }
         for (const Shape sh : {Shape{2048, 2048}, Shape{512, 2048},
                                Shape{8192, 2048}, Shape{2048, 8192}}) {
             const bool q8 = ty.type == locus::gguf::TensorType::kQ8_0;
