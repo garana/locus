@@ -284,10 +284,14 @@ TEST_CASE("vulkan weights written through mapped reach the kernel",
     // A batch whose submit fails (i#1137): its copy may not have run,
     // so the next batch must make it too.
     {
+        const int cmds = ctx.command_buffers_for_test();
         ctx.fail_submits_for_test(1);
         REQUIRE_THROWS_WITH(ctx.matvec_f32(wb, rows, cols, xb, ob),
                             Catch::Matchers::ContainsSubstring("submit"));
         ctx.fail_submits_for_test(0);
+        // Its command buffer is freed, not left for the next batch to
+        // allocate over (i#1140).
+        REQUIRE(ctx.command_buffers_for_test() == cmds);
     }
     // Twice: the first batch records the copy, the second reads the
     // device-local buffer alone.

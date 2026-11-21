@@ -1833,6 +1833,17 @@ struct VulkanContext::Impl {
         stage_in_flight.clear();
     }
 
+    /** Command buffers allocated and not yet freed (batch_cmd), for
+     *  command_buffers_for_test(). */
+    int live_cmds = 0;
+
+    /** Frees batch_cmd (which the GPU must no longer be reading). */
+    void free_batch_cmd() {
+        vkFreeCommandBuffers(device, pool, 1, &batch_cmd);
+        batch_cmd = VK_NULL_HANDLE;
+        --live_cmds;
+    }
+
     /** The batch that recorded stage_in_flight's copies did not run (or
      *  may not have): copy them again in the next one. Their staging is
      *  still there, so a second copy is harmless. */
@@ -2194,6 +2205,10 @@ void VulkanContext::fail_submits_for_test(int n) {
     impl_->fail_submits = n;
 }
 
+int VulkanContext::command_buffers_for_test() const {
+    return impl_->live_cmds;
+}
+
 VulkanContext::Buffer VulkanContext::import_host(const void* ptr,
                                                  std::size_t bytes,
                                                  std::size_t mapped) {
@@ -2253,6 +2268,7 @@ void VulkanContext::begin_batch() {
     check(vkAllocateCommandBuffers(im.device, &cba,
                                    &im.batch_cmd),
           "allocate command buffer");
+    ++im.live_cmds;
     VkCommandBufferBeginInfo cbb{};
     cbb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cbb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2406,15 +2422,26 @@ void VulkanContext::end_batch() {
     }
     // A throw from here to the wait may leave the batch's staged
     // copies unrun: copy them again in the next batch (i#1137).
-    struct RequeueOnThrow {
+    // The command buffer goes too (i#1140): at once if it was never
+    // submitted, else once the queue is idle, so the GPU is not still
+    // reading it.
+    struct OnThrow {
         Impl& im;
         bool armed = true;
-        ~RequeueOnThrow() {
-            if (armed) {
-                im.requeue_staged();
+        bool submitted = false;
+        ~OnThrow() {
+            if (!armed) {
+                return;
+            }
+            im.requeue_staged();
+            if (im.batch_cmd != VK_NULL_HANDLE) {
+                if (submitted) {
+                    vkQueueWaitIdle(im.queue);
+                }
+                im.free_batch_cmd();
             }
         }
-    } requeue{im};
+    } on_throw{im};
     check(vkEndCommandBuffer(im.batch_cmd), "end cmd");
     const clock::time_point t1 = clock::now();
     VkSubmitInfo si{};
@@ -2429,6 +2456,7 @@ void VulkanContext::end_batch() {
     if (im.spin_wait) {
         check(vkResetFences(im.device, 1, &im.batch_fence), "reset fence");
         check(vkQueueSubmit(im.queue, 1, &si, im.batch_fence), "submit");
+        on_throw.submitted = true;
         // Poll the fence, yielding between polls: a decode token's
         // batch takes a few ms, and waking from a blocking wait costs
         // MoltenVK about 0.4 ms a batch (i#697). Past the spin budget
@@ -2450,9 +2478,10 @@ void VulkanContext::end_batch() {
     } else {
         check(vkQueueSubmit(im.queue, 1, &si, VK_NULL_HANDLE),
               "submit");
+        on_throw.submitted = true;
         check(vkQueueWaitIdle(im.queue), "wait idle");
     }
-    requeue.armed = false;
+    on_throw.armed = false;
     ++im.prof.batches;
     // The batch's staging copies are done: free their buffers.
     im.finish_staged();
@@ -2536,8 +2565,7 @@ void VulkanContext::end_batch() {
             }
         }
     }
-    vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
-    im.batch_cmd = VK_NULL_HANDLE;
+    im.free_batch_cmd();
     // Bound the cache when keys keep changing (e.g. a paging
     // budget cycling per-expert buffers).
     if (im.sets_stale || im.sets_live > 65536) {
@@ -2551,8 +2579,7 @@ void VulkanContext::abandon_batch() {
     im.batch_dispatches = 0;
     if (im.batch_cmd != VK_NULL_HANDLE) {
         // Never submitted (or its submit failed): free it as is.
-        vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
-        im.batch_cmd = VK_NULL_HANDLE;
+        im.free_batch_cmd();
     }
     // Their copies never ran: copy them in the next batch instead.
     im.requeue_staged();
@@ -2740,6 +2767,7 @@ VulkanContext::Buffer VulkanContext::create_buffer(std::size_t, MemKind) {
 }
 void VulkanContext::fail_allocations_for_test(int) { no_kernels(); }
 void VulkanContext::fail_submits_for_test(int) { no_kernels(); }
+int VulkanContext::command_buffers_for_test() const { no_kernels(); }
 VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
                                                  std::size_t) {
     no_kernels();
