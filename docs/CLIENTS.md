@@ -420,7 +420,8 @@ calling. Reliable agent use therefore needs a capable instruct model.
   its `invalid_request_error`. A guard that fails (any reply but a
   verdict, or a chat longer than its KV pool: `--ctx`, else 4096
   positions) gives a 500, and the request is not run. Replies are not
-  checked.
+  checked, and the media endpoints (`/v1/images/*`, `/v1/videos`,
+  `/v1/audio/speech`) are not guarded.
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).
