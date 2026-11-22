@@ -851,7 +851,7 @@ guarding the default path.
   protectai/deberta-v3-base-prompt-injection-v2 the logits match
   float64 arithmetic on the same Q8_0 weights to 1.1e-5 and, from the
   F32 GGUF, the f32 original to 2.1e-5; Q8_0 itself moves them up to
-  0.05. It is not served yet (Prompt Guard, i#1159).
+  0.05. It serves as the `prompt-guard` guard (below).
 - Guards: `server/guard.hpp`'s `Guard` judges a batch of requests,
   one verdict each (allow, reject with labels, or failed); each kind
   implements it. A server runs several (`--guard-model` first, then
@@ -881,6 +881,30 @@ guarding the default path.
   client that someone sent the same conversation start. Only "safe", or
   "unsafe" and a line of codes, is a verdict; anything else, a reply
   cut at the cap, or a failed run rejects (fail closed).
+- Prompt Guard (`kind=prompt-guard`, `server/classifier_guard.cpp`):
+  a sequence classifier on the DeBERTa encoder, scoring the untrusted
+  text of a request: every user turn (tool results arrive as user
+  turns), not the system or assistant turns. Each turn is encoded
+  without specials (typed `[CLS]` stays text) and cut into windows of
+  the model's context, 510 tokens between `[CLS]` and `[SEP]`, the
+  next starting 64 tokens before the last ends, so a phrase cut at one
+  window's end lies whole in the next. Every window of the batch's
+  requests is classified (16 per call), a label's score is its highest
+  over the request's windows, through softmax or sigmoid as the GGUF's
+  `classifier.problem_type` says (absent: as transformers' pipeline,
+  softmax over several labels, a sigmoid on one; regression is
+  refused), and a label rejects when its score reaches its threshold
+  (`labels=INJECTION@0.9:JAILBREAK`, `threshold=` the default, 0.5).
+  The labels come from the GGUF (Prompt Guard and Prompt Guard 2
+  differ); `labels=` is required, a name the model lacks is refused
+  at start, and a threshold must lie in (0, 1]. The encoder runs on
+  the best CPU backend on the chat engine's worker, so the chat
+  engine waits while it runs: 0.24 s per window for a DeBERTa v3 base
+  on an M4 Max, so a request of more than 64 windows (about 29k
+  tokens) fails closed rather than stall it longer. Prompt Guard
+  itself is gated behind Meta's license; the tests use
+  protectai/deberta-v3-base-prompt-injection-v2 (labels SAFE and
+  INJECTION), the same layout.
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.
 - Metrics: every `/metrics` series carries `model` and `backend`

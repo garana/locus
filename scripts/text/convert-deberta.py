@@ -10,7 +10,11 @@ The layout (keys under "deberta-v2."):
   feed_forward_length, block_count, attention.head_count,
   attention.layer_norm_epsilon, position_buckets,
   max_relative_positions (as the model resolves -1), pooling_type 4
-  (a classifier head) and classifier.output_labels;
+  (a classifier head), classifier.output_labels and
+  classifier.problem_type (config.json's, else what transformers'
+  text-classification pipeline does without one: softmax over several
+  labels, single_label_classification, and a sigmoid on one,
+  multi_label_classification);
 - token_embd, token_embd_norm; rel_embd (the 2 * position_buckets
   relative embeddings) and rel_embd_norm (norm_rel_ebd);
 - per block attn_q, attn_k, attn_v, attn_output, attn_output_norm,
@@ -160,6 +164,21 @@ def check_config(cfg):
         raise SystemExit("heads x head size must be hidden_size")
 
 
+def problem_type(cfg):
+    """@returns How the logits become scores, as transformers names
+    it: config.json's problem_type, else what its text-classification
+    pipeline applies without one (softmax over several labels, a
+    sigmoid on one)."""
+    kinds = ("single_label_classification", "multi_label_classification",
+             "regression")
+    p = cfg.get("problem_type")
+    if p is None:
+        p = kinds[0] if len(cfg["id2label"]) > 1 else kinds[1]
+    if p not in kinds:
+        raise SystemExit(f"problem_type {p!r} is not one of {kinds}")
+    return p
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True,
@@ -221,6 +240,7 @@ def main():
     w.add_uint32(f"{ARCH}.max_relative_positions", max_rel)
     w.add_pooling_type(gguf.PoolingType.RANK)
     w.add_classifier_output_labels(labels)
+    w.add_string(f"{ARCH}.classifier.problem_type", problem_type(cfg))
     w.add_file_type(gguf.LlamaFileType.ALL_F32 if a.f32
                     else gguf.LlamaFileType.MOSTLY_Q8_0)
 

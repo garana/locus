@@ -276,25 +276,36 @@ class GuardBatcher {
 
 /** One --guard flag: which guard to load and how it rejects. */
 struct GuardSpec {
-    std::string kind;   ///< "llama-guard"
+    std::string kind;   ///< "llama-guard" or "prompt-guard"
     std::string model;  ///< the GGUF path
     /** /metrics and error-body name; default: the GGUF's file name
      *  without ".gguf". */
     std::string name;
-    /** The labels that reject; empty means all. */
+    /** The labels that reject; empty means all (llama-guard only: a
+     *  classifier kind needs them). */
     std::vector<std::string> labels;
+    /** Per label, the score from which it rejects (classifier kinds,
+     *  NAME@T); NaN takes `threshold`. */
+    std::vector<float> thresholds;
+    /** threshold=: the default for labels without their own. */
+    float threshold = 0.5f;
 };
 
 /**
  * Parses a --guard value: comma-separated key=value pairs, with
- * `kind` and `model` required and `name` and `labels` (colon-separated,
- * e.g. labels=S1:S9) optional.
+ * `kind` and `model` required and `name`, `labels` (colon-separated,
+ * e.g. labels=S1:S9) and `threshold` optional. For a classifier kind
+ * (prompt-guard) labels are required and each may carry its own
+ * threshold, labels=INJECTION@0.9:JAILBREAK; threshold= sets the
+ * default (0.5). A label rejects when its score reaches its threshold.
  *
  * @param text The flag's value, e.g.
  *     "kind=llama-guard,model=/m/lg.gguf,labels=S1:S9".
  * @returns The spec, with a default name filled in.
  * @throws std::invalid_argument on an unknown kind or key, a missing
- *     kind or model, or a pair without '='.
+ *     kind or model, a pair without '=', a classifier kind without
+ *     labels, a threshold on llama-guard, or a threshold that is not a
+ *     number in (0, 1].
  */
 GuardSpec parse_guard_spec(std::string_view text);
 
