@@ -116,6 +116,17 @@ TEST_CASE("the guard flags set the guard model and its categories",
         static_cast<int>(argv2.size()), const_cast<char**>(argv2.data()));
     CHECK(b.guard_model == "g.gguf");
     CHECK(b.guard_categories == std::vector<std::string>{"S10"});
+
+    // --guard repeats, in order; locus-server parses each value.
+    std::array<const char*, 5> argv3 = {
+        "prog", "--guard", "kind=llama-guard,model=a.gguf",
+        "--guard=kind=llama-guard,model=b.gguf,labels=S1", "m.gguf"};
+    auto c = locus_tools::parse_backend_args(
+        static_cast<int>(argv3.size()), const_cast<char**>(argv3.data()));
+    CHECK(c.guards == std::vector<std::string>{
+                          "kind=llama-guard,model=a.gguf",
+                          "kind=llama-guard,model=b.gguf,labels=S1"});
+    CHECK(c.positional == std::vector<std::string>{"m.gguf"});
 }
 
 TEST_CASE("the audio-max-tokens flag sets the speech token cap", "[cli]") {

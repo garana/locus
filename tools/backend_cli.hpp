@@ -235,6 +235,9 @@ inline constexpr const char* kCommonHelp =
     "                   reaches the chat model\n"
     "  --guard-categories S1,S9  locus-server: only these guard\n"
     "                   categories reject (default: all)\n"
+    "  --guard SPEC     locus-server: one more guard, repeatable:\n"
+    "                   kind=llama-guard,model=P[,name=N][,labels=S1:S9];\n"
+    "                   guards run in order, any one can reject\n"
     "  --rerank-model P locus-server: serve /v1/rerank with the\n"
     "                   reranker GGUF at path P (from\n"
     "                   scripts/text/convert-xlmr-reranker.py); both run on\n"
@@ -459,6 +462,8 @@ struct BackendArgs {
     /** From --guard-categories S1,S9: the categories that reject;
      * empty = all. */
     std::vector<std::string> guard_categories;
+    /** From each --guard SPEC, in order (parsed by locus-server). */
+    std::vector<std::string> guards;
     /** From --image-classifier P: path to a CNN GGUF for locus-server's
      * /v1/classify; empty = the endpoint answers 503. */
     std::string image_classifier;
@@ -707,6 +712,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.rerank_model = argv[++i];
         } else if (a.rfind("--rerank-model=", 0) == 0) {
             out.rerank_model = std::string(a.substr(15));
+        } else if (a == "--guard" && i + 1 < argc) {
+            out.guards.emplace_back(argv[++i]);
+        } else if (a.rfind("--guard=", 0) == 0) {
+            out.guards.emplace_back(a.substr(8));
         } else if (a == "--guard-model" && i + 1 < argc) {
             out.guard_model = argv[++i];
         } else if (a.rfind("--guard-model=", 0) == 0) {

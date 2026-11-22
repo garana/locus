@@ -12,6 +12,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <set>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -165,14 +166,16 @@ json make_error(const std::string& message,
  * fields (code "content_filter", param "prompt") plus the categories.
  * A guard that failed: 500, since the request was not judged.
  *
+ * @param guard The rejecting guard's name.
  * @param anthropic Use the /v1/messages error shape.
  */
-void set_guard_error(http::ServerResponse& res, const GuardVerdict& v,
-                     bool anthropic) {
+void set_guard_error(http::ServerResponse& res, const std::string& guard,
+                     const GuardVerdict& v, bool anthropic) {
     const bool failed = v.kind == GuardVerdict::Kind::kMalformed;
-    std::string msg = "the guard model failed; the request was not run";
+    std::string msg =
+        "the guard " + guard + " failed; the request was not run";
     if (!failed) {
-        msg = "the request was flagged by the guard model:";
+        msg = "the request was flagged by the guard " + guard + ":";
         for (std::size_t i = 0; i < v.categories.size(); ++i) {
             msg += (i == 0 ? " " : ", ") + v.categories[i];
         }
@@ -192,6 +195,7 @@ void set_guard_error(http::ServerResponse& res, const GuardVerdict& v,
                       {"type", "invalid_request_error"},
                       {"param", "prompt"},
                       {"code", "content_filter"},
+                      {"guard", guard},
                       {"categories", v.categories}}}};
     }
     res.set_content(body.dump(-1, ' ', false, kLossy), "application/json");
@@ -1238,16 +1242,38 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
                               " is a reranker; pass it as --rerank-model");
         }
     }
-    if (opt_.guard_classifier) {
-        guard_ = std::make_unique<Guard>(opt_.guard_classifier,
-                                         opt_.guard_categories);
-    } else if (!opt_.guard_model_path.empty()) {
-        // Its own KV pool, as large as the chat engine's (--ctx), else
-        // 4096 positions: a chat past it fails the check, closed.
+    {
+        // A generating guard's own KV pool: as large as the chat
+        // engine's (--ctx), else 4096 positions; a chat past it fails
+        // the check, closed.
         const std::uint32_t blocks =
             opt_.engine.n_blocks > 0 ? opt_.engine.n_blocks : 4096 / 16;
-        guard_ = Guard::load(opt_.guard_model_path, model_.active_backend(),
-                             blocks, opt_.guard_categories);
+        std::vector<std::shared_ptr<Guard>> all;
+        if (opt_.guard_classifier) {
+            all.push_back(std::make_shared<LlamaGuard>(
+                opt_.guard_classifier, opt_.guard_categories));
+        } else if (!opt_.guard_model_path.empty()) {
+            GuardSpec legacy = parse_guard_spec(
+                "kind=llama-guard,model=" + opt_.guard_model_path);
+            legacy.labels = opt_.guard_categories;
+            all.push_back(make_guard(legacy, model_.active_backend(), blocks));
+        }
+        for (const GuardSpec& s : opt_.guards) {
+            all.push_back(make_guard(s, model_.active_backend(), blocks));
+        }
+        for (const auto& g : opt_.extra_guards) all.push_back(g);
+        std::set<std::string> names;
+        for (auto& g : all) {
+            if (!names.insert(g->name()).second) {
+                throw std::invalid_argument(
+                    "two guards are named '" + g->name() +
+                    "'; give one a name= of its own");
+            }
+            guards_.push_back(std::make_unique<GuardSlot>());
+            guards_.back()->guard = std::move(g);
+            guards_.back()->batcher =
+                std::make_unique<GuardBatcher>(*guards_.back()->guard);
+        }
     }
     if (!opt_.rerank_model_path.empty()) {
         rerank_ = embed::EmbeddingModel::load(opt_.rerank_model_path);
@@ -2002,23 +2028,36 @@ std::unique_ptr<model::TokenConstraint> OpenAiServer::output_constraint(
 
 OpenAiServer::~OpenAiServer() { stop(); }
 
-std::optional<GuardVerdict> OpenAiServer::guard_flags(
-    std::span<const chat::Message> turns) {
-    if (!guard_) return std::nullopt;
-    guard_checks_total_.fetch_add(1, std::memory_order_relaxed);
-    const GuardVerdict v = guard_->check(
-        turns, [this](std::function<void()> f) {
-            loop_.run_on_worker(std::move(f));
-        });
-    if (!guard_->rejects(v)) return std::nullopt;
-    std::lock_guard<std::mutex> lk(guard_mu_);
-    if (v.kind == GuardVerdict::Kind::kMalformed) {
-        ++guard_flagged_["error"];
+std::optional<std::pair<std::string, GuardVerdict>>
+OpenAiServer::guard_flags(std::span<const chat::Message> turns) {
+    const Guard::Runner run = [this](std::function<void()> f) {
+        loop_.run_on_worker(std::move(f));
+    };
+    for (const auto& slot : guards_) {
+        Guard& g = *slot->guard;
+        const auto t0 = std::chrono::steady_clock::now();
+        const GuardVerdict v = slot->batcher->check(turns, run);
+        slot->check_ns.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count()),
+            std::memory_order_relaxed);
+        slot->checks.fetch_add(1, std::memory_order_relaxed);
+        if (!g.rejects(v)) continue;
+        if (v.kind == GuardVerdict::Kind::kMalformed) {
+            slot->failures.fetch_add(1, std::memory_order_relaxed);
+            const std::string why = g.last_error();
+            std::fprintf(stderr, "locus-server: guard %s failed%s%s\n",
+                         g.name().c_str(), why.empty() ? "" : ": ",
+                         why.c_str());
+        } else {
+            std::lock_guard<std::mutex> lk(slot->mu);
+            for (const std::string& c : v.categories) ++slot->flagged[c];
+        }
+        return std::pair{g.name(), v};
     }
-    for (const std::string& c : v.categories) {
-        ++guard_flagged_[c];
-    }
-    return v;
+    return std::nullopt;
 }
 
 void OpenAiServer::answer(std::uint64_t id, GenReply gr,
@@ -2314,18 +2353,40 @@ void OpenAiServer::install_routes() {
             counter("locus_requests_total",
                     "Completion requests accepted.",
                     requests_total_.load());
-            if (guard_) {
-                counter("locus_guard_checks_total",
-                        "Requests the guard model judged.",
-                        guard_checks_total_.load());
+            if (!guards_.empty()) {
+                const auto per_guard = [&](const char* name,
+                                           const char* help, auto get) {
+                    mt.family(name, help, "counter");
+                    for (const auto& slot : guards_) {
+                        mt.value(name,
+                                 MetricsText::label("guard",
+                                                    slot->guard->name()),
+                                 get(*slot));
+                    }
+                };
+                per_guard("locus_guard_checks_total",
+                          "Requests a guard judged.",
+                          [](GuardSlot& s) { return s.checks.load(); });
+                per_guard("locus_guard_failures_total",
+                          "Checks that failed (the request is rejected).",
+                          [](GuardSlot& s) { return s.failures.load(); });
+                per_guard("locus_guard_check_seconds_total",
+                          "Time spent in a guard's checks.",
+                          [](GuardSlot& s) {
+                              return static_cast<double>(s.check_ns.load()) *
+                                     1e-9;
+                          });
                 mt.family("locus_guard_flagged_total",
-                          "Requests the guard model rejected, by category "
-                          "(\"error\": the guard failed).",
-                          "counter");
-                std::lock_guard<std::mutex> gk(guard_mu_);
-                for (const auto& [cat, n] : guard_flagged_) {
-                    mt.value("locus_guard_flagged_total",
-                             MetricsText::label("category", cat), n);
+                          "Requests a guard rejected, by label.", "counter");
+                for (const auto& slot : guards_) {
+                    std::lock_guard<std::mutex> gk(slot->mu);
+                    for (const auto& [cat, n] : slot->flagged) {
+                        mt.value("locus_guard_flagged_total",
+                                 MetricsText::label("guard",
+                                                    slot->guard->name()) +
+                                     "," + MetricsText::label("category", cat),
+                                 n);
+                    }
                 }
             }
             counter("locus_prompt_tokens_total",
@@ -2578,7 +2639,7 @@ void OpenAiServer::install_routes() {
             guard_turns = vision_turns(*vision);
         }
         if (const auto flagged = guard_flags(guard_turns)) {
-            set_guard_error(res, *flagged, false);
+            set_guard_error(res, flagged->first, flagged->second, false);
             return;
         }
         if (vision) {
@@ -2924,7 +2985,7 @@ void OpenAiServer::install_routes() {
             guard_turns = vision_turns(*vision);
         }
         if (const auto flagged = guard_flags(guard_turns)) {
-            set_guard_error(res, *flagged, true);
+            set_guard_error(res, flagged->first, flagged->second, true);
             return;
         }
         if (vision) {
@@ -4281,7 +4342,7 @@ void OpenAiServer::install_routes() {
                 rq.max_output_tokens.value_or(opt_.max_tokens_cap),
                 opt_.max_tokens_cap));
         if (const auto flagged = guard_flags(rq.messages)) {
-            set_guard_error(res, *flagged, false);
+            set_guard_error(res, flagged->first, flagged->second, false);
             return;
         }
         auto [sampling, seed] = parse_sampling(body);

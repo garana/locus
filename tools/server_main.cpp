@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -327,6 +328,14 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         opt.rerank_model_path = args.rerank_model;
         opt.guard_model_path = args.guard_model;
         opt.guard_categories = args.guard_categories;
+        for (const std::string& g : args.guards) {
+            try {
+                opt.guards.push_back(locus::server::parse_guard_spec(g));
+            } catch (const std::invalid_argument& e) {
+                std::fprintf(stderr, "%s: %s\n", argv[0], e.what());
+                return 2;
+            }
+        }
         opt.image_classifier_path = args.image_classifier;
         opt.mmproj_path = args.mmproj;
         if (args.max_tokens > 0) {

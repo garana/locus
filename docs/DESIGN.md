@@ -852,12 +852,23 @@ guarding the default path.
   float64 arithmetic on the same Q8_0 weights to 1.1e-5 and, from the
   F32 GGUF, the f32 original to 2.1e-5; Q8_0 itself moves them up to
   0.05. It is not served yet (Prompt Guard, i#1159).
-- Guard: with `--guard-model`, a Llama Guard 3 GGUF (llama arch)
+- Guards: `server/guard.hpp`'s `Guard` judges a batch of requests,
+  one verdict each (allow, reject with labels, or failed); each kind
+  implements it. A server runs several (`--guard-model` first, then
+  each `--guard` in order) and stops at the first that rejects; a
+  failed guard rejects. Each guard's `GuardBatcher` joins concurrent
+  checks: a lone check runs at once, and the checks that arrive while
+  a batch runs form the next one. `/metrics` counts per guard
+  (`locus_guard_checks_total`, `_failures_total`,
+  `_check_seconds_total`, `_flagged_total{category}`, each with a
+  `guard` label).
+- Llama Guard 3 (`kind=llama-guard`): the GGUF (llama arch)
   loads on the chat model's backend with its own engine and KV pool
   (`--ctx`, else 4096 positions). Each chat request's turns become
   Llama Guard 3's prompt (`server/guard.cpp`), encoded with the
   messages as literal text, so a typed `<|eot_id|>` cannot close the
-  guard's turn and write its verdict. The guard decodes greedily up to
+  guard's turn and write its verdict. A batch's prompts go to the
+  engine together. The guard decodes greedily up to
   its EOS or `<|eot_id|>` (at most 64 tokens) on the chat engine's
   worker thread, between steps (`EngineLoop::run_on_worker`), so no
   backend runs on two threads; the chat engine waits while it runs.
@@ -870,8 +881,6 @@ guarding the default path.
   client that someone sent the same conversation start. Only "safe", or
   "unsafe" and a line of codes, is a verdict; anything else, a reply
   cut at the cap, or a failed run rejects (fail closed).
-  `locus_guard_checks_total` and `locus_guard_flagged_total{category}`
-  count them.
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.
 - Metrics: every `/metrics` series carries `model` and `backend`
