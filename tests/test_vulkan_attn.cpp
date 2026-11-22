@@ -515,6 +515,113 @@ TEST_CASE("vulkan decode attention (flash) matches the CPU reference",
     }
 }
 
+TEST_CASE("vulkan decode attention rounds merge on one pool", "[vulkan]") {
+    // i#1123: the partials cap splits a decode's blocks into rounds,
+    // merged by attn_combine_part, then the rounds by attn_combine. On
+    // one fixed pool and query (bit-identical inputs, unlike the model
+    // case, where each cap writes its own K/V) caps 1 and 2 must give
+    // the one-round result within 1e-5, on an F32 and an F16 pool. The
+    // dispatches follow rec_attn_decode (matvec_vulkan.cpp).
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(1123);
+    const std::uint32_t heads = 8, group = 4, d = 64, n_kv = heads / group;
+    const std::uint32_t k_off = 8, v_off = k_off + n_kv * d;
+    const std::uint32_t row_w = k_off + 2 * n_kv * d + 4;
+    const std::uint32_t bt = 16, max_pos = 130;
+    const std::uint32_t n_blocks = (max_pos + bt - 1) / bt;
+    const std::uint32_t block_stride = bt * row_w;
+    const std::uint32_t chunk = 32;  // attn_decode_grp.comp CH
+    auto pool = random_floats(std::size_t{n_blocks} * block_stride, rng);
+    auto table = shuffled_table(n_blocks, rng);
+    auto q = random_floats(std::size_t{heads} * d, rng);
+    const std::vector<float> q2(1, 0.0f);
+    const float scale = 0.125f;
+    for (const bool f16 : {false, true}) {
+        VulkanContext::Buffer pb;
+        if (f16) {
+            std::vector<std::uint16_t> half(pool.size());
+            for (std::size_t i = 0; i < pool.size(); ++i) {
+                half[i] = locus::backend::f32_to_f16(pool[i]);
+            }
+            pb = upload(ctx, half);
+        } else {
+            pb = upload(ctx, pool);
+        }
+        auto tb = upload(ctx, table);
+        auto qb = upload(ctx, q);
+        auto q2b = upload(ctx, q2);
+        // One decode of n_pos positions with `cap` blocks a round (0:
+        // one round), as rec_attn_decode records it.
+        const auto decode = [&](std::uint32_t n_pos, std::uint32_t cap) {
+            const std::uint32_t blocks = (n_pos + chunk - 1) / chunk;
+            const std::uint32_t rounds =
+                cap > 0 && blocks > cap ? (blocks + cap - 1) / cap : 1;
+            const std::uint32_t per = rounds > 1 ? cap : blocks;
+            auto ob = ctx.create_buffer(std::size_t{heads} * d * 4);
+            auto part = ctx.create_buffer(
+                std::size_t{per} * heads * (d + 2) * 4);
+            auto rnd = ctx.create_buffer(
+                std::size_t{rounds} * heads * (d + 2) * 4);
+            ctx.begin_batch();
+            for (std::uint32_t r = 0; r < rounds; ++r) {
+                const std::uint32_t c_base = r * per;
+                const std::uint32_t nb = std::min(per, blocks - c_base);
+                const VulkanContext::Buffer bufs[] = {
+                    pb, tb, qb, q2b, ob, blocks > 1 ? part : ob};
+                const std::uint32_t push[] = {
+                    n_pos, bt,    block_stride, row_w, k_off, v_off,
+                    d,     group, d,            0,     d,     0,
+                    0,     d,     fbits(scale), d,     c_base, blocks,
+                    0};
+                ctx.dispatch(f16 ? Kernel::kAttnDecodeGrp8F16
+                                 : Kernel::kAttnDecodeGrp8,
+                             bufs, push, nb, n_kv);
+                if (rounds > 1) {
+                    const VulkanContext::Buffer cb[] = {part, rnd};
+                    const std::uint32_t cp[] = {nb, heads, d, d, r, rounds};
+                    ctx.dispatch(Kernel::kAttnCombinePart, cb, cp,
+                                 (d + 63) / 64, heads);
+                }
+            }
+            if (blocks > 1) {
+                const VulkanContext::Buffer cb[] = {rounds > 1 ? rnd : part,
+                                                    ob};
+                const std::uint32_t cp[] = {rounds > 1 ? rounds : blocks,
+                                            heads, d, d};
+                ctx.dispatch(Kernel::kAttnCombine, cb, cp, (d + 63) / 64,
+                             heads);
+            }
+            ctx.end_batch();
+            auto got = download(ctx, ob, std::size_t{heads} * d);
+            for (auto b : {ob, part, rnd}) {
+                ctx.destroy_buffer(b);
+            }
+            return got;
+        };
+        // Past two blocks: one or two rounds left with one block.
+        for (const std::uint32_t n_pos : {65u, 67u, 70u, 96u, 97u, 130u}) {
+            const auto want = decode(n_pos, 0);
+            for (const std::uint32_t cap : {1u, 2u}) {
+                CAPTURE(f16, n_pos, cap);
+                const auto got = decode(n_pos, cap);
+                double err = 0.0, norm = 0.0;
+                for (std::size_t i = 0; i < want.size(); ++i) {
+                    const double e = double{got[i]} - want[i];
+                    err += e * e;
+                    norm += double{want[i]} * want[i];
+                }
+                CHECK(std::sqrt(err) <= 1e-5 * std::sqrt(norm));
+            }
+        }
+        for (auto b : {pb, tb, qb, q2b}) {
+            ctx.destroy_buffer(b);
+        }
+    }
+}
+
 TEST_CASE("vulkan grouped decode attention matches the CPU reference",
           "[vulkan]") {
     if (!VulkanContext::available()) {
