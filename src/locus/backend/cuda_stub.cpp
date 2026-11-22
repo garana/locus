@@ -93,6 +93,8 @@ void cuda_set_device(int ordinal) {
 
 void cuda_pool_reset() {}
 
+std::pair<std::size_t, std::size_t> cuda_pool_resident() { return {0, 0}; }
+
 void conv1d_cuda(std::span<const float> in, std::uint32_t in_ch,
                  std::uint32_t in_len, std::span<const float> weight,
                  std::uint32_t out_ch, std::uint32_t k,

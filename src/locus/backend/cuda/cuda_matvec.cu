@@ -11,6 +11,7 @@
 #include "locus/backend/gpu_metrics.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/sys/mmap_file.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -2573,6 +2574,10 @@ class ScratchLease {
     ScratchSet* set_ = nullptr;
 };
 
+/** False once the pool is destroyed at exit, so a mapping unmapped
+ *  after it (static teardown order) does not touch it (i#1164). */
+std::atomic<bool> g_pool_alive{false};
+
 /**
  * Device weight pool (R8-GPU pager). Caches one device buffer per
  * weight, keyed by host pointer, so a weight is uploaded once and
@@ -2591,13 +2596,12 @@ class ScratchLease {
  *
  * Lifetime: a page is keyed by (host address, size) and never compared
  * with the host bytes again, so it trusts that an address keeps its
- * bytes. Production weights are GGUF mappings (and cuda_dev_const
- * buffers the model owns) that live as long as the model. Code that
- * frees host weights and may get new ones at the same address in the
- * same process (a model unload and reload) must first drop the old
- * pages, with cuda_evict() per weight or cuda_pool_reset(), as the
- * Vulkan path does with vulkan_release_weights(); else a matvec reads
- * the old model's device copy.
+ * bytes. A GGUF mapping's pages are dropped when it is unmapped (the
+ * unmap hook, release_range(), i#1164), so a model unload and reload
+ * needs nothing more. Weights in buffers of their own (not a mapped
+ * file) must still drop their pages before the buffer is freed and
+ * its address reused, with cuda_evict() per weight or
+ * cuda_pool_reset(); else a matvec reads the old weights' device copy.
  */
 class WeightPool {
  public:
@@ -2729,6 +2733,53 @@ class WeightPool {
         table_.erase(it);
     }
 
+    /**
+     * Frees every page whose host address lies in [p, p + n): a mapped
+     * model file is going away (sys::add_unmap_hook, i#1164). Its pages
+     * would otherwise hold device memory for the rest of the process,
+     * and a later mapping at a reused address would be served the old
+     * model's copies (pages are keyed by host address). A page still
+     * pinned means a kernel may read it, so the device is synchronized
+     * first; unmapping a model while it runs is the caller's bug.
+     * The hook runs on whatever thread unmaps the file, whose CUDA
+     * device may never have been set (cuda_set_device is per thread):
+     * with one GPU that is device 0 anyway, but once several GPUs share
+     * the process (i#924) cudaFree and cudaDeviceSynchronize here need
+     * the pool's device_ set first.
+     */
+    void release_range(const void* p, std::size_t n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (table_.empty()) {
+            return;
+        }
+        const auto lo = reinterpret_cast<std::uintptr_t>(p);
+        const std::uintptr_t hi = lo + n;
+        bool synced = false;
+        for (auto it = table_.begin(); it != table_.end();) {
+            const auto h = reinterpret_cast<std::uintptr_t>(it->first);
+            if (h < lo || h >= hi) {
+                ++it;
+                continue;
+            }
+            if (it->second.pins != 0 && !synced) {
+                cudaDeviceSynchronize();
+                synced = true;
+            }
+            wait_ready(it->second);  // don't free mid-copy
+            cudaFree(it->second.dptr);
+            used_ -= it->second.bytes;
+            drops_++;
+            it = table_.erase(it);
+        }
+        note_used();
+    }
+
+    /** @returns The pages resident and their bytes (tests). */
+    std::pair<std::size_t, std::size_t> resident() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return {table_.size(), used_};
+    }
+
     /** @returns The byte budget (Ops.pool_budget). */
     std::size_t budget() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -2759,6 +2810,7 @@ class WeightPool {
     }
 
     ~WeightPool() {
+        g_pool_alive.store(false);
         if (std::getenv("LOCUS_MOE_STATS") == nullptr) {
             return;
         }
@@ -2920,9 +2972,24 @@ class WeightPool {
     std::mutex mu_;
 };
 
+/** sys unmap hook: a model file going away drops its device pages. */
+void on_unmap(const void* p, std::size_t n);
+
 WeightPool& pool() {
     static WeightPool p;
+    static const bool hooked = [] {
+        g_pool_alive.store(true);
+        sys::add_unmap_hook(&on_unmap);
+        return true;
+    }();
+    (void)hooked;
     return p;
+}
+
+void on_unmap(const void* p, std::size_t n) {
+    if (g_pool_alive.load()) {
+        pool().release_range(p, n);
+    }
 }
 
 /** Lazily uploads iq1s_grid to the device once; nullptr on failure
@@ -3585,6 +3652,10 @@ bool run_matvec_q8k(const Mat& w, std::span<const float> x,
 }  // namespace
 
 void cuda_pool_reset() { pool().reset(); }
+
+std::pair<std::size_t, std::size_t> cuda_pool_resident() {
+    return pool().resident();
+}
 
 void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
