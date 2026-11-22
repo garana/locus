@@ -3,8 +3,9 @@
 // (O(n^2)). These tests pin that the heap picks exactly the merges the
 // rescan picked, ties included, and that a long word is fast.
 
+#include <time.h>  // clock_gettime, CLOCK_THREAD_CPUTIME_ID (POSIX)
+
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -194,17 +195,22 @@ TEST_CASE("BPE heap merge picks the rescan's merges, ties included",
 
 TEST_CASE("a 200 KB word tokenizes in well under a second", "[tok]") {
     // The rescan was O(n^2) on one word: the review measured 9.9 s for
-    // 80 KB on stories260K. The heap is O(n log n).
+    // 80 KB on stories260K. The heap is O(n log n). Timed on this
+    // thread's CPU clock, so time spent waiting (a page read late in
+    // a full suite, i#1147) does not count; merge work does.
     std::mt19937 rng(627);
     const std::string w = random_word(rng, 200 * 1024);
     const SpmTokenizer spm(spm_vocab(rng));
     const BpeTokenizer bpe(bpe_vocab(rng));
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto cpu_seconds = [] {
+        timespec ts{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        return static_cast<double>(ts.tv_sec) + ts.tv_nsec * 1e-9;
+    };
+    const double t0 = cpu_seconds();
     const auto a = spm.encode(w, false);
     const auto b = bpe.encode(w, false);
-    const double s = std::chrono::duration<double>(
-                         std::chrono::steady_clock::now() - t0)
-                         .count();
+    const double s = cpu_seconds() - t0;
     CHECK_FALSE(a.empty());
     CHECK_FALSE(b.empty());
     CHECK(s < 3.0);
