@@ -833,6 +833,20 @@ guarding the default path.
   kind, `rerank`. ggml-org has no GGUF of the model, so
   `scripts/text/convert-xlmr-reranker.py` makes one from BAAI's safetensors,
   with the vocab of bge-m3's GGUF (the same SentencePiece model).
+- Guard: with `--guard-model`, a Llama Guard 3 GGUF (llama arch)
+  loads on the chat model's backend with its own engine and KV pool
+  (`--ctx`, else 4096 positions). Each chat request's turns become
+  Llama Guard 3's prompt (`server/guard.cpp`), encoded with the
+  messages as literal text, so a typed `<|eot_id|>` cannot close the
+  guard's turn and write its verdict. The guard decodes greedily up to
+  its EOS or `<|eot_id|>` (at most 64 tokens) on the chat engine's
+  worker thread, between steps (`EngineLoop::run_on_worker`), so no
+  backend runs on two threads; the cost is one guard prefill per
+  request, during which the chat engine waits. Only "safe", or
+  "unsafe" and a line of codes, is a verdict; anything else, a reply
+  cut at the cap, or a failed run rejects (fail closed).
+  `locus_guard_checks_total` and `locus_guard_flagged_total{category}`
+  count them.
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.
 - Metrics: every `/metrics` series carries `model` and `backend`

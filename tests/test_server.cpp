@@ -1175,6 +1175,108 @@ TEST_CASE("embedding model serves embeddings beside the chat model",
     }
 }
 
+TEST_CASE("a guard model rejects flagged requests on every text endpoint",
+          "[server][e2e][guard]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    // A stand-in guard: flags a request whose last user turn holds
+    // "BAD" (S1) or "WORSE" (S9), fails on "BROKEN", else "safe".
+    locus::server::OpenAiServer::Options opt;
+    opt.guard_categories = {"S1", "S9"};
+    opt.guard_classifier = [](const locus::chat::ChatTemplate::Prompt& p) {
+        const std::string& t = p.text;
+        const auto last = t.rfind("User: ");
+        const std::string turn = t.substr(last);
+        if (turn.find("BROKEN") != std::string::npos) return std::string("?");
+        if (turn.find("WORSE") != std::string::npos) {
+            return std::string("unsafe\nS9,S1");
+        }
+        if (turn.find("BAD") != std::string::npos) {
+            return std::string("unsafe\nS1");
+        }
+        if (turn.find("OTHER") != std::string::npos) {
+            return std::string("unsafe\nS5");  // not enabled
+        }
+        return std::string("safe");
+    };
+    TestServer ts(model, tok, opt);
+    httplib::Client client("127.0.0.1", ts.port);
+    const auto chat = [](const char* text) {
+        return json{{"messages", json::array({{{"role", "user"},
+                                               {"content", text}}})},
+                    {"max_tokens", 2}};
+    };
+
+    SECTION("OpenAI chat: a 400 with Azure's content_filter fields") {
+        auto res = client.Post("/v1/chat/completions",
+                               chat("say BAD things").dump(),
+                               "application/json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const json e = json::parse(res->body)["error"];
+        CHECK(e["code"] == "content_filter");
+        CHECK(e["param"] == "prompt");
+        CHECK(e["categories"] == json::array({"S1"}));
+        auto ok = client.Post("/v1/chat/completions",
+                              chat("hello").dump(), "application/json");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        // A category outside --guard-categories lets it through.
+        auto other = client.Post("/v1/chat/completions",
+                                 chat("OTHER").dump(), "application/json");
+        REQUIRE(other);
+        CHECK(other->status == 200);
+    }
+    SECTION("a completion's prompt is judged as one user turn") {
+        json req{{"prompt", "WORSE"}, {"max_tokens", 2}};
+        auto res = client.Post("/v1/completions", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(json::parse(res->body)["error"]["categories"] ==
+              json::array({"S9", "S1"}));
+    }
+    SECTION("Anthropic messages: its own error shape") {
+        auto res = client.Post("/v1/messages", chat("BAD").dump(),
+                               "application/json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const json b = json::parse(res->body);
+        CHECK(b["type"] == "error");
+        CHECK(b["error"]["type"] == "invalid_request_error");
+    }
+    SECTION("Responses: flagged input") {
+        json req{{"input", "BAD"}, {"max_output_tokens", 2}};
+        auto res = client.Post("/v1/responses", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("a guard that fails rejects with a 500 (fail closed)") {
+        auto res = client.Post("/v1/chat/completions",
+                               chat("BROKEN").dump(), "application/json");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+    }
+    SECTION("the metrics count checks and rejections by category") {
+        for (const char* t : {"BAD", "WORSE", "hello", "BROKEN"}) {
+            client.Post("/v1/chat/completions", chat(t).dump(),
+                        "application/json");
+        }
+        auto m = client.Get("/metrics");
+        REQUIRE(m);
+        CHECK(m->body.find("locus_guard_checks_total{") != std::string::npos);
+        CHECK(m->body.find("category=\"S1\"} 2") != std::string::npos);
+        CHECK(m->body.find("category=\"S9\"} 1") != std::string::npos);
+        CHECK(m->body.find("category=\"error\"} 1") != std::string::npos);
+    }
+}
+
 TEST_CASE("rerank endpoint orders documents by relevance",
           "[server][e2e]") {
     const std::string rr = std::string(LOCUS_SOURCE_DIR) +

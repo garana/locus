@@ -96,6 +96,12 @@ class EngineGroup {
      *  last event, then on a failed write of it). */
     void release(std::uint64_t id);
 
+    /** EngineLoop::run_on_worker on the first engine's worker (the
+     *  guard model runs there, i#1106). */
+    void run_on_worker(std::function<void()> fn) {
+        loops_.front()->run_on_worker(std::move(fn));
+    }
+
     /** The engines' gauges, summed. */
     EngineLoop::Stats stats();
     /** Engine e's timing metrics (lock-free, as EngineLoop::metrics). */

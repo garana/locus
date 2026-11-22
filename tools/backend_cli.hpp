@@ -229,6 +229,12 @@ inline constexpr const char* kCommonHelp =
     "                   image inputs to /v1/embeddings under its name,\n"
     "                   with the CNN GGUF at path P (ResNet or\n"
     "                   Inception, from scripts/image/convert-cnn.py; CPU)\n"
+    "  --guard-model P  locus-server: check each chat and completion\n"
+    "                   request with the Llama Guard 3 GGUF at path P\n"
+    "                   first; a flagged one gets a 400 and never\n"
+    "                   reaches the chat model\n"
+    "  --guard-categories S1,S9  locus-server: only these guard\n"
+    "                   categories reject (default: all)\n"
     "  --rerank-model P locus-server: serve /v1/rerank with the\n"
     "                   reranker GGUF at path P (from\n"
     "                   scripts/text/convert-xlmr-reranker.py); both run on\n"
@@ -447,6 +453,12 @@ struct BackendArgs {
     /** From --rerank-model P: path to a reranker GGUF for
      * locus-server's /v1/rerank; empty = the endpoint answers 503. */
     std::string rerank_model;
+    /** From --guard-model P: a Llama Guard 3 GGUF that checks
+     * locus-server's chat requests; empty = off. */
+    std::string guard_model;
+    /** From --guard-categories S1,S9: the categories that reject;
+     * empty = all. */
+    std::vector<std::string> guard_categories;
     /** From --image-classifier P: path to a CNN GGUF for locus-server's
      * /v1/classify; empty = the endpoint answers 503. */
     std::string image_classifier;
@@ -695,6 +707,26 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.rerank_model = argv[++i];
         } else if (a.rfind("--rerank-model=", 0) == 0) {
             out.rerank_model = std::string(a.substr(15));
+        } else if (a == "--guard-model" && i + 1 < argc) {
+            out.guard_model = argv[++i];
+        } else if (a.rfind("--guard-model=", 0) == 0) {
+            out.guard_model = std::string(a.substr(14));
+        } else if ((a == "--guard-categories" && i + 1 < argc) ||
+                   a.rfind("--guard-categories=", 0) == 0) {
+            const std::string list = a == "--guard-categories"
+                                         ? std::string(argv[++i])
+                                         : std::string(a.substr(19));
+            out.guard_categories.clear();
+            std::size_t at = 0;
+            while (at <= list.size()) {
+                const std::size_t comma = list.find(',', at);
+                const std::string c = list.substr(
+                    at, comma == std::string::npos ? std::string::npos
+                                                   : comma - at);
+                if (!c.empty()) out.guard_categories.push_back(c);
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
         } else if (a == "--image-classifier" && i + 1 < argc) {
             out.image_classifier = argv[++i];
         } else if (a.rfind("--image-classifier=", 0) == 0) {

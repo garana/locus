@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,6 +20,7 @@
 #include "locus/server/engine_group.hpp"
 #include "locus/server/engine_loop.hpp"
 #include "locus/server/gen_reply.hpp"
+#include "locus/server/guard.hpp"
 #include "locus/server/model_headers.hpp"
 #include "locus/tok/tokenizer.hpp"
 #include "locus/video/ffmpeg.hpp"
@@ -118,6 +121,16 @@ class OpenAiServer {
          * --rerank-model) that enables POST /v1/rerank; /v1/models lists
          * it by its file name. Empty = the endpoint answers 503. */
         std::string rerank_model_path;
+        /** Path to a guard model GGUF (Llama Guard 3, --guard-model,
+         * i#1106): every chat and completion request is checked first,
+         * and a flagged one never reaches the chat model. Empty = off. */
+        std::string guard_model_path;
+        /** The guard categories that reject (--guard-categories S1,S9);
+         * empty = all of them. */
+        std::vector<std::string> guard_categories;
+        /** Tests: a stand-in for the guard model's reply; set, it is
+         * the guard and guard_model_path is not read. */
+        Guard::Classifier guard_classifier;
         /** Path to a CNN image classifier GGUF (scripts/image/convert-cnn.py,
          * --image-classifier) that enables POST /v1/classify and image
          * inputs to /v1/embeddings under its name. Empty = 503. */
@@ -338,6 +351,18 @@ class OpenAiServer {
     void answer(std::uint64_t id, GenReply gr, http::ServerResponse& res,
                 const http::RequestContext& ctx);
 
+    /**
+     * Runs the guard model (--guard-model) over a request's turns on
+     * the chat engine's worker thread and counts the result.
+     *
+     * @param turns The request's messages; a completion's prompt is
+     *     one user turn.
+     * @returns The verdict that rejects the request, or nullopt (no
+     *     guard, or the guard let it through).
+     */
+    std::optional<GuardVerdict> guard_flags(
+        std::span<const chat::Message> turns);
+
     const model::TransformerModel& model_;
     const tok::Tokenizer& tok_;
     Options opt_;
@@ -377,6 +402,13 @@ class OpenAiServer {
     // The dedicated embedding model (--embedding-model; null when not
     // given), one request at a time under bert_mu_.
     std::unique_ptr<embed::EmbeddingModel> bert_;
+    /** The guard model (--guard-model), or null. */
+    std::unique_ptr<Guard> guard_;
+    /** Guard checks run, and rejected requests by category ("error"
+     *  for a guard that failed), for /metrics. */
+    std::atomic<std::uint64_t> guard_checks_total_{0};
+    std::mutex guard_mu_;
+    std::map<std::string, std::uint64_t> guard_flagged_;
     std::mutex bert_mu_;
     // The reranker (--rerank-model; null when not given), one request
     // at a time under rerank_mu_.
