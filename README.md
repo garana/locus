@@ -287,8 +287,11 @@ a ResNet-50 or Inception-v3 from `scripts/image/convert-cnn.py`.
 `--guard-model <llama-guard-3.gguf>` checks every chat and completion
 request with Llama Guard 3 before the chat model sees it; a flagged
 request gets a 400 (docs/CLIENTS.md), and `--guard-categories S1,S9`
-picks the categories that reject (default: all). The guard runs on the
-chat model's backend, between its steps.
+picks the categories that reject (default: all). More guards come from
+a repeatable `--guard kind=llama-guard,model=P[,name=N][,labels=S1:S9]`;
+they run in order and any one can reject. Guards run on the chat
+model's backend, between its steps; each llama-guard guard holds its
+own KV pool (`--ctx`, else 4096 positions).
 A converter whose input lies in a Hugging Face cache snapshot records
 the repository and commit (`general.source.url`,
 `general.source.revision`; `scripts/hf_source.py`, tested by

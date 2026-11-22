@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <stdexcept>
 
 #include "locus/engine/engine.hpp"
@@ -155,7 +156,7 @@ std::string guard_reply_text(std::span<const tok::TokenId> generated,
         static_cast<std::size_t>(stop - generated.begin())));
 }
 
-struct Guard::Loaded {
+struct LlamaGuard::Loaded {
     gguf::GgufFile file;
     model::TransformerModel model;
     std::unique_ptr<tok::Tokenizer> tok;
@@ -195,7 +196,7 @@ struct Guard::Loaded {
         return c;
     }
 
-    /** The last check's prompt tokens, and the positions it prefilled
+    /** The last batch's prompt tokens, and the positions it prefilled
      *  (the rest came from the prefix cache). */
     std::uint32_t last_prompt = 0;
     std::uint32_t last_prefilled = 0;
@@ -204,114 +205,311 @@ struct Guard::Loaded {
      *  fit well inside it. */
     static constexpr std::uint32_t kMaxReply = 64;
 
+    /** One prompt's reply text, or why it has none. */
+    struct Reply {
+        std::string text;
+        std::string error;  ///< non-empty: no reply
+    };
+
     /**
-     * The guard's greedy reply, up to its first EOS or <|eot_id|>. A
-     * reply with neither within kMaxReply tokens was cut, and a cut
-     * list of codes would parse as a shorter one, so it throws (and
-     * the check fails closed).
+     * The guard's greedy replies to a batch of prompts, each up to its
+     * first EOS or <|eot_id|>, run as one engine batch. A reply with
+     * neither within kMaxReply tokens was cut, and a cut list of codes
+     * would parse as a shorter one, so it gets an error (and its check
+     * fails closed).
+     *
+     * The prefix cache adopts an entry only when the whole cached
+     * prompt starts the new one, and a guard prompt ends with the
+     * instruction after the conversation. So each prompt's
+     * conversation part (up to the end of its last turn, cut where its
+     * tokens agree with the full prompt's) runs first, the whole
+     * batch's together: the full prompts then adopt them, and the next
+     * turn's conversation part adopts them too, prefilling only the
+     * new turn.
      */
-    std::string reply(const chat::ChatTemplate::Prompt& p) {
-        const auto ids = tok->encode_literal(p.text, false, p.content);
-        // The prefix cache adopts an entry only when the whole cached
-        // prompt starts the new one, and a guard prompt ends with the
-        // instruction after the conversation. So the conversation part
-        // (up to the end of the last turn) runs first as a request of
-        // its own: the full prompt then adopts it, and the next turn's
-        // conversation part adopts it too, prefilling only the new
-        // turn. Its tokens are cut where the two encodings agree.
-        std::uint32_t prefilled = 0;
-        if (!p.content.empty()) {
+    std::vector<Reply> replies(
+        std::span<const chat::ChatTemplate::Prompt> prompts) {
+        const std::size_t n = prompts.size();
+        std::vector<Reply> out(n);
+        std::vector<std::vector<tok::TokenId>> ids(n), heads(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& p = prompts[i];
+            ids[i] = tok->encode_literal(p.text, false, p.content);
+            if (p.content.empty()) continue;
             const std::size_t conv_end = p.content.back().end + 2;
-            const auto head_text = std::string_view(p.text).substr(
-                0, std::min(conv_end, p.text.size()));
-            const auto head =
-                tok->encode_literal(head_text, false, p.content);
+            const auto head = tok->encode_literal(
+                std::string_view(p.text).substr(
+                    0, std::min(conv_end, p.text.size())),
+                false, p.content);
             std::size_t k = 0;
-            while (k < head.size() && k < ids.size() && head[k] == ids[k]) {
+            while (k < head.size() && k < ids[i].size() &&
+                   head[k] == ids[i][k]) {
                 ++k;
             }
-            if (k >= 2 && k < ids.size()) {
-                run(std::vector<tok::TokenId>(ids.begin(), ids.begin() + k),
-                    1, prefilled);
+            if (k >= 2 && k < ids[i].size()) {
+                heads[i].assign(ids[i].begin(), ids[i].begin() + k);
             }
         }
-        const auto gen = run(ids, kMaxReply, prefilled);
-        last_prompt = static_cast<std::uint32_t>(ids.size());
+        std::uint32_t prefilled = 0, prompt = 0;
+        // The conversation parts, then the full prompts.
+        run(heads, 1, prefilled, out);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!out[i].error.empty()) ids[i].clear();
+            prompt += static_cast<std::uint32_t>(ids[i].size());
+        }
+        const auto gens = run(ids, kMaxReply, prefilled, out);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!out[i].error.empty() || ids[i].empty()) continue;
+            try {
+                out[i].text =
+                    guard_reply_text(gens[i], tok->eos_id(), eot, *tok);
+            } catch (const std::exception& e) {
+                out[i].error = e.what();
+            }
+        }
+        last_prompt = prompt;
         last_prefilled = prefilled;
-        return guard_reply_text(gen, tok->eos_id(), eot, *tok);
+        return out;
     }
 
-    /** Runs one request to its end; adds its prefilled positions
-     *  (prompt minus what the prefix cache served) to `prefilled`. */
-    std::vector<tok::TokenId> run(std::vector<tok::TokenId> ids,
-                                  std::uint32_t max_new,
-                                  std::uint32_t& prefilled) {
-        const auto n = static_cast<std::uint32_t>(ids.size());
-        const std::uint64_t id = engine.submit(std::move(ids), max_new);
-        engine.run_to_completion();
-        const engine::Request* r = engine.get(id);
-        if (r == nullptr || r->status != engine::Status::kDone) {
-            const std::string why =
-                r != nullptr ? r->error : "unknown request";
-            engine.release(id);
-            throw std::runtime_error("guard: " + why);
+    /**
+     * Submits every non-empty prompt of `batch` and runs the engine
+     * until all are done. Adds their prefilled positions (prompt minus
+     * what the prefix cache served) to `prefilled`; a request that does
+     * not finish sets its item's error.
+     *
+     * @returns Each item's generated tokens (empty for a skipped one).
+     */
+    std::vector<std::vector<tok::TokenId>> run(
+        const std::vector<std::vector<tok::TokenId>>& batch,
+        std::uint32_t max_new, std::uint32_t& prefilled,
+        std::vector<Reply>& out) {
+        std::vector<std::optional<std::uint64_t>> rid(batch.size());
+        for (std::size_t i = 0; i < batch.size(); ++i) {
+            if (!batch[i].empty() && out[i].error.empty()) {
+                rid[i] = engine.submit(batch[i], max_new);
+            }
         }
-        prefilled += n - std::min(n, r->reused_prefix_tokens);
-        std::vector<tok::TokenId> gen = r->generated;
-        engine.release(id);
-        return gen;
+        engine.run_to_completion();
+        std::vector<std::vector<tok::TokenId>> gens(batch.size());
+        for (std::size_t i = 0; i < batch.size(); ++i) {
+            if (!rid[i]) continue;
+            const engine::Request* r = engine.get(*rid[i]);
+            if (r == nullptr || r->status != engine::Status::kDone) {
+                out[i].error = "guard: " + (r != nullptr
+                                                ? r->error
+                                                : std::string("lost request"));
+            } else {
+                const auto np = static_cast<std::uint32_t>(batch[i].size());
+                prefilled += np - std::min(np, r->reused_prefix_tokens);
+                gens[i] = r->generated;
+            }
+            engine.release(*rid[i]);
+        }
+        return gens;
     }
 };
 
-Guard::Guard(Classifier classify, std::vector<std::string> enabled)
-    : classify_(std::move(classify)),
-      enabled_(std::move(enabled)),
+LlamaGuard::LlamaGuard(Classifier classify, std::vector<std::string> enabled,
+                       std::string name)
+    : Guard(std::move(name), std::move(enabled)),
+      classify_(std::move(classify)),
       categories_(llama_guard3_1b_categories()) {}
 
-Guard::~Guard() = default;
+LlamaGuard::~LlamaGuard() = default;
 
-std::unique_ptr<Guard> Guard::load(const std::string& path,
-                                   const backend::Backend& backend,
-                                   std::uint32_t n_blocks,
-                                   std::vector<std::string> enabled) {
+std::unique_ptr<LlamaGuard> LlamaGuard::load(
+    const std::string& path, const backend::Backend& backend,
+    std::uint32_t n_blocks, std::vector<std::string> enabled,
+    std::string name) {
     auto loaded = std::make_unique<Loaded>(path, backend, n_blocks);
     Loaded* raw = loaded.get();
-    auto g = std::make_unique<Guard>(
-        [raw](const chat::ChatTemplate::Prompt& p) { return raw->reply(p); },
-        std::move(enabled));
+    auto g = std::make_unique<LlamaGuard>(
+        [raw](const chat::ChatTemplate::Prompt& p) {
+            auto r = raw->replies({&p, 1});
+            if (!r[0].error.empty()) throw std::runtime_error(r[0].error);
+            return r[0].text;
+        },
+        std::move(enabled), std::move(name));
     g->loaded_ = std::move(loaded);
     return g;
 }
 
-std::string Guard::last_error() {
+std::string LlamaGuard::last_error() {
     std::lock_guard<std::mutex> lock(mu_);
     return last_error_;
 }
 
-std::pair<std::uint32_t, std::uint32_t> Guard::last_prefill() {
+std::pair<std::uint32_t, std::uint32_t> LlamaGuard::last_prefill() {
     std::lock_guard<std::mutex> lock(mu_);
     if (!loaded_) return {0, 0};
     return {loaded_->last_prompt, loaded_->last_prefilled};
 }
 
-GuardVerdict Guard::check(std::span<const chat::Message> turns,
-                          const Runner& run) {
-    const auto prompt = llama_guard3_prompt(turns, categories_);
+GuardSpec parse_guard_spec(std::string_view text) {
+    GuardSpec s;
+    bool have_labels = false;
+    std::size_t at = 0;
+    while (at <= text.size()) {
+        const std::size_t comma = text.find(',', at);
+        const std::string_view pair = text.substr(
+            at, comma == std::string_view::npos ? std::string_view::npos
+                                                : comma - at);
+        const std::size_t eq = pair.find('=');
+        if (eq == std::string_view::npos) {
+            throw std::invalid_argument("--guard: '" + std::string(pair) +
+                                        "' is not key=value");
+        }
+        const std::string_view key = pair.substr(0, eq);
+        const std::string value(pair.substr(eq + 1));
+        if (key == "kind") {
+            s.kind = value;
+        } else if (key == "model") {
+            s.model = value;
+        } else if (key == "name") {
+            s.name = value;
+        } else if (key == "labels") {
+            have_labels = true;
+            std::size_t b = 0;
+            while (b <= value.size()) {
+                const std::size_t c = value.find(':', b);
+                const std::string l = value.substr(
+                    b, c == std::string::npos ? std::string::npos : c - b);
+                if (!l.empty()) s.labels.push_back(l);
+                if (c == std::string::npos) break;
+                b = c + 1;
+            }
+        } else {
+            throw std::invalid_argument("--guard: unknown key '" +
+                                        std::string(key) + "'");
+        }
+        if (comma == std::string_view::npos) break;
+        at = comma + 1;
+    }
+    if (s.kind.empty() || s.model.empty()) {
+        throw std::invalid_argument("--guard needs kind= and model=");
+    }
+    if (s.kind != "llama-guard") {
+        throw std::invalid_argument("--guard: unknown kind '" + s.kind +
+                                    "' (known: llama-guard)");
+    }
+    if (have_labels && s.labels.empty()) {
+        throw std::invalid_argument("--guard: labels= names no label");
+    }
+    if (s.name.empty()) {
+        const std::size_t slash = s.model.find_last_of('/');
+        s.name = s.model.substr(slash == std::string::npos ? 0 : slash + 1);
+        if (s.name.size() > 5 &&
+            s.name.compare(s.name.size() - 5, 5, ".gguf") == 0) {
+            s.name.resize(s.name.size() - 5);
+        }
+    }
+    return s;
+}
+
+std::unique_ptr<Guard> make_guard(const GuardSpec& spec,
+                                  const backend::Backend& backend,
+                                  std::uint32_t n_blocks) {
+    if (spec.kind == "llama-guard") {
+        return LlamaGuard::load(spec.model, backend, n_blocks, spec.labels,
+                                spec.name);
+    }
+    throw std::invalid_argument("unknown guard kind '" + spec.kind + "'");
+}
+
+std::vector<GuardVerdict> LlamaGuard::check_batch(
+    std::span<const Turns> requests, const Runner& run) {
+    std::vector<chat::ChatTemplate::Prompt> prompts;
+    prompts.reserve(requests.size());
+    for (const Turns& t : requests) {
+        prompts.push_back(llama_guard3_prompt(t, categories_));
+    }
+    // A loaded guard runs the batch as one engine batch; the test
+    // seam's classifier, prompt by prompt.
+    std::vector<Loaded::Reply> got(prompts.size());
+    const auto work = [&] {
+        if (loaded_) {
+            got = loaded_->replies(prompts);
+            return;
+        }
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            try {
+                got[i].text = classify_(prompts[i]);
+            } catch (const std::exception& e) {
+                got[i].error = e.what();
+            }
+        }
+    };
     std::lock_guard<std::mutex> lock(mu_);
+    std::vector<GuardVerdict> out(prompts.size());  // kMalformed
     try {
-        std::string reply;
-        const auto work = [&] { reply = classify_(prompt); };
         if (run) {
             run(work);
         } else {
             work();
         }
-        last_error_.clear();
-        return parse_guard_verdict(reply);
     } catch (const std::exception& e) {
         last_error_ = e.what();
-        return {};  // kMalformed: fails closed
+        for (GuardVerdict& v : out) v.error = last_error_;
+        return out;  // the whole batch fails closed
     }
+    last_error_.clear();
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        if (got[i].error.empty()) {
+            out[i] = parse_guard_verdict(got[i].text);
+            if (out[i].kind == GuardVerdict::Kind::kMalformed) {
+                out[i].error = "no verdict in the guard's reply";
+            }
+        } else {
+            last_error_ = got[i].error;
+            out[i].error = got[i].error;
+        }
+    }
+    return out;
+}
+
+GuardVerdict GuardBatcher::check(Guard::Turns turns,
+                                 const Guard::Runner& run) {
+    Pending mine{turns, {}, false};
+    std::unique_lock<std::mutex> lk(mu_);
+    queue_.push_back(&mine);
+    while (!mine.done) {
+        if (busy_) {
+            cv_.wait(lk);
+            continue;
+        }
+        // No batch running: this thread runs every queued check.
+        busy_ = true;
+        std::vector<Pending*> batch;
+        batch.swap(queue_);
+        lk.unlock();
+        std::vector<Guard::Turns> requests;
+        requests.reserve(batch.size());
+        for (const Pending* p : batch) requests.push_back(p->turns);
+        std::vector<GuardVerdict> verdicts;
+        try {
+            verdicts = guard_.check_batch(requests, run);
+        } catch (...) {
+            // Anything thrown fails every check closed; busy_ must be
+            // cleared below, or later checks of this guard would wait
+            // for ever.
+            verdicts.clear();
+        }
+        batches_.fetch_add(1, std::memory_order_relaxed);
+        lk.lock();
+        for (std::size_t i = 0; i < batch.size(); ++i) {
+            if (i < verdicts.size()) {
+                batch[i]->verdict = verdicts[i];
+            } else {
+                batch[i]->verdict = GuardVerdict{};
+                batch[i]->verdict.error = "the guard gave no verdict";
+            }
+            batch[i]->done = true;
+        }
+        busy_ = false;
+        cv_.notify_all();
+    }
+    return mine.verdict;
 }
 
 }  // namespace locus::server

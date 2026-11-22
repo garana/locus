@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -38,6 +40,9 @@ struct GuardVerdict {
     Kind kind = Kind::kMalformed;
     /** The violated category codes ("S1", "S10"), for kUnsafe. */
     std::vector<std::string> categories;
+    /** Why the guard failed on this request, for kMalformed (logs);
+     *  may be empty. */
+    std::string error;
 };
 
 /**
@@ -103,11 +108,74 @@ std::string guard_reply_text(std::span<const tok::TokenId> generated,
                              const tok::Tokenizer& tok);
 
 /**
- * A guard model that judges chat requests (i#1106): it builds the
- * guard's prompt from a request's turns, runs the guard greedily for
- * a few tokens and parses its verdict. One check runs at a time.
+ * A guard: something that judges a chat request before the chat model
+ * sees it (i#1106, i#1156). Each kind (Llama Guard 3 now; the
+ * classifiers of i#1155 next) implements check(); the labels that
+ * reject and the fail-closed rule are shared. A server runs several.
  */
 class Guard {
+  public:
+    /** Runs a piece of work and returns when it is done (for example
+     *  EngineLoop::run_on_worker); its exception is rethrown. */
+    using Runner = std::function<void(std::function<void()>)>;
+
+    virtual ~Guard() = default;
+
+    /** @returns The kind, as --guard's kind= names it. */
+    virtual std::string_view kind() const = 0;
+
+    /** One request's messages. */
+    using Turns = std::span<const chat::Message>;
+
+    /**
+     * Judges several requests as one batch, one verdict each, in
+     * order. A request the guard fails on (it throws, or gives no
+     * verdict) gets kMalformed, which rejects.
+     *
+     * @param requests The requests' messages.
+     * @param run Where the model runs: the chat engine's worker thread
+     *     in the server, so no backend runs on two threads at once;
+     *     empty runs it on the calling thread.
+     * @returns requests.size() verdicts; for kUnsafe, the labels found.
+     */
+    virtual std::vector<GuardVerdict> check_batch(
+        std::span<const Turns> requests, const Runner& run = {}) = 0;
+
+    /** check_batch() of one request. */
+    GuardVerdict check(Turns turns, const Runner& run = {}) {
+        return check_batch({&turns, 1}, run).at(0);
+    }
+
+    /** @returns Why the last check failed (it threw), or "". */
+    virtual std::string last_error() { return {}; }
+
+    /** @returns The name /metrics and the error body use. */
+    const std::string& name() const { return name_; }
+
+    /** @returns Whether `v` rejects under this guard's labels. */
+    bool rejects(const GuardVerdict& v) const {
+        return guard_rejects(v, enabled_);
+    }
+
+  protected:
+    /**
+     * @param name The guard's name.
+     * @param enabled The labels that reject; empty means all.
+     */
+    Guard(std::string name, std::vector<std::string> enabled)
+        : name_(std::move(name)), enabled_(std::move(enabled)) {}
+
+  private:
+    std::string name_;
+    std::vector<std::string> enabled_;
+};
+
+/**
+ * Llama Guard 3 (kind "llama-guard"): builds its prompt from a
+ * request's turns, runs the model greedily for a few tokens and parses
+ * its written verdict. One check runs at a time.
+ */
+class LlamaGuard final : public Guard {
   public:
     /** Maps a guard prompt to the guard's reply text (the test seam;
      *  load() wires the real model in). */
@@ -117,8 +185,10 @@ class Guard {
     /**
      * @param classify Produces the guard's reply for a prompt.
      * @param enabled Category codes that reject; empty means all.
+     * @param name The guard's name.
      */
-    Guard(Classifier classify, std::vector<std::string> enabled);
+    LlamaGuard(Classifier classify, std::vector<std::string> enabled,
+               std::string name = "llama-guard");
 
     /**
      * Loads a guard GGUF (a llama-arch Llama Guard 3) on `backend`,
@@ -128,31 +198,22 @@ class Guard {
      * @param backend The backend the chat model runs on.
      * @param n_blocks KV blocks; a prompt past them fails the check.
      * @param enabled Category codes that reject; empty means all.
+     * @param name The guard's name.
      * @throws std::runtime_error (or gguf::Error) when it cannot load.
      */
-    static std::unique_ptr<Guard> load(const std::string& path,
-                                       const backend::Backend& backend,
-                                       std::uint32_t n_blocks,
-                                       std::vector<std::string> enabled);
+    static std::unique_ptr<LlamaGuard> load(
+        const std::string& path, const backend::Backend& backend,
+        std::uint32_t n_blocks, std::vector<std::string> enabled,
+        std::string name = "llama-guard");
 
-    ~Guard();
+    ~LlamaGuard() override;
 
-    /** Runs a piece of work and returns when it is done (for example
-     *  EngineLoop::run_on_worker); its exception is rethrown. */
-    using Runner = std::function<void(std::function<void()>)>;
+    std::string_view kind() const override { return "llama-guard"; }
 
-    /**
-     * Judges the last user turn of `turns`. A guard that throws or
-     * replies with anything but a verdict gives kMalformed.
-     *
-     * @param turns The request's messages.
-     * @param run Where the guard model runs: the chat engine's worker
-     *     thread in the server, so no backend runs on two threads at
-     *     once; empty runs it on the calling thread.
-     * @returns The verdict.
-     */
-    GuardVerdict check(std::span<const chat::Message> turns,
-                       const Runner& run = {});
+    /** Judges each request's last user turn; the batch's prompts go
+     *  to the guard's engine together. */
+    std::vector<GuardVerdict> check_batch(std::span<const Turns> requests,
+                                          const Runner& run = {}) override;
 
     /**
      * @returns The last check's prompt tokens and the positions it
@@ -161,23 +222,94 @@ class Guard {
      */
     std::pair<std::uint32_t, std::uint32_t> last_prefill();
 
-    /** @returns Why the last check failed (it threw), or "" when it
-     *  gave a reply. */
-    std::string last_error();
-
-    /** @returns Whether `v` rejects under this guard's categories. */
-    bool rejects(const GuardVerdict& v) const {
-        return guard_rejects(v, enabled_);
-    }
+    std::string last_error() override;
 
   private:
     struct Loaded;  // the GGUF, model, tokenizer and engine
     std::unique_ptr<Loaded> loaded_;
     Classifier classify_;
-    std::vector<std::string> enabled_;
     std::vector<GuardCategory> categories_;
     std::string last_error_;
     std::mutex mu_;
 };
+
+/**
+ * Batches one guard's checks across threads (i#1156): a check joins a
+ * queue; when no batch is running it runs every queued check as one
+ * check_batch() at once (a lone check runs at once, with no wait
+ * window), and while a batch runs, new checks wait and form the next
+ * one.
+ */
+class GuardBatcher {
+  public:
+    explicit GuardBatcher(Guard& guard) : guard_(guard) {}
+
+    /**
+     * @param turns The request's messages.
+     * @param run Where the guard runs (see Guard::check_batch).
+     * @returns The request's verdict.
+     */
+    GuardVerdict check(Guard::Turns turns, const Guard::Runner& run);
+
+    /** @returns The batches run so far (tests and /metrics). */
+    std::uint64_t batches() const { return batches_.load(); }
+
+    /** @returns The checks waiting for the next batch (tests). */
+    std::size_t queued() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return queue_.size();
+    }
+
+  private:
+    struct Pending {
+        Guard::Turns turns;
+        GuardVerdict verdict;
+        bool done = false;
+    };
+    Guard& guard_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<Pending*> queue_;
+    bool busy_ = false;
+    std::atomic<std::uint64_t> batches_{0};
+};
+
+/** One --guard flag: which guard to load and how it rejects. */
+struct GuardSpec {
+    std::string kind;   ///< "llama-guard"
+    std::string model;  ///< the GGUF path
+    /** /metrics and error-body name; default: the GGUF's file name
+     *  without ".gguf". */
+    std::string name;
+    /** The labels that reject; empty means all. */
+    std::vector<std::string> labels;
+};
+
+/**
+ * Parses a --guard value: comma-separated key=value pairs, with
+ * `kind` and `model` required and `name` and `labels` (colon-separated,
+ * e.g. labels=S1:S9) optional.
+ *
+ * @param text The flag's value, e.g.
+ *     "kind=llama-guard,model=/m/lg.gguf,labels=S1:S9".
+ * @returns The spec, with a default name filled in.
+ * @throws std::invalid_argument on an unknown kind or key, a missing
+ *     kind or model, or a pair without '='.
+ */
+GuardSpec parse_guard_spec(std::string_view text);
+
+/**
+ * Loads the guard a spec names.
+ *
+ * @param spec The guard to load.
+ * @param backend The backend the chat model runs on.
+ * @param n_blocks KV blocks for a guard that generates.
+ * @returns The guard.
+ * @throws std::invalid_argument on an unknown kind; what the kind's
+ *     loader throws when the model cannot load.
+ */
+std::unique_ptr<Guard> make_guard(const GuardSpec& spec,
+                                  const backend::Backend& backend,
+                                  std::uint32_t n_blocks);
 
 }  // namespace locus::server

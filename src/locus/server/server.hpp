@@ -128,9 +128,14 @@ class OpenAiServer {
         /** The guard categories that reject (--guard-categories S1,S9);
          * empty = all of them. */
         std::vector<std::string> guard_categories;
+        /** Guards from --guard (i#1156), run in order after the
+         * --guard-model one. */
+        std::vector<GuardSpec> guards;
         /** Tests: a stand-in for the guard model's reply; set, it is
-         * the guard and guard_model_path is not read. */
-        Guard::Classifier guard_classifier;
+         * the first guard and guard_model_path is not read. */
+        LlamaGuard::Classifier guard_classifier;
+        /** Tests: guards already built, run after the others. */
+        std::vector<std::shared_ptr<Guard>> extra_guards;
         /** Path to a CNN image classifier GGUF (scripts/image/convert-cnn.py,
          * --image-classifier) that enables POST /v1/classify and image
          * inputs to /v1/embeddings under its name. Empty = 503. */
@@ -352,15 +357,16 @@ class OpenAiServer {
                 const http::RequestContext& ctx);
 
     /**
-     * Runs the guard model (--guard-model) over a request's turns on
-     * the chat engine's worker thread and counts the result.
+     * Runs each guard, in order, over a request's turns on the chat
+     * engine's worker thread, and counts the results; it stops at the
+     * first guard that rejects (a failed guard rejects).
      *
      * @param turns The request's messages; a completion's prompt is
      *     one user turn.
-     * @returns The verdict that rejects the request, or nullopt (no
-     *     guard, or the guard let it through).
+     * @returns The rejecting guard's name and verdict, or nullopt (no
+     *     guard, or every guard let it through).
      */
-    std::optional<GuardVerdict> guard_flags(
+    std::optional<std::pair<std::string, GuardVerdict>> guard_flags(
         std::span<const chat::Message> turns);
 
     const model::TransformerModel& model_;
@@ -402,13 +408,20 @@ class OpenAiServer {
     // The dedicated embedding model (--embedding-model; null when not
     // given), one request at a time under bert_mu_.
     std::unique_ptr<embed::EmbeddingModel> bert_;
-    /** The guard model (--guard-model), or null. */
-    std::unique_ptr<Guard> guard_;
-    /** Guard checks run, and rejected requests by category ("error"
-     *  for a guard that failed), for /metrics. */
-    std::atomic<std::uint64_t> guard_checks_total_{0};
-    std::mutex guard_mu_;
-    std::map<std::string, std::uint64_t> guard_flagged_;
+    /** One guard and its /metrics counters. */
+    struct GuardSlot {
+        std::shared_ptr<Guard> guard;
+        /** Joins concurrent checks into one batch (i#1156). */
+        std::unique_ptr<GuardBatcher> batcher;
+        std::atomic<std::uint64_t> checks{0};
+        std::atomic<std::uint64_t> failures{0};
+        std::atomic<std::uint64_t> check_ns{0};
+        std::mutex mu;
+        /** Rejected requests by label (under mu). */
+        std::map<std::string, std::uint64_t> flagged;
+    };
+    /** The guards, in the order they run (empty: no guard). */
+    std::vector<std::unique_ptr<GuardSlot>> guards_;
     std::mutex bert_mu_;
     // The reranker (--rerank-model; null when not given), one request
     // at a time under rerank_mu_.
