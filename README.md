@@ -43,8 +43,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   `--rerank-model`. Both run on the CPU, and a large request's passes
   on Vulkan where the GPU shares host memory (Apple), or on CUDA. A
   DeBERTa v3 sequence classifier (arch `deberta-v2`, from
-  `scripts/text/convert-deberta.py`) runs and matches transformers,
-  not yet served (i#1159).
+  `scripts/text/convert-deberta.py`) matches transformers and serves
+  as a `--guard kind=prompt-guard`.
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), structured output (JSON mode, a JSON Schema, a
   regex or a GBNF grammar), prompt caching (in RAM, and on disk with
@@ -288,10 +288,14 @@ a ResNet-50 or Inception-v3 from `scripts/image/convert-cnn.py`.
 request with Llama Guard 3 before the chat model sees it; a flagged
 request gets a 400 (docs/CLIENTS.md), and `--guard-categories S1,S9`
 picks the categories that reject (default: all). More guards come from
-a repeatable `--guard kind=llama-guard,model=P[,name=N][,labels=S1:S9]`;
-they run in order and any one can reject. Guards run on the chat
-model's backend, between its steps; each llama-guard guard holds its
-own KV pool (`--ctx`, else 4096 positions).
+a repeatable `--guard kind=llama-guard,model=P[,name=N][,labels=S1:S9]`,
+or `--guard kind=prompt-guard,model=P,labels=INJECTION@0.9[,threshold=T]`
+for a DeBERTa classifier such as Prompt Guard (from
+`scripts/text/convert-deberta.py`; its labels from the model, each
+with an optional threshold, 0.5 by default); they run in order and
+any one can reject. Guards run on the chat model's worker, between
+its steps; each llama-guard guard holds its own KV pool (`--ctx`,
+else 4096 positions).
 A converter whose input lies in a Hugging Face cache snapshot records
 the repository and commit (`general.source.url`,
 `general.source.revision`; `scripts/hf_source.py`, tested by

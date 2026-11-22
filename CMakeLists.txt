@@ -142,6 +142,7 @@ add_library(locus
     src/locus/server/image_lora.cpp
     src/locus/server/model_headers.cpp
     src/locus/server/guard.cpp
+    src/locus/server/classifier_guard.cpp
     src/locus/http/base64.cpp
     src/locus/http/client.cpp
     src/locus/http/http.cpp

@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 
 #include "locus/engine/engine.hpp"
+#include "locus/server/classifier_guard.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -346,9 +350,29 @@ std::pair<std::uint32_t, std::uint32_t> LlamaGuard::last_prefill() {
     return {loaded_->last_prompt, loaded_->last_prefilled};
 }
 
+namespace {
+
+/** A threshold for a label without its own: GuardSpec::threshold. */
+constexpr float kNoThreshold = std::numeric_limits<float>::quiet_NaN();
+
+/** @returns text as a probability threshold in (0, 1].
+ *  @throws std::invalid_argument when it is not one. */
+float parse_threshold(const std::string& text) {
+    char* end = nullptr;
+    const float t = std::strtof(text.c_str(), &end);
+    if (text.empty() || end != text.c_str() + text.size() || !(t > 0.0f) ||
+        t > 1.0f) {
+        throw std::invalid_argument("--guard: threshold '" + text +
+                                    "' is not a number in (0, 1]");
+    }
+    return t;
+}
+
+}  // namespace
+
 GuardSpec parse_guard_spec(std::string_view text) {
     GuardSpec s;
-    bool have_labels = false;
+    bool have_labels = false, have_threshold = false;
     std::size_t at = 0;
     while (at <= text.size()) {
         const std::size_t comma = text.find(',', at);
@@ -375,10 +399,28 @@ GuardSpec parse_guard_spec(std::string_view text) {
                 const std::size_t c = value.find(':', b);
                 const std::string l = value.substr(
                     b, c == std::string::npos ? std::string::npos : c - b);
-                if (!l.empty()) s.labels.push_back(l);
+                if (!l.empty()) {
+                    // NAME or NAME@threshold (classifier kinds).
+                    const std::size_t at_sign = l.find('@');
+                    if (at_sign == std::string::npos) {
+                        s.labels.push_back(l);
+                        s.thresholds.push_back(kNoThreshold);
+                    } else {
+                        s.labels.push_back(l.substr(0, at_sign));
+                        s.thresholds.push_back(
+                            parse_threshold(l.substr(at_sign + 1)));
+                        if (s.labels.back().empty()) {
+                            throw std::invalid_argument(
+                                "--guard: '" + l + "' names no label");
+                        }
+                    }
+                }
                 if (c == std::string::npos) break;
                 b = c + 1;
             }
+        } else if (key == "threshold") {
+            s.threshold = parse_threshold(value);
+            have_threshold = true;
         } else {
             throw std::invalid_argument("--guard: unknown key '" +
                                         std::string(key) + "'");
@@ -389,12 +431,28 @@ GuardSpec parse_guard_spec(std::string_view text) {
     if (s.kind.empty() || s.model.empty()) {
         throw std::invalid_argument("--guard needs kind= and model=");
     }
-    if (s.kind != "llama-guard") {
+    if (s.kind != "llama-guard" && s.kind != "prompt-guard") {
         throw std::invalid_argument("--guard: unknown kind '" + s.kind +
-                                    "' (known: llama-guard)");
+                                    "' (known: llama-guard, prompt-guard)");
     }
     if (have_labels && s.labels.empty()) {
         throw std::invalid_argument("--guard: labels= names no label");
+    }
+    const bool scores = s.kind != "llama-guard";
+    if (!scores) {
+        // A generating guard writes its categories: no scores to
+        // compare with a threshold.
+        if (have_threshold ||
+            std::any_of(s.thresholds.begin(), s.thresholds.end(),
+                        [](float t) { return !std::isnan(t); })) {
+            throw std::invalid_argument(
+                "--guard: kind=llama-guard takes no threshold");
+        }
+    } else if (s.labels.empty()) {
+        // "All labels" would reject on the benign label too.
+        throw std::invalid_argument(
+            "--guard: kind=" + s.kind + " needs labels= (the labels that "
+            "reject, e.g. labels=INJECTION@0.9:JAILBREAK)");
     }
     if (s.name.empty()) {
         const std::size_t slash = s.model.find_last_of('/');
@@ -414,6 +472,7 @@ std::unique_ptr<Guard> make_guard(const GuardSpec& spec,
         return LlamaGuard::load(spec.model, backend, n_blocks, spec.labels,
                                 spec.name);
     }
+    if (spec.kind == "prompt-guard") return load_prompt_guard(spec);
     throw std::invalid_argument("unknown guard kind '" + spec.kind + "'");
 }
 

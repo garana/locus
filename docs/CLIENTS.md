@@ -410,8 +410,12 @@ calling. Reliable agent use therefore needs a capable instruct model.
   `/v1/chat/completions`, `/v1/completions` (its prompt as one user
   turn), `/v1/messages` and `/v1/responses` request first, in order;
   Llama Guard 3 judges the last user turn, with the earlier user and
-  assistant turns as context; tool results count as user turns,
-  system turns and images are left out. A request any guard flags
+  assistant turns as context; Prompt Guard (`kind=prompt-guard`)
+  scores every user turn and every tool result of the request, each
+  in windows of its context, for the labels the operator picked, but
+  not the system or assistant turns (the history is the client's, so
+  every turn is judged, not only the last). Tool results count as
+  user turns; system turns and images are left out. A request any guard flags
   never reaches the chat model and gets a 400, naming that guard; the
   OpenAI endpoints use Azure OpenAI's fields for a filtered prompt,
   plus the guard and the labels:
@@ -419,8 +423,9 @@ calling. Reliable agent use therefore needs a capable instruct model.
   S1", "type": "invalid_request_error", "param": "prompt", "code":
   "content_filter", "guard": "harm", "categories": ["S1"]}}`;
   `/v1/messages` gives its `invalid_request_error`. A guard that fails
-  (any reply but a verdict, or a chat longer than its KV pool: `--ctx`,
-  else 4096 positions) gives a 500, and the request is not run.
+  (any reply but a verdict, a chat longer than its KV pool: `--ctx`,
+  else 4096 positions, or for Prompt Guard more than 64 windows,
+  about 29k tokens) gives a 500, and the request is not run.
   Replies are not checked, and the media endpoints (`/v1/images/*`,
   `/v1/videos`, `/v1/audio/speech`) are not guarded.
 - Tool execution: locus only expresses tool calls; it never runs them.
