@@ -136,14 +136,22 @@ class Guard {
 
     ~Guard();
 
+    /** Runs a piece of work and returns when it is done (for example
+     *  EngineLoop::run_on_worker); its exception is rethrown. */
+    using Runner = std::function<void(std::function<void()>)>;
+
     /**
      * Judges the last user turn of `turns`. A guard that throws or
      * replies with anything but a verdict gives kMalformed.
      *
      * @param turns The request's messages.
+     * @param run Where the guard model runs: the chat engine's worker
+     *     thread in the server, so no backend runs on two threads at
+     *     once; empty runs it on the calling thread.
      * @returns The verdict.
      */
-    GuardVerdict check(std::span<const chat::Message> turns);
+    GuardVerdict check(std::span<const chat::Message> turns,
+                       const Runner& run = {});
 
     /** @returns Whether `v` rejects under this guard's categories. */
     bool rejects(const GuardVerdict& v) const {

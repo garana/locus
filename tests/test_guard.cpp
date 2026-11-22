@@ -125,6 +125,20 @@ TEST_CASE("a guard checks the prompt it builds and fails closed",
     const auto down = g.check(turns);
     CHECK(down.kind == Kind::kMalformed);
     CHECK(g.rejects(down));
+
+    // A runner: the model runs inside it, and its failure fails closed.
+    reply = "safe";
+    int ran = 0;
+    const Guard::Runner run = [&](std::function<void()> f) {
+        ++ran;
+        f();
+    };
+    CHECK(g.check(turns, run).kind == Kind::kSafe);
+    CHECK(ran == 1);
+    const Guard::Runner broken = [](std::function<void()>) {
+        throw std::runtime_error("engine loop stopped");
+    };
+    CHECK(g.check(turns, broken).kind == Kind::kMalformed);
 }
 
 TEST_CASE("a guard reply ends at EOS or end of turn, or is cut",

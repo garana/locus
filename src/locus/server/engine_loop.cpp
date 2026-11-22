@@ -7,6 +7,7 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -232,6 +233,20 @@ std::uint64_t EngineLoop::submit(
     return id;
 }
 
+void EngineLoop::run_on_worker(std::function<void()> fn) {
+    std::packaged_task<void()> task(std::move(fn));
+    std::future<void> done = task.get_future();
+    {
+        auto lk = lock_turn();
+        if (stop_) {
+            throw std::runtime_error("engine loop stopped");
+        }
+        tasks_.push_back(std::move(task));
+    }
+    work_cv_.notify_all();
+    done.get();
+}
+
 void EngineLoop::run() {
     // The engine worker drives the forward pass and runs the inline
     // matvec slice, so register its cache counters for /metrics too (the
@@ -248,6 +263,16 @@ void EngineLoop::run() {
     }
     std::unique_lock<std::mutex> lk(mu_);
     while (!stop_) {
+        // run_on_worker's tasks, between steps. mu_ is released while
+        // one runs: only this thread steps engine_, so readers may
+        // look at it meanwhile.
+        while (!tasks_.empty()) {
+            std::packaged_task<void()> task = std::move(tasks_.front());
+            tasks_.pop_front();
+            lk.unlock();
+            task();  // an exception lands in the task's future
+            lk.lock();
+        }
         try {
             engine_.step();
         } catch (const std::exception& e) {
@@ -269,11 +294,13 @@ void EngineLoop::run() {
             // A disk-tier read is in flight and its end does not
             // notify work_cv_: look again shortly instead of parking.
             work_cv_.wait_for(lk, std::chrono::milliseconds(10), [this] {
-                return stop_ || engine_.has_runnable_work();
+                return stop_ || engine_.has_runnable_work() ||
+                       !tasks_.empty();
             });
         } else if (!engine_.has_runnable_work()) {
             work_cv_.wait(lk, [this] {
-                return stop_ || engine_.has_runnable_work();
+                return stop_ || engine_.has_runnable_work() ||
+                       !tasks_.empty();
             });
         } else if (read_waiters_.load() > 0) {
             // Active generation with a client reading: release mu_ and

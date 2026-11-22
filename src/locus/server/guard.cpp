@@ -238,11 +238,19 @@ std::unique_ptr<Guard> Guard::load(const std::string& path,
     return g;
 }
 
-GuardVerdict Guard::check(std::span<const chat::Message> turns) {
+GuardVerdict Guard::check(std::span<const chat::Message> turns,
+                          const Runner& run) {
     const auto prompt = llama_guard3_prompt(turns, categories_);
     std::lock_guard<std::mutex> lock(mu_);
     try {
-        return parse_guard_verdict(classify_(prompt));
+        std::string reply;
+        const auto work = [&] { reply = classify_(prompt); };
+        if (run) {
+            run(work);
+        } else {
+            work();
+        }
+        return parse_guard_verdict(reply);
     } catch (const std::exception&) {
         return {};  // kMalformed: fails closed
     }
