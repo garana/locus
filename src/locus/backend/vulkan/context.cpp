@@ -1223,6 +1223,9 @@ struct VulkanContext::Impl {
     int fail_allocations = 0;
     /** fail_submits_for_test: end_batch submits left to fail. */
     int fail_submits = 0;
+    /** fail_begins_for_test: begin_batch command buffers left to fail
+     *  to begin. */
+    int fail_begins = 0;
     /** The heap of the memory type make_buffer last allocated from;
      *  ~0u before the first buffer (i#364). */
     std::uint32_t buffer_heap = ~0u;
@@ -2205,6 +2208,10 @@ void VulkanContext::fail_submits_for_test(int n) {
     impl_->fail_submits = n;
 }
 
+void VulkanContext::fail_begins_for_test(int n) {
+    impl_->fail_begins = n;
+}
+
 int VulkanContext::command_buffers_for_test() const {
     return impl_->live_cmds;
 }
@@ -2272,7 +2279,20 @@ void VulkanContext::begin_batch() {
     VkCommandBufferBeginInfo cbb{};
     cbb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cbb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    check(vkBeginCommandBuffer(im.batch_cmd, &cbb), "begin cmd");
+    VkResult began;
+    if (im.fail_begins > 0) {
+        // fail_begins_for_test: fail as vkBeginCommandBuffer would.
+        --im.fail_begins;
+        began = VK_ERROR_OUT_OF_HOST_MEMORY;
+    } else {
+        began = vkBeginCommandBuffer(im.batch_cmd, &cbb);
+    }
+    if (began != VK_SUCCESS) {
+        // Never recorded or submitted, so free it now: no batch opens to
+        // free it later (i#1142).
+        im.free_batch_cmd();
+        check(began, "begin cmd");
+    }
     im.batch_t0 = std::chrono::steady_clock::now();
     im.ts_tag.clear();
     im.batch_timed =
@@ -2767,6 +2787,7 @@ VulkanContext::Buffer VulkanContext::create_buffer(std::size_t, MemKind) {
 }
 void VulkanContext::fail_allocations_for_test(int) { no_kernels(); }
 void VulkanContext::fail_submits_for_test(int) { no_kernels(); }
+void VulkanContext::fail_begins_for_test(int) { no_kernels(); }
 int VulkanContext::command_buffers_for_test() const { no_kernels(); }
 VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
                                                  std::size_t) {

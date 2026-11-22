@@ -474,6 +474,12 @@ class VulkanContext {
      */
     void fail_submits_for_test(int n);
 
+    /**
+     * Test seam (i#1142): the next `n` begin_batch calls throw at
+     * vkBeginCommandBuffer, as a failed one does; 0 clears it.
+     */
+    void fail_begins_for_test(int n);
+
     /** @returns Command buffers allocated and not yet freed (tests:
      *  a failed batch must leave none behind, i#1140). */
     int command_buffers_for_test() const;
