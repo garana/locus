@@ -142,18 +142,42 @@ std::vector<GuardCategory> llama_guard3_1b_categories() {
     };
 }
 
+std::string guard_reply_text(std::span<const tok::TokenId> generated,
+                             tok::TokenId eos, tok::TokenId eot,
+                             const tok::Tokenizer& tok) {
+    const auto stop = std::find_if(
+        generated.begin(), generated.end(),
+        [&](tok::TokenId t) { return t == eos || t == eot; });
+    if (stop == generated.end()) {
+        throw std::runtime_error("guard: reply cut before its end");
+    }
+    return tok.decode(generated.first(
+        static_cast<std::size_t>(stop - generated.begin())));
+}
+
 struct Guard::Loaded {
     gguf::GgufFile file;
     model::TransformerModel model;
     std::unique_ptr<tok::Tokenizer> tok;
     engine::Engine engine;
 
+    /** <|eot_id|>'s id when the vocabulary has it as one token, else
+     *  EOS: Llama Guard 3 ends its verdict there, and a GGUF may name
+     *  <|end_of_text|> as EOS instead. */
+    tok::TokenId eot;
+
     Loaded(const std::string& path, const backend::Backend& backend,
            std::uint32_t n_blocks)
         : file(gguf::GgufFile::open(path)),
           model(model::TransformerModel::load(file)),
           tok(tok::tokenizer_from_gguf(file)),
-          engine(use(model, backend), tok->eos_id(), config(n_blocks)) {}
+          engine(use(model, backend), tok->eos_id(), config(n_blocks)),
+          eot(end_of_turn(*tok)) {}
+
+    static tok::TokenId end_of_turn(const tok::Tokenizer& t) {
+        const auto ids = t.encode("<|eot_id|>", false);
+        return ids.size() == 1 ? ids[0] : t.eos_id();
+    }
 
     static const model::TransformerModel& use(model::TransformerModel& m,
                                               const backend::Backend& b) {
@@ -167,10 +191,19 @@ struct Guard::Loaded {
         return c;
     }
 
-    /** The guard's greedy reply: at most 16 tokens, ending at EOS. */
+    /** The most tokens a verdict may take: "unsafe" and all 14 codes
+     *  fit well inside it. */
+    static constexpr std::uint32_t kMaxReply = 64;
+
+    /**
+     * The guard's greedy reply, up to its first EOS or <|eot_id|>. A
+     * reply with neither within kMaxReply tokens was cut, and a cut
+     * list of codes would parse as a shorter one, so it throws (and
+     * the check fails closed).
+     */
     std::string reply(const chat::ChatTemplate::Prompt& p) {
         auto ids = tok->encode_literal(p.text, false, p.content);
-        const std::uint64_t id = engine.submit(std::move(ids), 16);
+        const std::uint64_t id = engine.submit(std::move(ids), kMaxReply);
         engine.run_to_completion();
         const engine::Request* r = engine.get(id);
         if (r == nullptr || r->status != engine::Status::kDone) {
@@ -179,9 +212,9 @@ struct Guard::Loaded {
             engine.release(id);
             throw std::runtime_error("guard: " + why);
         }
-        std::string text = tok->decode(r->generated);
+        std::vector<tok::TokenId> gen = r->generated;
         engine.release(id);
-        return text;
+        return guard_reply_text(gen, tok->eos_id(), eot, *tok);
     }
 };
 

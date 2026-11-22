@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "locus/chat/template.hpp"
+#include "locus/tok/tokenizer.hpp"
 
 namespace locus::backend {
 struct Backend;
@@ -83,6 +84,22 @@ chat::ChatTemplate::Prompt llama_guard3_prompt(
  *     names them (the 1B model has no S14).
  */
 std::vector<GuardCategory> llama_guard3_1b_categories();
+
+/**
+ * The text of a guard's reply up to its first `eos` or `eot` token.
+ *
+ * @param generated The tokens the guard generated.
+ * @param eos The model's EOS id.
+ * @param eot Its end-of-turn id (<|eot_id|>), which may differ.
+ * @param tok The guard's tokenizer.
+ * @returns The decoded text before the stop token.
+ * @throws std::runtime_error when neither token is there: the reply
+ *     reached the token cap, and a cut list of codes would read as a
+ *     shorter one.
+ */
+std::string guard_reply_text(std::span<const tok::TokenId> generated,
+                             tok::TokenId eos, tok::TokenId eot,
+                             const tok::Tokenizer& tok);
 
 /**
  * A guard model that judges chat requests (i#1106): it builds the
