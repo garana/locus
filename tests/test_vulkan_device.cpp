@@ -293,6 +293,17 @@ TEST_CASE("vulkan weights written through mapped reach the kernel",
         // allocate over (i#1140).
         REQUIRE(ctx.command_buffers_for_test() == cmds);
     }
+    // A command buffer that fails to begin (i#1142): no batch opens,
+    // and the buffer it allocated is freed at once.
+    {
+        const int cmds = ctx.command_buffers_for_test();
+        ctx.fail_begins_for_test(1);
+        REQUIRE_THROWS_WITH(ctx.matvec_f32(wb, rows, cols, xb, ob),
+                            Catch::Matchers::ContainsSubstring("begin"));
+        ctx.fail_begins_for_test(0);
+        REQUIRE_FALSE(ctx.batch_open());
+        REQUIRE(ctx.command_buffers_for_test() == cmds);
+    }
     // Twice: the first batch records the copy, the second reads the
     // device-local buffer alone.
     for (int pass = 0; pass < 2; ++pass) {
