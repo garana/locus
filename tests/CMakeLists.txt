@@ -113,6 +113,7 @@ add_executable(locus_tests
     test_flux_lora.cpp
     test_image_lora.cpp
     test_model_headers.cpp
+    test_guard.cpp
     test_pixart_dit.cpp
     test_pixart_sampler.cpp
     test_pixart_vae.cpp
