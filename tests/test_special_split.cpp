@@ -158,30 +158,36 @@ TEST_CASE("many short messages split in linear time", "[tok]") {
 // i#1153: 1 MB of one control token's text, as a message (every copy
 // skipped) and raw (every copy splits), was quadratic in the copies.
 TEST_CASE("1 MB of control-token text encodes in linear time", "[tok]") {
-    const std::string path = std::string(LOCUS_SOURCE_DIR) +
-                             "/tests/models/llama-3.2-1b-q8_0.gguf";
-    if (!std::filesystem::exists(path)) {
-        SKIP("llama-3.2-1b-q8_0.gguf absent");
-    }
-    auto g = locus::gguf::GgufFile::open(path);
-    const auto tok = locus::tok::tokenizer_from_gguf(g);
-    const std::string marker = "<|eot_id|>";
-    const TokenId eot = tok->encode(marker, false).at(0);
-    std::string text;
-    while (text.size() < (1u << 20)) text += marker;
-    const std::size_t copies = text.size() / marker.size();
-    const TextRange all{0, text.size()};
+    // BPE (Llama 3.2, 256 specials) and SentencePiece (TinyLlama).
+    const std::pair<const char*, std::string> cases[] = {
+        {"llama-3.2-1b-q8_0.gguf", "<|eot_id|>"},
+        {"tinyllama-1.1b-q8_0.gguf", "</s>"}};
+    int ran = 0;
+    for (const auto& [file, marker] : cases) {
+        const std::string path =
+            std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + file;
+        if (!std::filesystem::exists(path)) continue;
+        ++ran;
+        auto g = locus::gguf::GgufFile::open(path);
+        const auto tok = locus::tok::tokenizer_from_gguf(g);
+        const TokenId eot = tok->encode(marker, false).at(0);
+        std::string text;
+        while (text.size() < (1u << 20)) text += marker;
+        const std::size_t copies = text.size() / marker.size();
+        const TextRange all{0, text.size()};
 
-    double t0 = cpu_seconds();
-    const auto lit = tok->encode_literal(text, false, {&all, 1});
-    const double literal_s = cpu_seconds() - t0;
-    t0 = cpu_seconds();
-    const auto raw = tok->encode(text, false);
-    const double raw_s = cpu_seconds() - t0;
-    INFO(copies << " copies: as a message " << literal_s << " s, raw "
-                << raw_s << " s");
-    CHECK(std::count(lit.begin(), lit.end(), eot) == 0);
-    CHECK(raw == std::vector<TokenId>(copies, eot));
-    CHECK(literal_s < 3.0);
-    CHECK(raw_s < 3.0);
+        double t0 = cpu_seconds();
+        const auto lit = tok->encode_literal(text, false, {&all, 1});
+        const double literal_s = cpu_seconds() - t0;
+        t0 = cpu_seconds();
+        const auto raw = tok->encode(text, false);
+        const double raw_s = cpu_seconds() - t0;
+        INFO(file << ", " << copies << " copies: as a message "
+                  << literal_s << " s, raw " << raw_s << " s");
+        CHECK(std::count(lit.begin(), lit.end(), eot) == 0);
+        CHECK(raw == std::vector<TokenId>(copies, eot));
+        CHECK(literal_s < 3.0);
+        CHECK(raw_s < 3.0);
+    }
+    if (ran == 0) SKIP("no model with a control token present");
 }

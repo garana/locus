@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 #include "locus/tok/bpe_tokenizer.hpp"
+#include "locus/tok/special_split.hpp"
 #include "locus/tok/ugm_tokenizer.hpp"
 #include "locus/tok/wpm_tokenizer.hpp"
 
@@ -90,7 +91,19 @@ SpmTokenizer::SpmTokenizer(Config config) : cfg_(std::move(config)) {
     for (std::size_t i = 0; i < n; ++i) {
         token_to_id_.emplace(cfg_.tokens[i],
                              static_cast<TokenId>(i));
+        const auto t = static_cast<TokenType>(cfg_.types[i]);
+        // As llama.cpp's special-token cache. An empty piece would
+        // match everywhere without advancing, so it is left out.
+        if ((t == TokenType::kControl || t == TokenType::kUnknown ||
+             t == TokenType::kUserDefined) &&
+            !cfg_.tokens[i].empty()) {
+            specials_.emplace_back(cfg_.tokens[i], static_cast<TokenId>(i));
+        }
     }
+    std::stable_sort(specials_.begin(), specials_.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.first.size() > b.first.size();
+                     });
 }
 
 SpmTokenizer SpmTokenizer::from_gguf(const gguf::GgufFile& g) {
@@ -136,13 +149,49 @@ SpmTokenizer SpmTokenizer::from_gguf(const gguf::GgufFile& g) {
 
 std::vector<TokenId> SpmTokenizer::encode(std::string_view text,
                                           bool add_bos) const {
+    return encode_literal(text, add_bos, {});
+}
+
+std::vector<TokenId> SpmTokenizer::encode_literal(
+    std::string_view text, bool add_bos,
+    std::span<const TextRange> literal, bool user_defined) const {
     std::vector<TokenId> out;
     if (add_bos) {
         out.push_back(cfg_.bos);
     }
-    const std::string norm = normalize(text, cfg_.add_space_prefix);
+    // Split on special tokens (earliest match, the longer on a tie;
+    // linear, split_specials), SPM in between, as llama.cpp's
+    // tokenizer_st_partition and its SPM loop: a run of text that
+    // starts the input or follows a special token takes the space
+    // prefix.
+    std::vector<SpecialText> specials;
+    specials.reserve(specials_.size());
+    for (const auto& [sp, id] : specials_) {
+        const TokenType t = type_of(id);
+        specials.push_back(
+            {sp, id,
+             t == TokenType::kControl || t == TokenType::kUnknown ||
+                 (user_defined && t == TokenType::kUserDefined)});
+    }
+    bool after_special = true;
+    split_specials(
+        text, specials, literal,
+        [&](std::string_view seg) {
+            encode_text(seg, cfg_.add_space_prefix && after_special, out);
+            after_special = false;
+        },
+        [&](TokenId id) {
+            out.push_back(id);
+            after_special = true;
+        });
+    return out;
+}
+
+void SpmTokenizer::encode_text(std::string_view text, bool space_prefix,
+                               std::vector<TokenId>& out) const {
+    const std::string norm = normalize(text, space_prefix);
     if (norm.empty()) {
-        return out;
+        return;
     }
 
     // Split into UTF-8 codepoint symbols (offset, length pairs), linked
@@ -252,7 +301,6 @@ std::vector<TokenId> SpmTokenizer::encode(std::string_view text,
                                                    : it->second);
         }
     }
-    return out;
 }
 
 std::string SpmTokenizer::decode(std::span<const TokenId> ids) const {

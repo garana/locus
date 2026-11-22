@@ -204,10 +204,15 @@ TEST_CASE("SPM text never merges into a control or the unknown token",
     cfg.types = {2, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
     cfg.add_space_prefix = false;
     const SpmTokenizer tok(cfg);
-    CHECK(tok.encode("</s>", false) == std::vector<TokenId>{7, 8});
-    CHECK(tok.encode("<unk>", false) == std::vector<TokenId>{13, 14});
-    CHECK(tok.encode("</s></s>", false) ==
-          std::vector<TokenId>{7, 8, 7, 8});
+    // As message text: the special-token pass leaves it alone (i#1150),
+    // so only the merges could build the control.
+    const auto literal = [&](const std::string& s) {
+        const locus::tok::TextRange all{0, s.size()};
+        return tok.encode_literal(s, false, {&all, 1});
+    };
+    CHECK(literal("</s>") == std::vector<TokenId>{7, 8});
+    CHECK(literal("<unk>") == std::vector<TokenId>{13, 14});
+    CHECK(literal("</s></s>") == std::vector<TokenId>{7, 8, 7, 8});
 }
 
 TEST_CASE("a 200 KB word tokenizes in well under a second", "[tok]") {
