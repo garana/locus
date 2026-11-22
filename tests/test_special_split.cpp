@@ -31,13 +31,15 @@ std::vector<std::string> split(std::string_view text,
 }
 
 /** The split before i#1153: every special searched from the cursor at
- *  every step, a literal match skipped one byte at a time. */
+ *  every step, a literal match skipped one byte at a time. One change:
+ *  an empty range (an empty message, no client text) protects nothing;
+ *  the old check counted one lying inside a match as an overlap. */
 std::vector<std::string> reference(std::string_view text,
                                    const std::vector<SpecialText>& sp,
                                    const std::vector<TextRange>& lit) {
     const auto in_lit = [&](std::size_t b, std::size_t e) {
         for (const TextRange& r : lit) {
-            if (b < r.end && r.begin < e) return true;
+            if (r.begin < r.end && b < r.end && r.begin < e) return true;
         }
         return false;
     };
@@ -94,6 +96,12 @@ TEST_CASE("special split: earliest match, longer on a tie, literal skip",
           V{"t:x</s>y<s>", "s:9", "t:z", "s:2"});
     // A match straddling a range edge counts as inside.
     CHECK(split("ab</s>", sp, {{0, 3}}) == V{"t:ab</s>"});
+    // Ranges out of order, overlapping, touching or empty give the
+    // same split as their union.
+    const std::string u = "</s></s></s></s>";
+    CHECK(split(u, sp, {{8, 12}, {0, 4}, {2, 6}, {6, 6}}) ==
+          split(u, sp, {{0, 6}, {8, 12}}));
+    CHECK(split(u, sp, {{4, 8}, {0, 4}}) == split(u, sp, {{0, 8}}));
 }
 
 TEST_CASE("special split matches the old split on random text", "[tok]") {
@@ -116,6 +124,35 @@ TEST_CASE("special split matches the old split on random text", "[tok]") {
         INFO("text '" << text << "'");
         CHECK(split(text, sp, lit) == reference(text, sp, lit));
     }
+}
+
+// i#1153 review: a chat of many short messages, each one control token,
+// was messages squared (every tested match scanned every range). 200k
+// one-copy ranges, given out of order, with the same marker between
+// them outside any range.
+TEST_CASE("many short messages split in linear time", "[tok]") {
+    const std::vector<SpecialText> sp = {{"<|eot_id|>", 7, true},
+                                         {"<|x|>", 8, true}};
+    const std::string m = "<|eot_id|>";
+    const std::size_t n = 200000;
+    std::string text;
+    std::vector<TextRange> lit;
+    for (std::size_t i = 0; i < n; ++i) {
+        lit.push_back({text.size(), text.size() + m.size()});
+        text += m;   // a message: stays text
+        text += m;   // the template's own: splits
+    }
+    std::reverse(lit.begin(), lit.end());
+    std::size_t specials = 0, texts = 0;
+    const double t0 = cpu_seconds();
+    split_specials(
+        text, sp, lit, [&](std::string_view) { ++texts; },
+        [&](TokenId id) { specials += id == 7 ? 1 : 0; });
+    const double s = cpu_seconds() - t0;
+    INFO(n << " messages: " << s << " s");
+    CHECK(specials == n);
+    CHECK(texts == n);
+    CHECK(s < 1.0);
 }
 
 // i#1153: 1 MB of one control token's text, as a message (every copy
