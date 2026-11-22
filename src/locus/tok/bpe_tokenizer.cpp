@@ -1,5 +1,6 @@
 #include "locus/tok/bpe_tokenizer.hpp"
 
+#include "locus/tok/special_split.hpp"
 #include "locus/tok/unicode.hpp"
 
 #include <algorithm>
@@ -585,52 +586,27 @@ std::vector<TokenId> BpeTokenizer::encode_literal(
     if (add_bos && cfg_.add_bos) {
         out.push_back(cfg_.bos);
     }
-    const auto in_literal = [&](std::size_t b, std::size_t e) {
-        for (const TextRange& r : literal) {
-            if (b < r.end && r.begin < e) return true;
-        }
-        return false;
-    };
     // Split on special tokens (longest first), BPE in between. A
     // control token's match that overlaps a literal range is skipped,
-    // and so is a user-defined one's when user_defined is set.
-    std::size_t at = 0;
-    while (at < text.size()) {
-        std::size_t sp_pos = std::string_view::npos;
-        std::size_t sp_idx = 0;
-        for (std::size_t k = 0; k < specials_.size(); ++k) {
-            const std::string_view sp = specials_[k].first;
-            const TokenType t = type_of(specials_[k].second);
-            const bool skip = t == TokenType::kControl ||
-                              (user_defined && t == TokenType::kUserDefined);
-            std::size_t p = text.find(sp, at);
-            while (skip && p != std::string_view::npos &&
-                   in_literal(p, p + sp.size())) {
-                p = text.find(sp, p + 1);
-            }
-            if (p < sp_pos) {
-                sp_pos = p;
-                sp_idx = k;
-            }
-        }
-        const std::size_t seg_end =
-            sp_pos == std::string_view::npos ? text.size()
-                                             : sp_pos;
-        const std::string_view seg =
-            text.substr(at, seg_end - at);
-        for (const auto& [b, e] : pretokenize(seg, cfg_.pre)) {
-            bpe_word(seg.substr(b, e - b), out);
-        }
-        if (sp_pos == std::string_view::npos) {
-            break;
-        }
-        out.push_back(specials_[sp_idx].second);
-        // Advance by at least one byte so a zero-width special can
-        // never stall the loop (defence-in-depth; empty specials are
-        // already filtered at construction).
-        const std::size_t adv = specials_[sp_idx].first.size();
-        at = sp_pos + (adv > 0 ? adv : 1);
+    // and so is a user-defined one's when user_defined is set. Linear
+    // in the text per special (split_specials, i#1153).
+    std::vector<SpecialText> specials;
+    specials.reserve(specials_.size());
+    for (const auto& [sp, id] : specials_) {
+        const TokenType t = type_of(id);
+        specials.push_back(
+            {sp, id,
+             t == TokenType::kControl ||
+                 (user_defined && t == TokenType::kUserDefined)});
     }
+    split_specials(
+        text, specials, literal,
+        [&](std::string_view seg) {
+            for (const auto& [b, e] : pretokenize(seg, cfg_.pre)) {
+                bpe_word(seg.substr(b, e - b), out);
+            }
+        },
+        [&](TokenId id) { out.push_back(id); });
     return out;
 }
 
