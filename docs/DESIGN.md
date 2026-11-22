@@ -846,7 +846,9 @@ guarding the default path.
   of the prompt runs first as its own request, so a later turn
   prefills only the new turn and the closing instruction (on a
   2100-token chat, a Llama 3.2 1B stand-in: 121 s cold and 9.6 s for
-  the next turn on an SSE4 CPU, 36 s and 3.4 s on CUDA). Only "safe", or
+  the next turn on an SSE4 CPU, 36 s and 3.4 s on CUDA). As with the
+  chat engine's cache, every client shares it, so a fast check tells a
+  client that someone sent the same conversation start. Only "safe", or
   "unsafe" and a line of codes, is a verdict; anything else, a reply
   cut at the cap, or a failed run rejects (fail closed).
   `locus_guard_checks_total` and `locus_guard_flagged_total{category}`
