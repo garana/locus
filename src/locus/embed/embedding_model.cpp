@@ -103,9 +103,69 @@ std::unique_ptr<EmbeddingModel> EmbeddingModel::load(const std::string& path,
         }
         if (enc.labels() == 0) throw gguf::Error(path + ": no classifier");
     }
-    return std::unique_ptr<EmbeddingModel>(
+    // A classifier's label names (llama.cpp's converter writes id2label
+    // as {arch}.classifier.output_labels) and problem type (ours,
+    // transformers' value as is), for a guard (i#1157).
+    std::vector<std::string> labels;
+    std::optional<std::string> problem;
+    if (enc.pooling() == Pooling::kRank) {
+        const std::string a(*arch);
+        if (const auto* v = g->get_array(a + ".classifier.output_labels")) {
+            for (const auto& x : *v) {
+                if (x.type != gguf::ValueType::kString) {
+                    throw gguf::Error(path + ": a classifier label is not a "
+                                             "string");
+                }
+                labels.push_back(x.s);
+            }
+            if (labels.size() != enc.labels()) {
+                throw gguf::Error(path + ": " + std::to_string(labels.size()) +
+                                  " label names for " +
+                                  std::to_string(enc.labels()) + " outputs");
+            }
+        } else {
+            for (std::uint32_t i = 0; i < enc.labels(); ++i) {
+                labels.push_back("LABEL_" + std::to_string(i));
+            }
+        }
+        if (const gguf::Value* pt = g->find(a + ".classifier.problem_type")) {
+            if (pt->type != gguf::ValueType::kString) {
+                throw gguf::Error(path + ": classifier.problem_type is not a "
+                                         "string");
+            }
+            problem = pt->s;
+        }
+    }
+    auto m = std::unique_ptr<EmbeddingModel>(
         new EmbeddingModel(std::move(g), std::move(tok), std::move(enc),
                            std::move(name), pair));
+    m->labels_ = std::move(labels);
+    m->problem_type_ = std::move(problem);
+    return m;
+}
+
+std::vector<tok::TokenId> EmbeddingModel::encode_literal(
+    std::string_view text) const {
+    const tok::TextRange all{0, text.size()};
+    return tok_->encode_literal(text, false, {&all, 1});
+}
+
+std::vector<std::vector<float>> EmbeddingModel::logits(
+    std::span<const std::vector<tok::TokenId>> inputs, const backend::Ops& op,
+    const backend::Ops* gpu) const {
+    if (!reranker()) {
+        throw std::invalid_argument(name_ + " has no classifier head");
+    }
+    const std::vector<std::vector<tok::TokenId>> ids(inputs.begin(),
+                                                     inputs.end());
+    std::vector<std::vector<float>> out;
+    out.reserve(ids.size());
+    passes(ids, [&](std::span<const std::vector<tok::TokenId>> run) {
+        for (auto& l : enc_.rank(run, pick(run, op, gpu, enc_.token_macs()))) {
+            out.push_back(std::move(l));
+        }
+    });
+    return out;
 }
 
 std::vector<std::vector<float>> EmbeddingModel::embed(

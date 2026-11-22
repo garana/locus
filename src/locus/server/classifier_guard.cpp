@@ -6,6 +6,7 @@
 
 #include "locus/backend/registry.hpp"
 #include "locus/embed/deberta.hpp"
+#include "locus/embed/embedding_model.hpp"
 #include "locus/gguf/gguf.hpp"
 
 namespace locus::server {
@@ -70,7 +71,9 @@ std::vector<std::vector<tok::TokenId>> guard_windows(
 }
 
 ClassifierGuard::ClassifierGuard(Model model, const GuardSpec& spec)
-    : Guard(spec.name, spec.labels), model_(std::move(model)) {
+    : Guard(spec.name, spec.labels),
+      model_(std::move(model)),
+      max_windows_(spec.max_windows) {
     if (model_.problem == ProblemType::kRegression) {
         throw std::invalid_argument("guard " + spec.name +
                                     ": a regression model has no labels "
@@ -125,16 +128,16 @@ std::vector<GuardVerdict> ClassifierGuard::check_batch(
                                        model_.context, kOverlap, model_.cls,
                                        model_.sep);
                 mine += w.size();
-                if (mine > kMaxWindows) break;
+                if (mine > max_windows_) break;
                 for (auto& x : w) {
                     windows.push_back(std::move(x));
                     owner.push_back(r);
                 }
             }
-            if (mine > kMaxWindows) {
+            if (mine > max_windows_) {
                 ok[r] = false;
                 out[r].error = "the request needs more than " +
-                               std::to_string(kMaxWindows) +
+                               std::to_string(max_windows_) +
                                " windows of the guard's context";
                 // Drop the windows already queued for it.
                 while (!owner.empty() && owner.back() == r) {
@@ -246,6 +249,52 @@ std::unique_ptr<ClassifierGuard> load_prompt_guard(const GuardSpec& spec) {
         return raw->encoder.classify(batch, backend::best_backend().ops);
     };
     m.owner = files;
+    return std::make_unique<ClassifierGuard>(std::move(m), spec);
+}
+
+std::unique_ptr<ClassifierGuard> load_encoder_classifier(
+    const GuardSpec& spec, const backend::Ops* gpu) {
+    std::shared_ptr<embed::EmbeddingModel> em =
+        embed::EmbeddingModel::load(spec.model);
+    if (!em->reranker()) {
+        throw gguf::Error(spec.model + ": no classifier head (a sequence "
+                                       "classifier has pooling rank)");
+    }
+    if (!em->has_pooler()) {
+        // llama.cpp's converter drops BertForSequenceClassification's
+        // pooler.dense, so cls.output then reads the raw CLS state and
+        // the scores are not the model's. A guard with wrong scores is
+        // worse than none.
+        throw gguf::Error(
+            spec.model + ": the classifier head has no pooler (cls); "
+                         "convert the model with "
+                         "scripts/text/convert-bert-classifier.py");
+    }
+    const tok::TokenId cls = em->cls_token(), sep = em->end_token();
+    if (cls < 0 || sep < 0) {
+        throw gguf::Error(spec.model + ": the tokenizer has no first or "
+                                       "last token for one sequence");
+    }
+    ClassifierGuard::Model m;
+    m.kind = "classifier";
+    m.labels = em->label_names();
+    const auto& pt = em->problem_type();
+    m.problem = parse_problem_type(
+        pt ? std::optional<std::string_view>(*pt) : std::nullopt,
+        m.labels.size());
+    m.context = em->context();
+    embed::EmbeddingModel* raw = em.get();
+    // Literal: this tokenizer's plain encode() parses typed special
+    // tokens (SentencePiece since #1151), which a guard must not.
+    m.encode = [raw](std::string_view text) {
+        return raw->encode_literal(text);
+    };
+    m.cls = cls;
+    m.sep = sep;
+    m.classify = [raw, gpu](std::span<const std::vector<tok::TokenId>> batch) {
+        return raw->logits(batch, backend::best_backend().ops, gpu);
+    };
+    m.owner = em;
     return std::make_unique<ClassifierGuard>(std::move(m), spec);
 }
 

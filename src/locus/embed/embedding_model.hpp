@@ -2,7 +2,10 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "locus/backend/registry.hpp"
@@ -97,6 +100,43 @@ class EmbeddingModel {
                             std::size_t* tokens = nullptr,
                             const backend::Ops* gpu = nullptr) const;
 
+    // A sequence classifier's parts, for a guard (i#1157). Valid when
+    // reranker() (pooling rank: a classifier head).
+
+    /** @returns The label names, in output order, from
+     *  `{arch}.classifier.output_labels`, else LABEL_0, LABEL_1, ... */
+    const std::vector<std::string>& label_names() const { return labels_; }
+
+    /** @returns `{arch}.classifier.problem_type`, or nullopt. */
+    const std::optional<std::string>& problem_type() const {
+        return problem_type_;
+    }
+
+    /** @returns Whether the head has its pooler (BertEncoder::has_cls). */
+    bool has_pooler() const { return enc_.has_cls(); }
+
+    /** @returns The single-sequence input's first token ([CLS] / <s>)
+     *  and last ([SEP] / </s>); -1 when the GGUF has none. */
+    tok::TokenId cls_token() const { return pair_.bos; }
+    tok::TokenId end_token() const {
+        return pair_.eos >= 0 ? pair_.eos : pair_.sep;
+    }
+
+    /** @returns `text`'s tokens without specials, its control-token
+     *  text kept as text (encode_literal over all of it). */
+    std::vector<tok::TokenId> encode_literal(std::string_view text) const;
+
+    /**
+     * The classifier's raw logits for inputs that already hold their
+     * specials, in passes of up to kPassTokens tokens.
+     *
+     * @param gpu As for embed().
+     * @returns label_names().size() logits per input.
+     */
+    std::vector<std::vector<float>> logits(
+        std::span<const std::vector<tok::TokenId>> inputs,
+        const backend::Ops& op, const backend::Ops* gpu = nullptr) const;
+
   private:
     /** The special tokens of a pair; -1 = none. */
     struct PairFormat {
@@ -112,6 +152,8 @@ class EmbeddingModel {
     BertEncoder enc_;
     std::string name_;
     PairFormat pair_;
+    std::vector<std::string> labels_;
+    std::optional<std::string> problem_type_;
 };
 
 }  // namespace locus::embed

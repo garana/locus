@@ -292,8 +292,12 @@ a repeatable `--guard kind=llama-guard,model=P[,name=N][,labels=S1:S9]`,
 or `--guard kind=prompt-guard,model=P,labels=INJECTION@0.9[,threshold=T]`
 for a DeBERTa classifier such as Prompt Guard (from
 `scripts/text/convert-deberta.py`; its labels from the model, each
-with an optional threshold, 0.5 by default); they run in order and
-any one can reject. Guards run on the chat model's worker, between
+with an optional threshold, 0.5 by default), or `kind=classifier` the
+same way for a BERT, XLM-R or nomic-bert sequence classifier (from
+`scripts/text/convert-bert-classifier.py`; a llama.cpp conversion of
+a BERT classifier lacks its pooler and is refused); `max_windows=`
+raises a classifier's window cap (64); they run in order and any one
+can reject. Guards run on the chat model's worker, between
 its steps; each llama-guard guard holds its own KV pool (`--ctx`,
 else 4096 positions).
 A converter whose input lies in a Hugging Face cache snapshot records
