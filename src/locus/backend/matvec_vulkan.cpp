@@ -1696,6 +1696,8 @@ bool grp_ok(const PagedPool& pp, const DecodeAttn& a) {
  * than one block: attn_decode per (64-position block, head), or with
  * `grouped` (grp_ok) attn_decode_grp per (32-position block, KV
  * head), reading each K/V row once for the KV head's query heads.
+ * The test "vulkan decode attention rounds merge on one pool" copies
+ * its grouped rounds dispatches; keep the two in step.
  */
 void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
                      std::uint32_t heads, const DecodeAttn& a,

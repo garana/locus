@@ -582,10 +582,10 @@ TEST_CASE("vulkan decode attention merges its partials in rounds",
             at(1, p, got1);
             at(2, p, got2);
             at(0, p, want);
-            CAPTURE(1);
-            check(want, got1);
-            CAPTURE(2);
-            check(want, got2);
+            for (const std::uint32_t cap : {1u, 2u}) {
+                CAPTURE(cap);
+                check(want, cap == 1 ? got1 : got2);
+            }
         }
         c.release(s);
         locus::backend::vulkan_set_attn_part_blocks(0);

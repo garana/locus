@@ -521,7 +521,8 @@ TEST_CASE("vulkan decode attention rounds merge on one pool", "[vulkan]") {
     // one fixed pool and query (bit-identical inputs, unlike the model
     // case, where each cap writes its own K/V) caps 1 and 2 must give
     // the one-round result within 1e-5, on an F32 and an F16 pool. The
-    // dispatches follow rec_attn_decode (matvec_vulkan.cpp).
+    // dispatches copy rec_attn_decode (matvec_vulkan.cpp); keep the
+    // two in step.
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
