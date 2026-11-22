@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <span>
@@ -130,6 +131,49 @@ TEST_CASE("EngineLoop cancels a request when its client disconnects",
     // The engine reclaimed the slot: a fresh request still completes.
     const auto v2 = loop.wait_done(loop.submit(prompt, 4));
     REQUIRE(v2.status == locus::engine::Status::kDone);
+}
+
+// i#1106: run_on_worker runs its task on the worker thread, between
+// steps, also while a generation is going, and returns its exception.
+TEST_CASE("EngineLoop runs a task on its worker thread between steps",
+          "[e2e][engine_loop]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::engine::Engine::Config cfg;
+    const locus::tok::TokenId never_eos = model.hparams().n_vocab;
+    locus::server::EngineLoop loop(model, never_eos, cfg);
+    const auto prompt = tok.encode("Once upon a time", true);
+
+    // Idle: the parked worker wakes for the task.
+    std::thread::id worker;
+    loop.run_on_worker([&] { worker = std::this_thread::get_id(); });
+    CHECK(worker != std::thread::id{});
+    CHECK(worker != std::this_thread::get_id());
+
+    // Busy: the task runs while a long generation is under way, on the
+    // same thread, and the generation goes on after it.
+    const std::uint64_t id = loop.submit(prompt, 256);
+    while (loop.view(id).generated.empty()) {
+        std::this_thread::yield();
+    }
+    std::size_t at = 0;
+    std::thread::id busy;
+    loop.run_on_worker([&] {
+        busy = std::this_thread::get_id();
+        at = loop.view(id).generated.size();
+    });
+    CHECK(busy == worker);
+    const auto v = loop.wait_done(id);
+    CHECK(v.status == locus::engine::Status::kDone);
+    CHECK(at < v.generated.size());
+
+    CHECK_THROWS_WITH(
+        loop.run_on_worker([] { throw std::runtime_error("guard down"); }),
+        "guard down");
 }
 
 // i#81 turnstile regression (deterministic): EngineLoop::cancel must

@@ -281,6 +281,11 @@ prefixes such as "query: " are the client's job. `/v1/rerank` needs
 reranker by `scripts/text/convert-xlmr-reranker.py`. `/v1/classify` and
 image inputs to `/v1/embeddings` need `--image-classifier <cnn.gguf>`,
 a ResNet-50 or Inception-v3 from `scripts/image/convert-cnn.py`.
+`--guard-model <llama-guard-3.gguf>` checks every chat and completion
+request with Llama Guard 3 before the chat model sees it; a flagged
+request gets a 400 (docs/CLIENTS.md), and `--guard-categories S1,S9`
+picks the categories that reject (default: all). The guard runs on the
+chat model's backend, between its steps.
 A converter whose input lies in a Hugging Face cache snapshot records
 the repository and commit (`general.source.url`,
 `general.source.revision`; `scripts/hf_source.py`, tested by

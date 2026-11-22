@@ -406,6 +406,22 @@ calling. Reliable agent use therefore needs a capable instruct model.
   PATH is unset), a name with a `/` is used as given, and either is
   started with `execv`, which runs no shell for a script without
   `#!`.
+- Guard model: with `--guard-model`, Llama Guard 3 judges the last
+  user turn of each `/v1/chat/completions`, `/v1/completions` (its
+  prompt as one user turn), `/v1/messages` and `/v1/responses`
+  request first, with the earlier user and assistant turns as
+  context; tool results count as user turns, system turns and images
+  are left out. A flagged request never reaches the chat model and
+  gets a 400; the OpenAI endpoints use Azure OpenAI's fields for a
+  filtered prompt, plus the categories:
+  `{"error": {"message": "the request was flagged by the guard model:
+  S1", "type": "invalid_request_error", "param": "prompt", "code":
+  "content_filter", "categories": ["S1"]}}`; `/v1/messages` gives
+  its `invalid_request_error`. A guard that fails (any reply but a
+  verdict, or a chat longer than its KV pool: `--ctx`, else 4096
+  positions) gives a 500, and the request is not run. Replies are not
+  checked, and the media endpoints (`/v1/images/*`, `/v1/videos`,
+  `/v1/audio/speech`) are not guarded.
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).

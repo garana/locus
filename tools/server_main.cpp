@@ -325,6 +325,8 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         opt.audio_decoder_path = args.audio_decoder;
         opt.embedding_model_path = args.embedding_model;
         opt.rerank_model_path = args.rerank_model;
+        opt.guard_model_path = args.guard_model;
+        opt.guard_categories = args.guard_categories;
         opt.image_classifier_path = args.image_classifier;
         opt.mmproj_path = args.mmproj;
         if (args.max_tokens > 0) {

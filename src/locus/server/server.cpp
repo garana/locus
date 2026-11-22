@@ -159,6 +159,44 @@ json make_error(const std::string& message,
     return json{{"error", {{"message", message}, {"type", type}}}};
 }
 
+/**
+ * Fills res for a request the guard model rejected (i#1106). Flagged:
+ * 400, and on the OpenAI endpoints Azure OpenAI's filtered-prompt
+ * fields (code "content_filter", param "prompt") plus the categories.
+ * A guard that failed: 500, since the request was not judged.
+ *
+ * @param anthropic Use the /v1/messages error shape.
+ */
+void set_guard_error(http::ServerResponse& res, const GuardVerdict& v,
+                     bool anthropic) {
+    const bool failed = v.kind == GuardVerdict::Kind::kMalformed;
+    std::string msg = "the guard model failed; the request was not run";
+    if (!failed) {
+        msg = "the request was flagged by the guard model:";
+        for (std::size_t i = 0; i < v.categories.size(); ++i) {
+            msg += (i == 0 ? " " : ", ") + v.categories[i];
+        }
+    }
+    res.status = failed ? 500 : 400;
+    json body;
+    if (anthropic) {
+        body = json{{"type", "error"},
+                    {"error",
+                     {{"type", failed ? "api_error" : "invalid_request_error"},
+                      {"message", msg}}}};
+    } else if (failed) {
+        body = make_error(msg, "server_error");
+    } else {
+        body = json{{"error",
+                     {{"message", msg},
+                      {"type", "invalid_request_error"},
+                      {"param", "prompt"},
+                      {"code", "content_filter"},
+                      {"categories", v.categories}}}};
+    }
+    res.set_content(body.dump(-1, ' ', false, kLossy), "application/json");
+}
+
 /** Fills res for an exception a handler caught: 400 with
  * invalid_request_error for a client error, else 500 with server_error
  * (see http_status_for). */
@@ -855,6 +893,17 @@ struct VisionChat {
 
 namespace {
 
+/** An image chat's text turns, for the guard model (the images are
+ *  not judged). */
+std::vector<chat::Message> vision_turns(const VisionChat& v) {
+    std::vector<chat::Message> out;
+    out.reserve(v.turns.size());
+    for (const image::ChatTurn& t : v.turns) {
+        out.push_back({t.role, t.text});
+    }
+    return out;
+}
+
 /** The bytes of an OpenAI image_url: a base64 data: URL only. */
 std::vector<std::byte> data_url_bytes(const json& image_url,
                                       std::size_t max_bytes) {
@@ -1188,6 +1237,17 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             throw gguf::Error("--embedding-model " + bert_->name() +
                               " is a reranker; pass it as --rerank-model");
         }
+    }
+    if (opt_.guard_classifier) {
+        guard_ = std::make_unique<Guard>(opt_.guard_classifier,
+                                         opt_.guard_categories);
+    } else if (!opt_.guard_model_path.empty()) {
+        // Its own KV pool, as large as the chat engine's (--ctx), else
+        // 4096 positions: a chat past it fails the check, closed.
+        const std::uint32_t blocks =
+            opt_.engine.n_blocks > 0 ? opt_.engine.n_blocks : 4096 / 16;
+        guard_ = Guard::load(opt_.guard_model_path, model_.active_backend(),
+                             blocks, opt_.guard_categories);
     }
     if (!opt_.rerank_model_path.empty()) {
         rerank_ = embed::EmbeddingModel::load(opt_.rerank_model_path);
@@ -1942,6 +2002,25 @@ std::unique_ptr<model::TokenConstraint> OpenAiServer::output_constraint(
 
 OpenAiServer::~OpenAiServer() { stop(); }
 
+std::optional<GuardVerdict> OpenAiServer::guard_flags(
+    std::span<const chat::Message> turns) {
+    if (!guard_) return std::nullopt;
+    guard_checks_total_.fetch_add(1, std::memory_order_relaxed);
+    const GuardVerdict v = guard_->check(
+        turns, [this](std::function<void()> f) {
+            loop_.run_on_worker(std::move(f));
+        });
+    if (!guard_->rejects(v)) return std::nullopt;
+    std::lock_guard<std::mutex> lk(guard_mu_);
+    if (v.kind == GuardVerdict::Kind::kMalformed) {
+        ++guard_flagged_["error"];
+    }
+    for (const std::string& c : v.categories) {
+        ++guard_flagged_[c];
+    }
+    return v;
+}
+
 void OpenAiServer::answer(std::uint64_t id, GenReply gr,
                           http::ServerResponse& res,
                           const http::RequestContext& ctx) {
@@ -2235,6 +2314,20 @@ void OpenAiServer::install_routes() {
             counter("locus_requests_total",
                     "Completion requests accepted.",
                     requests_total_.load());
+            if (guard_) {
+                counter("locus_guard_checks_total",
+                        "Requests the guard model judged.",
+                        guard_checks_total_.load());
+                mt.family("locus_guard_flagged_total",
+                          "Requests the guard model rejected, by category "
+                          "(\"error\": the guard failed).",
+                          "counter");
+                std::lock_guard<std::mutex> gk(guard_mu_);
+                for (const auto& [cat, n] : guard_flagged_) {
+                    mt.value("locus_guard_flagged_total",
+                             MetricsText::label("category", cat), n);
+                }
+            }
             counter("locus_prompt_tokens_total",
                     "Prompt tokens submitted.",
                     prompt_tokens_total_.load());
@@ -2433,6 +2526,7 @@ void OpenAiServer::install_routes() {
         std::optional<VisionChat> vision;  // a chat with images (i#241)
         OutputGrammar grammar;  // an output format
         engine::LogprobsOpt lp;
+        std::vector<chat::Message> guard_turns;  // what the guard judges
         try {
             body = http::parse_json(req.body);
             if (chat) {
@@ -2449,6 +2543,7 @@ void OpenAiServer::install_routes() {
             if (chat && !vision) {
                 bool tool_history = false;
                 auto msgs = parse_messages(body["messages"], &tool_history);
+                guard_turns = msgs;
                 tools = parse_tools(body, /*anthropic=*/false);
                 if (!tools.empty()) {
                     msgs.insert(msgs.begin(),
@@ -2464,6 +2559,7 @@ void OpenAiServer::install_routes() {
                         "prompt must be a string");
                 }
                 prompt.text = body["prompt"].get<std::string>();
+                guard_turns = {{"user", prompt.text}};
             }
             max_tokens =
                 read_max_tokens(body, opt_.max_tokens_cap, max_tokens);
@@ -2476,6 +2572,13 @@ void OpenAiServer::install_routes() {
             res.status = 400;
             res.set_content(make_error(e.what()).dump(-1, ' ', false, kLossy),
                             "application/json");
+            return;
+        }
+        if (vision) {
+            guard_turns = vision_turns(*vision);
+        }
+        if (const auto flagged = guard_flags(guard_turns)) {
+            set_guard_error(res, *flagged, false);
             return;
         }
         if (vision) {
@@ -2773,6 +2876,7 @@ void OpenAiServer::install_routes() {
         std::uint64_t seed = 0;
         std::unique_ptr<model::TokenConstraint> constraint;
         std::optional<VisionChat> vision;  // a chat with images (i#241)
+        std::vector<chat::Message> guard_turns;  // what the guard judges
         try {
             const json body = http::parse_json(req.body);
             if (!body.contains("messages") ||
@@ -2789,6 +2893,7 @@ void OpenAiServer::install_routes() {
                     output_constraint(output_grammar(body, req.body));
                 bool tool_history = false;
                 auto msgs = parse_anthropic_messages(body, &tool_history);
+                guard_turns = msgs;
                 tools = parse_tools(body, /*anthropic=*/true);
                 if (!tools.empty()) {
                     msgs.insert(msgs.begin(),
@@ -2813,6 +2918,13 @@ void OpenAiServer::install_routes() {
                        {"message", e.what()}}}}
                     .dump(-1, ' ', false, kLossy),
                 "application/json");
+            return;
+        }
+        if (vision) {
+            guard_turns = vision_turns(*vision);
+        }
+        if (const auto flagged = guard_flags(guard_turns)) {
+            set_guard_error(res, *flagged, true);
             return;
         }
         if (vision) {
@@ -4168,6 +4280,10 @@ void OpenAiServer::install_routes() {
             std::min<std::uint64_t>(
                 rq.max_output_tokens.value_or(opt_.max_tokens_cap),
                 opt_.max_tokens_cap));
+        if (const auto flagged = guard_flags(rq.messages)) {
+            set_guard_error(res, *flagged, false);
+            return;
+        }
         auto [sampling, seed] = parse_sampling(body);
         const auto prompt = opt_.chat_template.render(rq.messages);
         auto prompt_ids =

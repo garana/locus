@@ -99,6 +99,25 @@ TEST_CASE("the embedding-model flag takes the embedding GGUF path",
     REQUIRE(d.rerank_model == "r2.gguf");
 }
 
+TEST_CASE("the guard flags set the guard model and its categories",
+          "[cli]") {
+    std::array<const char*, 6> argv1 = {"prog", "--guard-model", "lg.gguf",
+                                        "--guard-categories", "S1,,S9",
+                                        "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()), const_cast<char**>(argv1.data()));
+    CHECK(a.guard_model == "lg.gguf");
+    CHECK(a.guard_categories == std::vector<std::string>{"S1", "S9"});
+    CHECK(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 4> argv2 = {"prog", "--guard-model=g.gguf",
+                                        "--guard-categories=S10", "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()), const_cast<char**>(argv2.data()));
+    CHECK(b.guard_model == "g.gguf");
+    CHECK(b.guard_categories == std::vector<std::string>{"S10"});
+}
+
 TEST_CASE("the audio-max-tokens flag sets the speech token cap", "[cli]") {
     std::array<const char*, 4> argv1 = {"prog", "--audio-max-tokens",
                                         "350", "m.gguf"};

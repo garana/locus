@@ -142,18 +142,42 @@ std::vector<GuardCategory> llama_guard3_1b_categories() {
     };
 }
 
+std::string guard_reply_text(std::span<const tok::TokenId> generated,
+                             tok::TokenId eos, tok::TokenId eot,
+                             const tok::Tokenizer& tok) {
+    const auto stop = std::find_if(
+        generated.begin(), generated.end(),
+        [&](tok::TokenId t) { return t == eos || t == eot; });
+    if (stop == generated.end()) {
+        throw std::runtime_error("guard: reply cut before its end");
+    }
+    return tok.decode(generated.first(
+        static_cast<std::size_t>(stop - generated.begin())));
+}
+
 struct Guard::Loaded {
     gguf::GgufFile file;
     model::TransformerModel model;
     std::unique_ptr<tok::Tokenizer> tok;
     engine::Engine engine;
 
+    /** <|eot_id|>'s id when the vocabulary has it as one token, else
+     *  EOS: Llama Guard 3 ends its verdict there, and a GGUF may name
+     *  <|end_of_text|> as EOS instead. */
+    tok::TokenId eot;
+
     Loaded(const std::string& path, const backend::Backend& backend,
            std::uint32_t n_blocks)
         : file(gguf::GgufFile::open(path)),
           model(model::TransformerModel::load(file)),
           tok(tok::tokenizer_from_gguf(file)),
-          engine(use(model, backend), tok->eos_id(), config(n_blocks)) {}
+          engine(use(model, backend), tok->eos_id(), config(n_blocks)),
+          eot(end_of_turn(*tok)) {}
+
+    static tok::TokenId end_of_turn(const tok::Tokenizer& t) {
+        const auto ids = t.encode("<|eot_id|>", false);
+        return ids.size() == 1 ? ids[0] : t.eos_id();
+    }
 
     static const model::TransformerModel& use(model::TransformerModel& m,
                                               const backend::Backend& b) {
@@ -164,13 +188,66 @@ struct Guard::Loaded {
     static engine::Engine::Config config(std::uint32_t n_blocks) {
         engine::Engine::Config c;
         c.n_blocks = n_blocks;
+        // Turn N's guard prompt starts with turn N-1's up to the end
+        // of its last turn, so a chat's later checks prefill only the
+        // new turn and the closing lines.
+        c.prefix_cache = true;
         return c;
     }
 
-    /** The guard's greedy reply: at most 16 tokens, ending at EOS. */
+    /** The last check's prompt tokens, and the positions it prefilled
+     *  (the rest came from the prefix cache). */
+    std::uint32_t last_prompt = 0;
+    std::uint32_t last_prefilled = 0;
+
+    /** The most tokens a verdict may take: "unsafe" and all 14 codes
+     *  fit well inside it. */
+    static constexpr std::uint32_t kMaxReply = 64;
+
+    /**
+     * The guard's greedy reply, up to its first EOS or <|eot_id|>. A
+     * reply with neither within kMaxReply tokens was cut, and a cut
+     * list of codes would parse as a shorter one, so it throws (and
+     * the check fails closed).
+     */
     std::string reply(const chat::ChatTemplate::Prompt& p) {
-        auto ids = tok->encode_literal(p.text, false, p.content);
-        const std::uint64_t id = engine.submit(std::move(ids), 16);
+        const auto ids = tok->encode_literal(p.text, false, p.content);
+        // The prefix cache adopts an entry only when the whole cached
+        // prompt starts the new one, and a guard prompt ends with the
+        // instruction after the conversation. So the conversation part
+        // (up to the end of the last turn) runs first as a request of
+        // its own: the full prompt then adopts it, and the next turn's
+        // conversation part adopts it too, prefilling only the new
+        // turn. Its tokens are cut where the two encodings agree.
+        std::uint32_t prefilled = 0;
+        if (!p.content.empty()) {
+            const std::size_t conv_end = p.content.back().end + 2;
+            const auto head_text = std::string_view(p.text).substr(
+                0, std::min(conv_end, p.text.size()));
+            const auto head =
+                tok->encode_literal(head_text, false, p.content);
+            std::size_t k = 0;
+            while (k < head.size() && k < ids.size() && head[k] == ids[k]) {
+                ++k;
+            }
+            if (k >= 2 && k < ids.size()) {
+                run(std::vector<tok::TokenId>(ids.begin(), ids.begin() + k),
+                    1, prefilled);
+            }
+        }
+        const auto gen = run(ids, kMaxReply, prefilled);
+        last_prompt = static_cast<std::uint32_t>(ids.size());
+        last_prefilled = prefilled;
+        return guard_reply_text(gen, tok->eos_id(), eot, *tok);
+    }
+
+    /** Runs one request to its end; adds its prefilled positions
+     *  (prompt minus what the prefix cache served) to `prefilled`. */
+    std::vector<tok::TokenId> run(std::vector<tok::TokenId> ids,
+                                  std::uint32_t max_new,
+                                  std::uint32_t& prefilled) {
+        const auto n = static_cast<std::uint32_t>(ids.size());
+        const std::uint64_t id = engine.submit(std::move(ids), max_new);
         engine.run_to_completion();
         const engine::Request* r = engine.get(id);
         if (r == nullptr || r->status != engine::Status::kDone) {
@@ -179,9 +256,10 @@ struct Guard::Loaded {
             engine.release(id);
             throw std::runtime_error("guard: " + why);
         }
-        std::string text = tok->decode(r->generated);
+        prefilled += n - std::min(n, r->reused_prefix_tokens);
+        std::vector<tok::TokenId> gen = r->generated;
         engine.release(id);
-        return text;
+        return gen;
     }
 };
 
@@ -205,12 +283,33 @@ std::unique_ptr<Guard> Guard::load(const std::string& path,
     return g;
 }
 
-GuardVerdict Guard::check(std::span<const chat::Message> turns) {
+std::string Guard::last_error() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return last_error_;
+}
+
+std::pair<std::uint32_t, std::uint32_t> Guard::last_prefill() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!loaded_) return {0, 0};
+    return {loaded_->last_prompt, loaded_->last_prefilled};
+}
+
+GuardVerdict Guard::check(std::span<const chat::Message> turns,
+                          const Runner& run) {
     const auto prompt = llama_guard3_prompt(turns, categories_);
     std::lock_guard<std::mutex> lock(mu_);
     try {
-        return parse_guard_verdict(classify_(prompt));
-    } catch (const std::exception&) {
+        std::string reply;
+        const auto work = [&] { reply = classify_(prompt); };
+        if (run) {
+            run(work);
+        } else {
+            work();
+        }
+        last_error_.clear();
+        return parse_guard_verdict(reply);
+    } catch (const std::exception& e) {
+        last_error_ = e.what();
         return {};  // kMalformed: fails closed
     }
 }

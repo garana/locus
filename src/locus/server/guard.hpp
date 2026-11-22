@@ -7,9 +7,11 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "locus/chat/template.hpp"
+#include "locus/tok/tokenizer.hpp"
 
 namespace locus::backend {
 struct Backend;
@@ -85,6 +87,22 @@ chat::ChatTemplate::Prompt llama_guard3_prompt(
 std::vector<GuardCategory> llama_guard3_1b_categories();
 
 /**
+ * The text of a guard's reply up to its first `eos` or `eot` token.
+ *
+ * @param generated The tokens the guard generated.
+ * @param eos The model's EOS id.
+ * @param eot Its end-of-turn id (<|eot_id|>), which may differ.
+ * @param tok The guard's tokenizer.
+ * @returns The decoded text before the stop token.
+ * @throws std::runtime_error when neither token is there: the reply
+ *     reached the token cap, and a cut list of codes would read as a
+ *     shorter one.
+ */
+std::string guard_reply_text(std::span<const tok::TokenId> generated,
+                             tok::TokenId eos, tok::TokenId eot,
+                             const tok::Tokenizer& tok);
+
+/**
  * A guard model that judges chat requests (i#1106): it builds the
  * guard's prompt from a request's turns, runs the guard greedily for
  * a few tokens and parses its verdict. One check runs at a time.
@@ -119,14 +137,33 @@ class Guard {
 
     ~Guard();
 
+    /** Runs a piece of work and returns when it is done (for example
+     *  EngineLoop::run_on_worker); its exception is rethrown. */
+    using Runner = std::function<void(std::function<void()>)>;
+
     /**
      * Judges the last user turn of `turns`. A guard that throws or
      * replies with anything but a verdict gives kMalformed.
      *
      * @param turns The request's messages.
+     * @param run Where the guard model runs: the chat engine's worker
+     *     thread in the server, so no backend runs on two threads at
+     *     once; empty runs it on the calling thread.
      * @returns The verdict.
      */
-    GuardVerdict check(std::span<const chat::Message> turns);
+    GuardVerdict check(std::span<const chat::Message> turns,
+                       const Runner& run = {});
+
+    /**
+     * @returns The last check's prompt tokens and the positions it
+     *     prefilled (the guard's prefix cache served the rest); {0, 0}
+     *     for a stand-in guard.
+     */
+    std::pair<std::uint32_t, std::uint32_t> last_prefill();
+
+    /** @returns Why the last check failed (it threw), or "" when it
+     *  gave a reply. */
+    std::string last_error();
 
     /** @returns Whether `v` rejects under this guard's categories. */
     bool rejects(const GuardVerdict& v) const {
@@ -139,6 +176,7 @@ class Guard {
     Classifier classify_;
     std::vector<std::string> enabled_;
     std::vector<GuardCategory> categories_;
+    std::string last_error_;
     std::mutex mu_;
 };
 

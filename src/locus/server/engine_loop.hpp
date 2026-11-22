@@ -5,7 +5,9 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -169,6 +171,19 @@ class EngineLoop {
      *     false when it was still running and was kept. */
     bool release(std::uint64_t id);
 
+    /**
+     * Runs `fn` on the worker thread between two steps and waits for
+     * it, so work on this engine's backend (the guard model, i#1106)
+     * never runs beside a step from another thread. It sees the
+     * worker's device binding and thread pool. An exception from `fn`
+     * is rethrown here.
+     *
+     * @param fn The work. mu_ is free while it runs, so it may read
+     *     the loop (view); calling run_on_worker or wait_* from it
+     *     deadlocks.
+     */
+    void run_on_worker(std::function<void()> fn);
+
     /** Engine gauges for /metrics (snapshotted under the mutex). */
     struct Stats {
         std::uint32_t free_blocks = 0;
@@ -232,6 +247,8 @@ class EngineLoop {
 
     std::mutex mu_;
     std::condition_variable work_cv_;
+    /** run_on_worker's queue, under mu_. */
+    std::deque<std::packaged_task<void()>> tasks_;
     /**
      * Progress publication, apart from mu_ so a waiter never sleeps on
      * the engine mutex (whose relock races the worker's). Lock order:
