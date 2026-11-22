@@ -113,6 +113,37 @@ TEST_CASE("a guard batches the checks that wait behind a running one",
     CHECK(b.batches() == 2);
 }
 
+namespace {
+
+/** Throws something that is not a std::exception on its first batch. */
+class OddGuard final : public Guard {
+  public:
+    OddGuard() : Guard("odd", {}) {}
+    std::string_view kind() const override { return "odd"; }
+    std::vector<GuardVerdict> check_batch(std::span<const Turns> requests,
+                                          const Runner&) override {
+        if (calls++ == 0) throw 42;
+        std::vector<GuardVerdict> out(requests.size());
+        for (auto& v : out) v.kind = GuardVerdict::Kind::kSafe;
+        return out;
+    }
+    int calls = 0;
+};
+
+}  // namespace
+
+TEST_CASE("a guard that throws anything fails closed and does not hang",
+          "[guard]") {
+    OddGuard g;
+    locus::server::GuardBatcher b(g);
+    const std::vector<Message> m{{"user", "x"}};
+    const auto first = b.check(m, {});
+    CHECK(first.kind == Kind::kMalformed);
+    CHECK_FALSE(first.error.empty());
+    // The batcher is free again: the next check runs.
+    CHECK(b.check(m, {}).kind == Kind::kSafe);
+}
+
 TEST_CASE("a --guard value parses into a guard spec", "[guard]") {
     const GuardSpec a =
         parse_guard_spec("kind=llama-guard,model=/m/lg-1b.gguf,labels=S1:S9");
@@ -216,6 +247,7 @@ TEST_CASE("a guard checks the prompt it builds and fails closed",
     reply = "throw";
     const auto down = g.check(turns);
     CHECK(down.kind == Kind::kMalformed);
+    CHECK(down.error == "guard down");  // the reason travels with it
     CHECK(g.rejects(down));
 
     // A runner: the model runs inside it, and its failure fails closed.

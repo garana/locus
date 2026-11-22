@@ -450,14 +450,19 @@ std::vector<GuardVerdict> LlamaGuard::check_batch(
         }
     } catch (const std::exception& e) {
         last_error_ = e.what();
+        for (GuardVerdict& v : out) v.error = last_error_;
         return out;  // the whole batch fails closed
     }
     last_error_.clear();
     for (std::size_t i = 0; i < got.size(); ++i) {
         if (got[i].error.empty()) {
             out[i] = parse_guard_verdict(got[i].text);
+            if (out[i].kind == GuardVerdict::Kind::kMalformed) {
+                out[i].error = "no verdict in the guard's reply";
+            }
         } else {
             last_error_ = got[i].error;
+            out[i].error = got[i].error;
         }
     }
     return out;
@@ -484,14 +489,21 @@ GuardVerdict GuardBatcher::check(Guard::Turns turns,
         std::vector<GuardVerdict> verdicts;
         try {
             verdicts = guard_.check_batch(requests, run);
-        } catch (const std::exception&) {
-            verdicts.clear();  // every check fails closed
+        } catch (...) {
+            // Anything thrown fails every check closed; busy_ must be
+            // cleared below, or later checks of this guard would wait
+            // for ever.
+            verdicts.clear();
         }
         batches_.fetch_add(1, std::memory_order_relaxed);
         lk.lock();
         for (std::size_t i = 0; i < batch.size(); ++i) {
-            batch[i]->verdict =
-                i < verdicts.size() ? verdicts[i] : GuardVerdict{};
+            if (i < verdicts.size()) {
+                batch[i]->verdict = verdicts[i];
+            } else {
+                batch[i]->verdict = GuardVerdict{};
+                batch[i]->verdict.error = "the guard gave no verdict";
+            }
             batch[i]->done = true;
         }
         busy_ = false;

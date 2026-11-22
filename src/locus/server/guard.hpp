@@ -40,6 +40,9 @@ struct GuardVerdict {
     Kind kind = Kind::kMalformed;
     /** The violated category codes ("S1", "S10"), for kUnsafe. */
     std::vector<std::string> categories;
+    /** Why the guard failed on this request, for kMalformed (logs);
+     *  may be empty. */
+    std::string error;
 };
 
 /**

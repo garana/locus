@@ -1256,6 +1256,9 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             GuardSpec legacy = parse_guard_spec(
                 "kind=llama-guard,model=" + opt_.guard_model_path);
             legacy.labels = opt_.guard_categories;
+            // As before --guard: its 400s and metric label say
+            // "llama-guard", whatever the file is called.
+            legacy.name = "llama-guard";
             all.push_back(make_guard(legacy, model_.active_backend(), blocks));
         }
         for (const GuardSpec& s : opt_.guards) {
@@ -2047,10 +2050,10 @@ OpenAiServer::guard_flags(std::span<const chat::Message> turns) {
         if (!g.rejects(v)) continue;
         if (v.kind == GuardVerdict::Kind::kMalformed) {
             slot->failures.fetch_add(1, std::memory_order_relaxed);
-            const std::string why = g.last_error();
+            // This request's own reason (another batch may have run).
             std::fprintf(stderr, "locus-server: guard %s failed%s%s\n",
-                         g.name().c_str(), why.empty() ? "" : ": ",
-                         why.c_str());
+                         g.name().c_str(), v.error.empty() ? "" : ": ",
+                         v.error.c_str());
         } else {
             std::lock_guard<std::mutex> lk(slot->mu);
             for (const std::string& c : v.categories) ++slot->flagged[c];
@@ -2371,7 +2374,8 @@ void OpenAiServer::install_routes() {
                           "Checks that failed (the request is rejected).",
                           [](GuardSlot& s) { return s.failures.load(); });
                 per_guard("locus_guard_check_seconds_total",
-                          "Time spent in a guard's checks.",
+                          "Time a guard's checks took, per request, "
+                          "including the wait for a batch.",
                           [](GuardSlot& s) {
                               return static_cast<double>(s.check_ns.load()) *
                                      1e-9;
