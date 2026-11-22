@@ -497,42 +497,98 @@ TEST_CASE("vulkan decode attention merges its partials in rounds",
     model.use_backend(*locus::backend::find_backend("vulkan"));
     const std::uint32_t V = model.hparams().n_vocab;
     constexpr std::uint32_t n_pos = 100;
-    // The logits at every position, with the partials cap at `cap`
-    // blocks a round (0: the default, one round here).
-    auto run = [&](std::uint32_t cap) {
-        locus::backend::vulkan_set_attn_part_blocks(cap);
+    const auto token = [&](std::uint32_t p) {
+        return static_cast<locus::tok::TokenId>(1 + (p * 37) % (V - 1));
+    };
+    // The merged logits o match w: the same argmax, and within 1e-5 of
+    // the norm. On F16 KV a check may instead be within 1e-4 when its
+    // own row rounded to the other half (see below); `over` counts
+    // those.
+    std::uint32_t over = 0;
+    const auto check = [&](std::span<const float> w,
+                           std::span<const float> o) {
+        double err = 0.0, norm = 0.0;
+        for (std::uint32_t v = 0; v < V; ++v) {
+            const double d = double{o[v]} - w[v];
+            err += d * d;
+            norm += double{w[v]} * w[v];
+        }
+        const double rel = std::sqrt(err) / std::sqrt(norm);
+        CHECK(std::max_element(o.begin(), o.end()) - o.begin() ==
+              std::max_element(w.begin(), w.end()) - w.begin());
+        if (kv == KvType::kF16 && rel > 1e-5) {
+            WARN("F16 own-row rounding: relative error " << rel);
+            ++over;
+            CHECK(rel <= 1e-4);
+        } else {
+            CHECK(rel <= 1e-5);
+        }
+    };
+    if (kv == KvType::kF32) {
+        // End to end: each cap fills its own cache, as decode does.
+        // The logits at every position, with the partials cap at `cap`
+        // blocks a round (0: the default, one round here).
+        auto run = [&](std::uint32_t cap) {
+            locus::backend::vulkan_set_attn_part_blocks(cap);
+            PagedKvCache c = model.make_cache(0, kv);
+            PagedKvCache::Seq s;
+            std::vector<float> all(std::size_t{n_pos} * V);
+            for (std::uint32_t p = 0; p < n_pos; ++p) {
+                REQUIRE(c.ensure_capacity(s, 1));
+                REQUIRE(locus::backend::vulkan_forward(
+                    model, token(p), c, s,
+                    std::span(all).subspan(std::size_t{p} * V, V)));
+            }
+            c.release(s);
+            locus::backend::vulkan_set_attn_part_blocks(0);
+            return all;
+        };
+        const auto want = run(0);
+        for (const std::uint32_t cap : {1u, 2u}) {
+            CAPTURE(cap);
+            const auto got = run(cap);
+            for (std::uint32_t p = 0; p < n_pos; ++p) {
+                CAPTURE(p);
+                check(std::span(want).subspan(std::size_t{p} * V, V),
+                      std::span(got).subspan(std::size_t{p} * V, V));
+            }
+        }
+    } else {
+        // F16 KV rounds each stored element to a half, so two caches
+        // filled under different caps drift apart: the merge order's
+        // rounding (about 1e-7) now and then rounds a stored K/V element
+        // the other way, and later layers attend to it (i#1123). So
+        // every cap here reads one cache: each position runs with caps
+        // 1 and 2, then with cap 0, which writes the reference and
+        // leaves row p as cap 0 made it for the positions after it.
+        // Position p's own row is still written under each cap, so it
+        // can round the other way: on a GTX 750 Ti that moved 1 of the
+        // 200 checks to 7.7e-5. At most 1 may, under 1e-4. The merge
+        // alone, on one fixed pool, is held to 1e-5 in "vulkan decode
+        // attention rounds merge on one pool" (test_vulkan_attn.cpp).
         PagedKvCache c = model.make_cache(0, kv);
         PagedKvCache::Seq s;
-        std::vector<float> all(std::size_t{n_pos} * V);
-        for (std::uint32_t p = 0; p < n_pos; ++p) {
+        std::vector<float> want(V), got1(V), got2(V);
+        const auto at = [&](std::uint32_t cap, std::uint32_t p,
+                            std::vector<float>& out) {
+            locus::backend::vulkan_set_attn_part_blocks(cap);
+            s.n_tokens = p;  // rerun position p over the same rows
             REQUIRE(c.ensure_capacity(s, 1));
-            const auto t =
-                static_cast<locus::tok::TokenId>(1 + (p * 37) % (V - 1));
-            REQUIRE(locus::backend::vulkan_forward(
-                model, t, c, s,
-                std::span(all).subspan(std::size_t{p} * V, V)));
+            REQUIRE(locus::backend::vulkan_forward(model, token(p), c, s,
+                                                   out));
+        };
+        for (std::uint32_t p = 0; p < n_pos; ++p) {
+            CAPTURE(p);
+            at(1, p, got1);
+            at(2, p, got2);
+            at(0, p, want);
+            for (const std::uint32_t cap : {1u, 2u}) {
+                CAPTURE(cap);
+                check(want, cap == 1 ? got1 : got2);
+            }
         }
         c.release(s);
         locus::backend::vulkan_set_attn_part_blocks(0);
-        return all;
-    };
-    const auto want = run(0);
-    for (const std::uint32_t cap : {1u, 2u}) {
-        CAPTURE(cap);
-        const auto got = run(cap);
-        for (std::uint32_t p = 0; p < n_pos; ++p) {
-            CAPTURE(p);
-            const auto w = std::span(want).subspan(std::size_t{p} * V, V);
-            const auto o = std::span(got).subspan(std::size_t{p} * V, V);
-            double err = 0.0, norm = 0.0;
-            for (std::uint32_t v = 0; v < V; ++v) {
-                const double d = double{o[v]} - w[v];
-                err += d * d;
-                norm += double{w[v]} * w[v];
-            }
-            CHECK(std::sqrt(err) <= 1e-5 * std::sqrt(norm));
-            CHECK(std::max_element(o.begin(), o.end()) - o.begin() ==
-                  std::max_element(w.begin(), w.end()) - w.begin());
-        }
+        CHECK(over <= 1u);
     }
 }
