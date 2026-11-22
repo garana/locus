@@ -101,7 +101,7 @@ class ClassifierGuard : public Guard {
      *  engine (the guard runs on its worker). 64 windows hold about 29k
      *  tokens and take about 15 s of a DeBERTa v3 base on an M4 Max's
      *  CPU (0.24 s a window). */
-    static constexpr std::size_t kMaxWindows = 64;
+    static constexpr std::size_t kMaxWindows = kGuardMaxWindows;
     /** Tokens two neighbouring windows share. */
     static constexpr std::uint32_t kOverlap = 64;
     /** Windows per classify() call. */

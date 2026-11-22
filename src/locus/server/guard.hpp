@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -275,6 +276,10 @@ class GuardBatcher {
     std::atomic<std::uint64_t> batches_{0};
 };
 
+/** A classifier guard's default window cap per request (GuardSpec::
+ *  max_windows, ClassifierGuard::kMaxWindows). */
+inline constexpr std::size_t kGuardMaxWindows = 64;
+
 /** One --guard flag: which guard to load and how it rejects. */
 struct GuardSpec {
     std::string kind;   ///< "llama-guard" or "prompt-guard"
@@ -293,7 +298,7 @@ struct GuardSpec {
     /** max_windows= (classifier kinds): the most encoder windows one
      *  request may take; past it the check fails closed (the guard
      *  runs on the chat engine's worker, so this bounds its stall). */
-    std::size_t max_windows = 64;
+    std::size_t max_windows = kGuardMaxWindows;
 };
 
 /**

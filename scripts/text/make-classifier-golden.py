@@ -15,8 +15,13 @@ sha256 2c272885...4f6ad09; multi_label_classification):
 """
 import argparse
 import json
+import pathlib
+import sys
 
 import torch
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
 
 LONG = (
     "The committee met on Tuesday to review the quarterly budget, the "
@@ -83,8 +88,11 @@ def main():
             items.append({"text": t, "ids": ids, "windows": ws,
                           "logits": logits, "scores": scores, "top": top})
             print(len(ids), len(ws), [round(x, 4) for x in top], t[:40])
+    # "<repo>@<commit>" from the snapshot path, not the local path
+    # (which names the host's cache), so a rerun keeps the field.
+    snap = hf_source.snapshot_of(a.hf)
     data = {
-        "model": cfg.name_or_path,
+        "model": f"{snap[0]}@{snap[1]}" if snap else cfg.name_or_path,
         "problem_type": pt,
         "labels": [cfg.id2label[i] for i in range(cfg.num_labels)],
         "window_body_tokens": WIDTH,
