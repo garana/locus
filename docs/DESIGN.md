@@ -833,6 +833,25 @@ guarding the default path.
   kind, `rerank`. ggml-org has no GGUF of the model, so
   `scripts/text/convert-xlmr-reranker.py` makes one from BAAI's safetensors,
   with the vocab of bge-m3's GGUF (the same SentencePiece model).
+- DeBERTa classifier: `embed::DebertaEncoder` runs a DeBERTa v3
+  sequence classifier, GGUF arch `deberta-v2`, which
+  `scripts/text/convert-deberta.py` makes from transformers'
+  safetensors (llama.cpp has no such arch); the tokenizer is its
+  SentencePiece unigram model, written as the `t5` (UGM) keys. It is
+  BERT's post-norm encoder without absolute positions: each head adds
+  to $q_i \cdot k_j$ the content-to-position and position-to-content
+  terms $q_i \cdot pk_c$ and $k_j \cdot pq_c$, where $pk$ and $pq$ are
+  the layer's own k and q projections of the normalized relative
+  embeddings and $c$ the log bucket of $i - j$, all over
+  $\sqrt{3 d}$. Only the relative rows the longest input reaches are
+  projected, so a short input does not pay for all 512. Inputs run as
+  one batch (attention within each), and longer than the trained 512
+  tokens, as transformers allows; the head is the pooler (the CLS
+  state through `cls` and GELU) then `cls.output`. On
+  protectai/deberta-v3-base-prompt-injection-v2 the logits match
+  float64 arithmetic on the same Q8_0 weights to 1.1e-5 and, from the
+  F32 GGUF, the f32 original to 2.1e-5; Q8_0 itself moves them up to
+  0.05. It is not served yet (Prompt Guard, i#1159).
 - Guard: with `--guard-model`, a Llama Guard 3 GGUF (llama arch)
   loads on the chat model's backend with its own engine and KV pool
   (`--ctx`, else 4096 positions). Each chat request's turns become

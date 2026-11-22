@@ -164,6 +164,7 @@ add_library(locus
     src/locus/tok/unicode_flags.cpp
     src/locus/tok/wpm_tokenizer.cpp
     src/locus/embed/bert.cpp
+    src/locus/embed/deberta.cpp
     src/locus/embed/embedding_model.cpp
     third_party/llama/unicode-data.cpp
 )
