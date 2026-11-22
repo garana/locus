@@ -841,8 +841,12 @@ guarding the default path.
   guard's turn and write its verdict. The guard decodes greedily up to
   its EOS or `<|eot_id|>` (at most 64 tokens) on the chat engine's
   worker thread, between steps (`EngineLoop::run_on_worker`), so no
-  backend runs on two threads; the cost is one guard prefill per
-  request, during which the chat engine waits. Only "safe", or
+  backend runs on two threads; the chat engine waits while it runs.
+  Its prefix cache keeps a chat's earlier turns: the conversation part
+  of the prompt runs first as its own request, so a later turn
+  prefills only the new turn and the closing instruction (on a
+  2100-token chat, a Llama 3.2 1B stand-in: 121 s cold and 9.6 s for
+  the next turn on an SSE4 CPU, 36 s and 3.4 s on CUDA). Only "safe", or
   "unsafe" and a line of codes, is a verdict; anything else, a reply
   cut at the cap, or a failed run rejects (fail closed).
   `locus_guard_checks_total` and `locus_guard_flagged_total{category}`

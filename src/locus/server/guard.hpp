@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "locus/chat/template.hpp"
@@ -153,6 +154,17 @@ class Guard {
     GuardVerdict check(std::span<const chat::Message> turns,
                        const Runner& run = {});
 
+    /**
+     * @returns The last check's prompt tokens and the positions it
+     *     prefilled (the guard's prefix cache served the rest); {0, 0}
+     *     for a stand-in guard.
+     */
+    std::pair<std::uint32_t, std::uint32_t> last_prefill();
+
+    /** @returns Why the last check failed (it threw), or "" when it
+     *  gave a reply. */
+    std::string last_error();
+
     /** @returns Whether `v` rejects under this guard's categories. */
     bool rejects(const GuardVerdict& v) const {
         return guard_rejects(v, enabled_);
@@ -164,6 +176,7 @@ class Guard {
     Classifier classify_;
     std::vector<std::string> enabled_;
     std::vector<GuardCategory> categories_;
+    std::string last_error_;
     std::mutex mu_;
 };
 
