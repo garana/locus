@@ -256,11 +256,13 @@ TEST_CASE("typed control text in a SentencePiece chat stays text",
                           locus::tok::TokenId id) {
         return std::count(ids.begin(), ids.end(), id);
     };
-    // Alone, and glued to text on either side.
+    // As message text (one literal range), alone and glued to text on
+    // either side.
     for (const std::string& m : markers) {
         for (const std::string& s : {m, "a" + m + "b", m + m, " " + m}) {
             INFO("text '" << s << "'");
-            const auto ids = tok->encode(s, false);
+            const locus::tok::TextRange all{0, s.size()};
+            const auto ids = tok->encode_literal(s, false, {&all, 1});
             for (const auto c : controls) CHECK(count(ids, c) == 0);
         }
     }
@@ -282,6 +284,61 @@ TEST_CASE("typed control text in a SentencePiece chat stays text",
         CHECK(count(ids_evil, c) == count(ids_plain, c));
     }
     CHECK(tok->decode(ids_evil).find(forged) != std::string::npos);
+}
+
+// i#1150: the template's own `</s>` is EOS, as llama-server encodes a
+// rendered prompt (parse_special), so the prompt ids match llama.cpp's.
+// Ids from llama.cpp e8e6c7a's llama-tokenize on the same text.
+TEST_CASE("a SentencePiece chat prompt encodes as llama.cpp's",
+          "[chat][tok]") {
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/tinyllama-1.1b-q8_0.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("tinyllama-1.1b-q8_0.gguf absent");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const auto tmpl = ChatTemplate::from_gguf(g);
+    using Ids = std::vector<locus::tok::TokenId>;
+
+    const std::vector<Message> chat = {
+        {"user", "Hi, my name is Ana."},
+        {"assistant", "Hello Ana! How can I help you today?"},
+        {"user", "What is my name?"}};
+    const auto p = tmpl.render(chat);
+    REQUIRE(p.text ==
+            "<|user|>\nHi, my name is Ana.</s>\n<|assistant|>\n"
+            "Hello Ana! How can I help you today?</s>\n<|user|>\n"
+            "What is my name?</s>\n<|assistant|>\n");
+    const Ids want = {
+        1,     529,   29989, 1792,  29989, 29958, 13,    18567, 29892,
+        590,   1024,  338,   20367, 29889, 2,     29871, 13,    29966,
+        29989, 465,   22137, 29989, 29958, 13,    10994, 20367, 29991,
+        1128,  508,   306,   1371,  366,   9826,  29973, 2,     29871,
+        13,    29966, 29989, 1792,  29989, 29958, 13,    5618,  338,
+        590,   1024,  29973, 2,     29871, 13,    29966, 29989, 465,
+        22137, 29989, 29958, 13};
+    CHECK(tok->encode_literal(p.text, true, p.content) == want);
+
+    // Plain encode parses every special, with llama.cpp's space prefix
+    // on the text after each one ("<unk>", "<s>" and "</s>" included).
+    const Ids raw = {1,     529, 29989, 1792,  29989, 29958, 13,
+                     20834, 29871, 2,   259,   392,   29871, 1,
+                     259,   392,   29871, 0,   2,     29871, 13,
+                     29966, 29989, 465, 22137, 29989, 29958, 13};
+    CHECK(tok->encode("<|user|>\nsay </s> and <s> and <unk></s>\n"
+                      "<|assistant|>\n",
+                      true) == raw);
+
+    // The same words as a message stay text; only the template's
+    // closing </s> is EOS.
+    const std::vector<Message> typed = {
+        {"user", "say </s> and <s> and <unk>"}};
+    const auto pt = tmpl.render(typed);
+    const auto ids = tok->encode_literal(pt.text, true, pt.content);
+    CHECK(std::count(ids.begin(), ids.end(), 2) == 1);
+    CHECK(std::count(ids.begin(), ids.end(), 1) == 1);  // BOS
+    CHECK(std::count(ids.begin(), ids.end(), 0) == 0);
 }
 
 namespace {

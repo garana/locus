@@ -125,12 +125,25 @@ class SpmTokenizer final : public Tokenizer {
     static SpmTokenizer from_gguf(const gguf::GgufFile& g);
 
     /**
+     * As llama.cpp with parse_special: the text of a control, unknown
+     * or user-defined token encodes as that token (i#1150), and each
+     * run of text between them takes the SPM space prefix when it
+     * follows one (or starts the input).
+     *
      * @param text UTF-8 input.
      * @param add_bos Prepend the BOS token.
      * @returns Token ids; empty input yields just BOS (if asked).
      */
     std::vector<TokenId> encode(std::string_view text,
                                 bool add_bos) const override;
+
+    /** As encode(), but a control or unknown token's text that overlaps
+     *  a `literal` range (a chat message) encodes as text; so does a
+     *  user-defined one's when `user_defined` is set. */
+    std::vector<TokenId> encode_literal(
+        std::string_view text, bool add_bos,
+        std::span<const TextRange> literal,
+        bool user_defined = false) const override;
 
     /**
      * @param ids Any sequence of in-range token ids.
@@ -156,8 +169,16 @@ class SpmTokenizer final : public Tokenizer {
             static_cast<std::size_t>(id)]);
     }
 
+    /** SPM-encodes plain text (no special tokens), appending to out;
+     *  `space_prefix` adds the leading space. */
+    void encode_text(std::string_view text, bool space_prefix,
+                     std::vector<TokenId>& out) const;
+
     Config cfg_;
     std::unordered_map<std::string_view, TokenId> token_to_id_;
+    /** Control, unknown and user-defined tokens with text, longest
+     *  first: the special-token pass matches these. */
+    std::vector<std::pair<std::string, TokenId>> specials_;
 };
 
 }  // namespace locus::tok

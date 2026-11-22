@@ -90,7 +90,19 @@ SpmTokenizer::SpmTokenizer(Config config) : cfg_(std::move(config)) {
     for (std::size_t i = 0; i < n; ++i) {
         token_to_id_.emplace(cfg_.tokens[i],
                              static_cast<TokenId>(i));
+        const auto t = static_cast<TokenType>(cfg_.types[i]);
+        // As llama.cpp's special-token cache. An empty piece would
+        // match everywhere without advancing, so it is left out.
+        if ((t == TokenType::kControl || t == TokenType::kUnknown ||
+             t == TokenType::kUserDefined) &&
+            !cfg_.tokens[i].empty()) {
+            specials_.emplace_back(cfg_.tokens[i], static_cast<TokenId>(i));
+        }
     }
+    std::stable_sort(specials_.begin(), specials_.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.first.size() > b.first.size();
+                     });
 }
 
 SpmTokenizer SpmTokenizer::from_gguf(const gguf::GgufFile& g) {
@@ -136,13 +148,69 @@ SpmTokenizer SpmTokenizer::from_gguf(const gguf::GgufFile& g) {
 
 std::vector<TokenId> SpmTokenizer::encode(std::string_view text,
                                           bool add_bos) const {
+    return encode_literal(text, add_bos, {});
+}
+
+std::vector<TokenId> SpmTokenizer::encode_literal(
+    std::string_view text, bool add_bos,
+    std::span<const TextRange> literal, bool user_defined) const {
     std::vector<TokenId> out;
     if (add_bos) {
         out.push_back(cfg_.bos);
     }
-    const std::string norm = normalize(text, cfg_.add_space_prefix);
+    const auto in_literal = [&](std::size_t b, std::size_t e) {
+        for (const TextRange& r : literal) {
+            if (b < r.end && r.begin < e) return true;
+        }
+        return false;
+    };
+    // Split on special tokens (longest first, earliest match), SPM in
+    // between, as llama.cpp's tokenizer_st_partition and its SPM loop:
+    // a run of text that starts the input or follows a special token
+    // takes the space prefix.
+    bool after_special = true;
+    std::size_t at = 0;
+    while (at < text.size()) {
+        std::size_t sp_pos = std::string_view::npos;
+        std::size_t sp_idx = 0;
+        for (std::size_t k = 0; k < specials_.size(); ++k) {
+            const std::string_view sp = specials_[k].first;
+            const TokenType t = type_of(specials_[k].second);
+            const bool skip = t == TokenType::kControl ||
+                              t == TokenType::kUnknown ||
+                              (user_defined && t == TokenType::kUserDefined);
+            std::size_t p = text.find(sp, at);
+            while (skip && p != std::string_view::npos &&
+                   in_literal(p, p + sp.size())) {
+                p = text.find(sp, p + 1);
+            }
+            if (p < sp_pos) {
+                sp_pos = p;
+                sp_idx = k;
+            }
+        }
+        const std::size_t seg_end =
+            sp_pos == std::string_view::npos ? text.size() : sp_pos;
+        if (seg_end > at) {
+            encode_text(text.substr(at, seg_end - at),
+                        cfg_.add_space_prefix && after_special, out);
+            after_special = false;
+        }
+        if (sp_pos == std::string_view::npos) {
+            break;
+        }
+        out.push_back(specials_[sp_idx].second);
+        after_special = true;
+        at = sp_pos + specials_[sp_idx].first.size();
+    }
+    return out;
+}
+
+void SpmTokenizer::encode_text(std::string_view text, bool space_prefix,
+                               std::vector<TokenId>& out) const {
+    const std::string norm = normalize(text, space_prefix);
     if (norm.empty()) {
-        return out;
+        return;
     }
 
     // Split into UTF-8 codepoint symbols (offset, length pairs), linked
@@ -252,7 +320,6 @@ std::vector<TokenId> SpmTokenizer::encode(std::string_view text,
                                                    : it->second);
         }
     }
-    return out;
 }
 
 std::string SpmTokenizer::decode(std::span<const TokenId> ids) const {
