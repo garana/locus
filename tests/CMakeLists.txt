@@ -98,6 +98,7 @@ add_executable(locus_tests
     test_vulkan_reset.cpp
     test_tokenizer.cpp
     test_tokenizer_merge.cpp
+    test_special_split.cpp
     test_t5_tokenizer.cpp
     test_wpm_tokenizer.cpp
     test_bert.cpp
