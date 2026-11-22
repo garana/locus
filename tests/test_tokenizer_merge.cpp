@@ -193,6 +193,23 @@ TEST_CASE("BPE heap merge picks the rescan's merges, ties included",
     }
 }
 
+TEST_CASE("SPM text never merges into a control or the unknown token",
+          "[tok]") {
+    // i#1129: "</" + "s>" joins to "</s>", the EOS control, whose score
+    // (0) beats every piece's; same for "<unk>" from "<un" + "k>".
+    SpmTokenizer::Config cfg;
+    cfg.tokens = {"<unk>", "<s>", "</s>", "<", "/", "s", ">", "</",
+                  "s>",    "u",   "n",    "k", "un", "<un", "k>"};
+    cfg.scores = {0, 0, 0, -9, -9, -9, -9, -1, -1, -9, -9, -9, -2, -1, -1};
+    cfg.types = {2, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    cfg.add_space_prefix = false;
+    const SpmTokenizer tok(cfg);
+    CHECK(tok.encode("</s>", false) == std::vector<TokenId>{7, 8});
+    CHECK(tok.encode("<unk>", false) == std::vector<TokenId>{13, 14});
+    CHECK(tok.encode("</s></s>", false) ==
+          std::vector<TokenId>{7, 8, 7, 8});
+}
+
 TEST_CASE("a 200 KB word tokenizes in well under a second", "[tok]") {
     // The rescan was O(n^2) on one word: the review measured 9.9 s for
     // 80 KB on stories260K. The heap is O(n log n). Timed on this

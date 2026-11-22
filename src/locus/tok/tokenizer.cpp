@@ -193,6 +193,14 @@ std::vector<TokenId> SpmTokenizer::encode(std::string_view text,
         if (it == token_to_id_.end()) {
             return;
         }
+        // Text never merges into a control or the unknown token (i#1129):
+        // with pieces "</" and "s>" in a vocabulary, typed "</s>" would
+        // otherwise become EOS, whose score (0) beats every piece's.
+        const auto type = static_cast<TokenType>(
+            cfg_.types[static_cast<std::size_t>(it->second)]);
+        if (type == TokenType::kControl || type == TokenType::kUnknown) {
+            return;
+        }
         const float s = cfg_.scores[static_cast<std::size_t>(it->second)];
         // The rescan this replaces never picked a score at or below
         // lowest() (or a NaN): skip them, which also keeps the heap's
