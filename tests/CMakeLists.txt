@@ -102,6 +102,7 @@ add_executable(locus_tests
     test_t5_tokenizer.cpp
     test_wpm_tokenizer.cpp
     test_bert.cpp
+    test_deberta.cpp
     test_image_dense.cpp
     test_rerank.cpp
     test_t5_encoder.cpp

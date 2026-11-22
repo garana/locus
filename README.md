@@ -41,7 +41,10 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   bge-m3 and nomic-embed-text v1.5. A reranker (an XLM-R cross-encoder
   such as bge-reranker-v2-m3) serves `/v1/rerank` with
   `--rerank-model`. Both run on the CPU, and a large request's passes
-  on Vulkan where the GPU shares host memory (Apple), or on CUDA.
+  on Vulkan where the GPU shares host memory (Apple), or on CUDA. A
+  DeBERTa v3 sequence classifier (arch `deberta-v2`, from
+  `scripts/text/convert-deberta.py`) runs and matches transformers,
+  not yet served (i#1159).
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), structured output (JSON mode, a JSON Schema, a
   regex or a GBNF grammar), prompt caching (in RAM, and on disk with
