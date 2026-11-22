@@ -2574,6 +2574,10 @@ class ScratchLease {
     ScratchSet* set_ = nullptr;
 };
 
+/** False once the pool is destroyed at exit, so a mapping unmapped
+ *  after it (static teardown order) does not touch it (i#1164). */
+std::atomic<bool> g_pool_alive{false};
+
 /**
  * Device weight pool (R8-GPU pager). Caches one device buffer per
  * weight, keyed by host pointer, so a weight is uploaded once and
@@ -2592,18 +2596,13 @@ class ScratchLease {
  *
  * Lifetime: a page is keyed by (host address, size) and never compared
  * with the host bytes again, so it trusts that an address keeps its
- * bytes. Production weights are GGUF mappings (and cuda_dev_const
- * buffers the model owns) that live as long as the model. Code that
- * frees host weights and may get new ones at the same address in the
- * same process (a model unload and reload) must first drop the old
- * pages, with cuda_evict() per weight or cuda_pool_reset(), as the
- * Vulkan path does with vulkan_release_weights(); else a matvec reads
- * the old model's device copy.
+ * bytes. A GGUF mapping's pages are dropped when it is unmapped (the
+ * unmap hook, release_range(), i#1164), so a model unload and reload
+ * needs nothing more. Weights in buffers of their own (not a mapped
+ * file) must still drop their pages before the buffer is freed and
+ * its address reused, with cuda_evict() per weight or
+ * cuda_pool_reset(); else a matvec reads the old weights' device copy.
  */
-/** False once the pool is destroyed at exit, so a mapping unmapped
- *  after it (static teardown order) does not touch it (i#1164). */
-std::atomic<bool> g_pool_alive{false};
-
 class WeightPool {
  public:
     /** @returns device buffer for `host` (uploading on miss) with the
@@ -2742,6 +2741,11 @@ class WeightPool {
      * model's copies (pages are keyed by host address). A page still
      * pinned means a kernel may read it, so the device is synchronized
      * first; unmapping a model while it runs is the caller's bug.
+     * The hook runs on whatever thread unmaps the file, whose CUDA
+     * device may never have been set (cuda_set_device is per thread):
+     * with one GPU that is device 0 anyway, but once several GPUs share
+     * the process (i#924) cudaFree and cudaDeviceSynchronize here need
+     * the pool's device_ set first.
      */
     void release_range(const void* p, std::size_t n) {
         std::lock_guard<std::mutex> lk(mu_);
