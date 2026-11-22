@@ -2,6 +2,7 @@
 
 #include <span>
 #include <string>
+#include <utility>
 
 #include "locus/backend/cpu_ops.hpp"
 
@@ -500,11 +501,17 @@ void cuda_set_device(int ordinal);
  * pool keys weights by host pointer, valid only while that buffer is
  * live; tests reset it between cases so transient weight buffers whose
  * addresses get recycled do not alias a stale device page. No-op on
- * non-CUDA builds. Inference does not need it while weights stay
- * mapped for the model's life; a model unload and reload must call it
- * (or cuda_evict per weight) before the new weights run.
+ * non-CUDA builds. A model file's unmap drops that file's pages on
+ * its own (an unmap hook, i#1164); weights in buffers of their own
+ * still need this or cuda_evict before their address is reused.
  */
 void cuda_pool_reset();
+
+/**
+ * @returns The CUDA weight pool's resident pages and their bytes
+ *     ({0, 0} on non-CUDA builds); for tests.
+ */
+std::pair<std::size_t, std::size_t> cuda_pool_resident();
 
 /**
  * Async weight prefetch (Ops.prefetch): begins a cudaMemcpyAsync of
