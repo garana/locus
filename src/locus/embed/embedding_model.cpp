@@ -201,6 +201,35 @@ std::vector<std::vector<float>> EmbeddingModel::embed(
     return out;
 }
 
+std::pair<tok::TokenId, tok::TokenId> EmbeddingModel::text_ends() const {
+    const auto ids = tok_->encode("", true);
+    if (ids.size() != 2) {
+        throw gguf::Error(name_ + ": the tokenizer does not frame a text "
+                                  "with one first and one last token");
+    }
+    return {ids[0], ids[1]};
+}
+
+std::vector<std::vector<float>> EmbeddingModel::embed_ids(
+    std::span<const std::vector<tok::TokenId>> inputs, const backend::Ops& op,
+    const backend::Ops* gpu) const {
+    if (reranker()) {
+        throw std::invalid_argument(name_ + " is a reranker, not an "
+                                            "embedding model");
+    }
+    const std::vector<std::vector<tok::TokenId>> ids(inputs.begin(),
+                                                     inputs.end());
+    std::vector<std::vector<float>> out;
+    out.reserve(ids.size());
+    passes(ids, [&](std::span<const std::vector<tok::TokenId>> run) {
+        for (auto& v :
+             enc_.embed(run, pick(run, op, gpu, enc_.token_macs()))) {
+            out.push_back(std::move(v));
+        }
+    });
+    return out;
+}
+
 std::vector<float> EmbeddingModel::rank(
     const std::string& query, const std::vector<std::string>& documents,
     const backend::Ops& op, std::size_t* tokens,

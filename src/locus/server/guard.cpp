@@ -434,6 +434,8 @@ GuardSpec parse_guard_spec(std::string_view text) {
             }
             s.max_windows = w;
             have_max_windows = true;
+        } else if (key == "embedding") {
+            s.embedding = value;
         } else {
             throw std::invalid_argument("--guard: unknown key '" +
                                         std::string(key) + "'");
@@ -445,10 +447,19 @@ GuardSpec parse_guard_spec(std::string_view text) {
         throw std::invalid_argument("--guard needs kind= and model=");
     }
     if (s.kind != "llama-guard" && s.kind != "prompt-guard" &&
-        s.kind != "classifier") {
+        s.kind != "classifier" && s.kind != "linear-head") {
         throw std::invalid_argument(
             "--guard: unknown kind '" + s.kind +
-            "' (known: llama-guard, prompt-guard, classifier)");
+            "' (known: llama-guard, prompt-guard, classifier, linear-head)");
+    }
+    // A linear head scores the vectors of the embedding model it was
+    // trained on; no other kind takes one.
+    if ((s.kind == "linear-head") != !s.embedding.empty()) {
+        throw std::invalid_argument(
+            s.kind == "linear-head"
+                ? "--guard: kind=linear-head needs embedding= (the "
+                  "embedding GGUF its head was trained on)"
+                : "--guard: only kind=linear-head takes embedding=");
     }
     if (have_labels && s.labels.empty()) {
         throw std::invalid_argument("--guard: labels= names no label");
@@ -496,6 +507,7 @@ std::unique_ptr<Guard> make_guard(const GuardSpec& spec,
     if (spec.kind == "classifier") {
         return load_encoder_classifier(spec, encoder_gpu);
     }
+    if (spec.kind == "linear-head") return load_linear_head(spec, encoder_gpu);
     throw std::invalid_argument("unknown guard kind '" + spec.kind + "'");
 }
 

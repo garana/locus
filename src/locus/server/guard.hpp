@@ -299,6 +299,9 @@ struct GuardSpec {
      *  request may take; past it the check fails closed (the guard
      *  runs on the chat engine's worker, so this bounds its stall). */
     std::size_t max_windows = kGuardMaxWindows;
+    /** embedding= (kind=linear-head only): the embedding GGUF whose
+     *  vectors the head scores. */
+    std::string embedding;
 };
 
 /**
@@ -308,14 +311,17 @@ struct GuardSpec {
  * (prompt-guard) labels are required and each may carry its own
  * threshold, labels=INJECTION@0.9:JAILBREAK; threshold= sets the
  * default (0.5). A label rejects when its score reaches its threshold.
+ * kind=linear-head also needs embedding= (the embedding GGUF its head
+ * was trained on), which no other kind takes.
  *
  * @param text The flag's value, e.g.
  *     "kind=llama-guard,model=/m/lg.gguf,labels=S1:S9".
  * @returns The spec, with a default name filled in.
  * @throws std::invalid_argument on an unknown kind or key, a missing
  *     kind or model, a pair without '=', a classifier kind without
- *     labels, a threshold on llama-guard, or a threshold that is not a
- *     number in (0, 1].
+ *     labels, a threshold on llama-guard, a threshold that is not a
+ *     number in (0, 1], or embedding= missing on linear-head or given
+ *     to another kind.
  */
 GuardSpec parse_guard_spec(std::string_view text);
 

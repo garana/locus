@@ -920,6 +920,27 @@ guarding the default path.
   transformers' float32 within 1e-3 and the Q8_0's within 0.05
   (`tests/golden/toxic_bert_hf.json`); a llama.cpp reranker
   (bge-reranker-v2-m3) loads as one label.
+- Linear head (`kind=linear-head`, `load_linear_head`): the same
+  guard over an embedding model (`embedding=`, a bge, e5 or nomic
+  GGUF) and a linear head on its vectors, for an operator's own
+  labels. SetFit, the usual recipe, stores its head only as a pickle
+  (`model_head.pkl`, joblib, for its scikit-learn and its torch head
+  alike), which locus never loads; so the head is a GGUF of arch
+  `linear-head`: `cls.output.weight` (labels x width) and `.bias`,
+  `classifier.output_labels`, `classifier.problem_type`, a
+  `temperature`, and the embedding model it was trained on. Each
+  window is embedded as `/v1/embeddings` does (pooled,
+  L2-normalized) and scored as (W v + b) / temperature. A head whose
+  embedding model's `general.name`, width, pooling or file size
+  differ from `embedding=`'s is refused (its sha256 is recorded, not
+  checked at every start). `locus-embed` embeds a JSONL of labeled
+  examples with the server's own code (the training sandbox has no
+  network to call the server), and `scripts/text/train-linear-head.py`
+  fits scikit-learn's logistic-regression objective (multinomial, or
+  a sigmoid per label; L2 with C = 1) by L-BFGS in torch, with no
+  scikit-learn. On 60 hand-written examples (prompt injections and
+  benign requests) with bge-small, 11 of 12 held out are right, and
+  the guard scores them as the script does to 1e-4.
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.
 - Metrics: every `/metrics` series carries `model` and `backend`

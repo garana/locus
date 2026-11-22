@@ -6,6 +6,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "locus/backend/registry.hpp"
@@ -134,6 +135,33 @@ class EmbeddingModel {
      * @returns label_names().size() logits per input.
      */
     std::vector<std::vector<float>> logits(
+        std::span<const std::vector<tok::TokenId>> inputs,
+        const backend::Ops& op, const backend::Ops* gpu = nullptr) const;
+
+    // An embedding model's parts, for a linear-head guard (i#1160).
+
+    /** @returns How embed() pools the token states. */
+    Pooling pooling() const { return enc_.pooling(); }
+
+    /**
+     * @returns The tokens embed() puts before and after a text ([CLS]
+     *     and [SEP], or <s> and </s>): the tokenizer's encoding of ""
+     *     with its specials.
+     * @throws gguf::Error when that is not exactly two tokens.
+     */
+    std::pair<tok::TokenId, tok::TokenId> text_ends() const;
+
+    /**
+     * embed() for inputs already tokenized with their specials (as
+     * text_ends() frames them): pooled and L2-normalized, in passes of
+     * up to kPassTokens tokens.
+     *
+     * @param gpu As for embed().
+     * @returns One width()-float vector per input.
+     * @throws std::invalid_argument for a reranker, or as
+     *     BertEncoder::encode does.
+     */
+    std::vector<std::vector<float>> embed_ids(
         std::span<const std::vector<tok::TokenId>> inputs,
         const backend::Ops& op, const backend::Ops* gpu = nullptr) const;
 

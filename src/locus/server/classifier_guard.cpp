@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <sstream>
 #include <stdexcept>
 
 #include "locus/backend/registry.hpp"
@@ -295,6 +298,145 @@ std::unique_ptr<ClassifierGuard> load_encoder_classifier(
         return raw->logits(batch, backend::best_backend().ops, gpu);
     };
     m.owner = em;
+    return std::make_unique<ClassifierGuard>(std::move(m), spec);
+}
+
+std::unique_ptr<ClassifierGuard> load_linear_head(const GuardSpec& spec,
+                                                  const backend::Ops* gpu) {
+    // The head: labels, problem type, temperature, W and b.
+    struct Head {
+        gguf::GgufFile file;
+        std::vector<float> w, b;
+        float temperature = 1.0f;
+    };
+    auto head = std::make_shared<Head>(Head{gguf::GgufFile::open(spec.model),
+                                            {}, {}, 1.0f});
+    const gguf::GgufFile& g = head->file;
+    const std::string what = spec.model + ": ";
+    if (g.get_string("general.architecture") != "linear-head") {
+        throw gguf::Error(what + "not a linear head (arch linear-head; see "
+                                 "scripts/text/train-linear-head.py)");
+    }
+    const std::string ns = "linear-head.";
+    const auto need_uint = [&](const std::string& key) {
+        const auto v = g.get_uint(ns + key);
+        if (!v || *v == 0) throw gguf::Error(what + "missing " + ns + key);
+        return *v;
+    };
+    const auto need_string = [&](const std::string& key) {
+        const auto v = g.get_string(ns + key);
+        if (!v) throw gguf::Error(what + "missing " + ns + key);
+        return std::string(*v);
+    };
+    const auto d = static_cast<std::uint32_t>(need_uint("embedding_length"));
+    std::vector<std::string> labels;
+    if (const auto* v = g.get_array(ns + "classifier.output_labels")) {
+        for (const auto& x : *v) {
+            if (x.type != gguf::ValueType::kString) {
+                throw gguf::Error(what + "a label is not a string");
+            }
+            labels.push_back(x.s);
+        }
+    }
+    if (labels.empty()) throw gguf::Error(what + "no labels");
+    if (const gguf::Value* t = g.find(ns + "temperature")) {
+        if (t->type != gguf::ValueType::kFloat32 || !(t->f > 0.0f)) {
+            throw gguf::Error(what + "temperature must be a positive float");
+        }
+        head->temperature = static_cast<float>(t->f);
+    }
+    // An F32 tensor of `rows` rows of `cols` (GGUF's ne[0] is cols).
+    const auto tensor = [&](const std::string& name, std::size_t cols,
+                            std::size_t rows) {
+        const gguf::TensorInfo* ti = g.find_tensor(name);
+        if (ti == nullptr || ti->type != gguf::TensorType::kF32 ||
+            ti->ne[0] != cols || ti->nelements() != cols * rows) {
+            throw gguf::Error(what + name + " is missing or not F32 of the "
+                                            "right shape");
+        }
+        const auto bytes = g.tensor_data(*ti);
+        std::vector<float> out(ti->nelements());
+        std::memcpy(out.data(), bytes.data(), out.size() * sizeof(float));
+        return out;
+    };
+    head->w = tensor("cls.output.weight", d, labels.size());
+    head->b = tensor("cls.output.bias", labels.size(), 1);
+
+    // The embedding model, checked against the one the head names.
+    std::shared_ptr<embed::EmbeddingModel> em =
+        embed::EmbeddingModel::load(spec.embedding);
+    if (em->reranker()) {
+        throw gguf::Error(spec.embedding + ": a classifier, not an embedding "
+                                           "model");
+    }
+    const auto meta = gguf::GgufFile::open(spec.embedding);
+    const auto gname = meta.get_string("general.name");
+    const std::string emb_name =
+        gname ? std::string(*gname)
+              : std::filesystem::path(spec.embedding).filename().string();
+    const auto mismatch = [&](const std::string& field, const auto& head_v,
+                              const auto& model_v) {
+        if (head_v != model_v) {
+            std::ostringstream os;
+            os << what << "trained on an embedding model with " << field
+               << " " << head_v << ", but " << spec.embedding << " has "
+               << model_v;
+            throw gguf::Error(os.str());
+        }
+    };
+    mismatch("name", need_string("embedding.name"), emb_name);
+    mismatch("width", need_uint("embedding.width"),
+             std::uint64_t{em->width()});
+    mismatch("width", std::uint64_t{d}, std::uint64_t{em->width()});
+    const auto pooling = g.get_uint(ns + "embedding.pooling");
+    if (!pooling) {
+        throw gguf::Error(what + "missing " + ns + "embedding.pooling");
+    }
+    mismatch("pooling", *pooling, static_cast<std::uint64_t>(em->pooling()));
+    mismatch("file size", need_uint("embedding.file_size"),
+             static_cast<std::uint64_t>(
+                 std::filesystem::file_size(spec.embedding)));
+
+    const auto [cls, sep] = em->text_ends();
+    const std::size_t nl = labels.size();
+    ClassifierGuard::Model m;
+    m.kind = "linear-head";
+    m.labels = labels;
+    const auto pt = g.get_string(ns + "classifier.problem_type");
+    m.problem = parse_problem_type(
+        pt ? std::optional<std::string_view>(*pt) : std::nullopt, nl);
+    m.context = em->context();
+    embed::EmbeddingModel* raw = em.get();
+    Head* h = head.get();
+    m.encode = [raw](std::string_view text) {
+        return raw->encode_literal(text);
+    };
+    m.cls = cls;
+    m.sep = sep;
+    m.classify = [raw, h, gpu, d, nl](
+                     std::span<const std::vector<tok::TokenId>> batch) {
+        const auto vecs = raw->embed_ids(batch, backend::best_backend().ops,
+                                         gpu);
+        std::vector<std::vector<float>> out;
+        out.reserve(vecs.size());
+        for (const auto& v : vecs) {
+            std::vector<float> z(nl);
+            for (std::size_t k = 0; k < nl; ++k) {
+                double acc = h->b[k];
+                const float* row = h->w.data() + k * d;
+                for (std::uint32_t i = 0; i < d; ++i) {
+                    acc += static_cast<double>(row[i]) * v[i];
+                }
+                z[k] = static_cast<float>(acc / h->temperature);
+            }
+            out.push_back(std::move(z));
+        }
+        return out;
+    };
+    // Both files live as long as the guard.
+    using Owners =
+        std::pair<std::shared_ptr<Head>, std::shared_ptr<embed::EmbeddingModel>>;
+    m.owner = std::make_shared<Owners>(head, em);
     return std::make_unique<ClassifierGuard>(std::move(m), spec);
 }
 
