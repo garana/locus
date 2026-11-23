@@ -85,7 +85,9 @@ inline constexpr const char* kRouterUsage =
     "                      never by discovery: a guard decides what\n"
     "                      passes\n"
     "  --guard-timeout S   longest silence from a guard instance before\n"
-    "                      the next one is tried (default 60; 0 = none)\n"
+    "                      the next one is tried (default 300; 0 =\n"
+    "                      none); set it above the guard's cold check\n"
+    "                      time and lower it for fast guards\n"
     "  -h, --help          show this help and exit\n";
 
 /**

@@ -214,8 +214,11 @@ or responses request (text or image-to-text) then goes first to one of
 them, `POST /v1/guard/{api}` with the client's body, in rendezvous
 order by the session key (a conversation keeps its guard's prefix
 cache), the next after a connect failure, a busy 503, no reply within
-`--guard-timeout` (60 s; a chat's 30 minutes would hold the request
-behind a hung guard) or any reply that is not a verdict. The guard
+`--guard-timeout` (300 s; a chat's 30 minutes would hold the request
+behind a hung guard) or any reply that is not a verdict. Set it above
+the guard's cold check time (121 s for a 2100-token chat with a 1B
+llama-guard on the SSE4 CPU, 36 s on CUDA; Prompt Guard at 64 windows
+about 15 s) and lower it for fast guards, to fail over sooner. The guard
 endpoint marks each reply it writes with `X-Locus-Guard: verdict`; the
 router allows only on a marked 200 `{"allow": true}` and relays only a
 marked 400 or 500, so a proxy or another service at a guard's address

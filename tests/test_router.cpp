@@ -1633,7 +1633,7 @@ TEST_CASE("router: --guard-timeout parses", "[router][guard]") {
                                          const_cast<char**>(argv.data()), 1,
                                          cfg, help) == "");
     CHECK(cfg.guard_read_timeout_ms == 5000);
-    CHECK(RouterConfig{}.guard_read_timeout_ms == 60000);
+    CHECK(RouterConfig{}.guard_read_timeout_ms == 300000);
 }
 
 TEST_CASE("router: a session keeps its guard instance", "[router][guard]") {

@@ -203,9 +203,11 @@ struct RouterConfig {
      *  (i#610). A dead instance is caught by the health polls. */
     int text_read_timeout_ms = 30 * 60 * 1000;
     /** The read timeout of a guard check (ms; 0 = no limit): shorter
-     *  than a chat's, so a hung guard fails over to the next one
-     *  soon; a check is one prefill on the guard instance. */
-    int guard_read_timeout_ms = 60 * 1000;
+     *  than a chat's, so a hung guard fails over sooner; above the
+     *  guard's cold check (121 s for a 2100-token chat with a 1B
+     *  llama-guard on an SSE4 CPU), so a slow guard is not taken for
+     *  a hung one. */
+    int guard_read_timeout_ms = 300 * 1000;
     int worker_threads = 16;
     /** Open connections one client address may hold (i#625 F21); 0 =
      *  no cap. */
