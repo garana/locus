@@ -1510,3 +1510,56 @@ TEST_CASE("metal decode norm fold tracks the unfolded decode", "[metal]") {
     }
     CHECK(worst_any > 0.0f);
 }
+
+// i#1074: the prefill matmuls alone, at Llama 3.2 1B's layer shapes and
+// 983 tokens, to compare with a whole prefill (locus-run --timing).
+TEST_CASE("bench: metal prefill matmuls at Llama 1B's shapes",
+          "[.bench][metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    Context& ctx = Context::get();
+    const std::uint32_t n_tok = 983;
+    // q, k, v, o, gate, up, down: rows x cols.
+    const std::pair<std::uint32_t, std::uint32_t> shapes[] = {
+        {2048, 2048}, {512, 2048},  {512, 2048}, {2048, 2048},
+        {8192, 2048}, {8192, 2048}, {2048, 8192}};
+    for (const TensorType ty : {TensorType::kQ4_K, TensorType::kQ8_0}) {
+        double total = 0.0, flops = 0.0;
+        for (const auto& [rows, cols] : shapes) {
+            const auto w = random_weights(ty, rows, cols, rows);
+            std::vector<float> x(std::size_t{n_tok} * cols, 0.25f);
+            Context::Buffer wb = ctx.upload(w);
+            Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
+            std::vector<float> o(std::size_t{n_tok} * rows);
+            Context::Buffer ob = ctx.upload(std::as_bytes(std::span(o)));
+            const auto run = [&] {
+                std::lock_guard lk(mb::device_mutex());
+                REQUIRE(mb::record_matmul(ctx, ty, rows, cols, n_tok, wb, 0,
+                                          xb, 0, cols, ob, 0, rows, false));
+            };
+            run();  // warm up
+            const int reps = 20;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) run();
+            const double s = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count() /
+                             reps;
+            total += s;
+            flops += 2.0 * rows * cols * n_tok;
+            WARN(static_cast<int>(ty) << " " << rows << "x" << cols << ": "
+                                      << s * 1e3 << " ms, "
+                                      << 2.0 * rows * cols * n_tok / s / 1e12
+                                      << " TFLOP/s");
+            ctx.free(wb);
+            ctx.free(xb);
+            ctx.free(ob);
+        }
+        WARN(static_cast<int>(ty) << " one layer " << total * 1e3
+                                  << " ms, 16 layers " << 16 * total * 1e3
+                                  << " ms, " << flops / total / 1e12
+                                  << " TFLOP/s");
+    }
+}
