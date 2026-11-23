@@ -1262,7 +1262,8 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             all.push_back(make_guard(legacy, model_.active_backend(), blocks));
         }
         for (const GuardSpec& s : opt_.guards) {
-            all.push_back(make_guard(s, model_.active_backend(), blocks));
+            all.push_back(make_guard(s, model_.active_backend(), blocks,
+                                     encoder_gpu_ops()));
         }
         for (const auto& g : opt_.extra_guards) all.push_back(g);
         std::set<std::string> names;

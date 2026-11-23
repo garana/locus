@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -17,6 +18,7 @@
 
 namespace locus::backend {
 struct Backend;
+struct Ops;
 }
 
 namespace locus::server {
@@ -274,6 +276,10 @@ class GuardBatcher {
     std::atomic<std::uint64_t> batches_{0};
 };
 
+/** A classifier guard's default window cap per request (GuardSpec::
+ *  max_windows, ClassifierGuard::kMaxWindows). */
+inline constexpr std::size_t kGuardMaxWindows = 64;
+
 /** One --guard flag: which guard to load and how it rejects. */
 struct GuardSpec {
     std::string kind;   ///< "llama-guard" or "prompt-guard"
@@ -289,6 +295,10 @@ struct GuardSpec {
     std::vector<float> thresholds;
     /** threshold=: the default for labels without their own. */
     float threshold = 0.5f;
+    /** max_windows= (classifier kinds): the most encoder windows one
+     *  request may take; past it the check fails closed (the guard
+     *  runs on the chat engine's worker, so this bounds its stall). */
+    std::size_t max_windows = kGuardMaxWindows;
 };
 
 /**
@@ -315,12 +325,15 @@ GuardSpec parse_guard_spec(std::string_view text);
  * @param spec The guard to load.
  * @param backend The backend the chat model runs on.
  * @param n_blocks KV blocks for a guard that generates.
+ * @param encoder_gpu GPU ops for an encoder classifier's large passes
+ *     (kind=classifier), or null.
  * @returns The guard.
  * @throws std::invalid_argument on an unknown kind; what the kind's
  *     loader throws when the model cannot load.
  */
 std::unique_ptr<Guard> make_guard(const GuardSpec& spec,
                                   const backend::Backend& backend,
-                                  std::uint32_t n_blocks);
+                                  std::uint32_t n_blocks,
+                                  const backend::Ops* encoder_gpu = nullptr);
 
 }  // namespace locus::server

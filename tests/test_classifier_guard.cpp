@@ -1,12 +1,18 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <optional>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "json.hpp"
+#include "locus/backend/registry.hpp"
 #include "locus/chat/template.hpp"
+#include "locus/embed/embedding_model.hpp"
 #include "locus/server/classifier_guard.hpp"
 #include "locus/server/guard.hpp"
 
@@ -315,4 +321,138 @@ TEST_CASE("prompt-guard check time on full windows",
     // repetitive text an injection (its own false positive).
     WARN("one ~7000-token turn: " << s << " s, verdict "
                                   << static_cast<int>(v.kind));
+}
+
+// i#1157: kind=classifier, and max_windows= for every classifier kind.
+TEST_CASE("a classifier --guard takes max_windows", "[guard][classifier]") {
+    const GuardSpec a = parse_guard_spec(
+        "kind=classifier,model=/m/tox.gguf,labels=toxic,max_windows=128");
+    CHECK(a.kind == "classifier");
+    CHECK(a.max_windows == 128);
+    CHECK(parse_guard_spec("kind=classifier,model=x,labels=a").max_windows ==
+          ClassifierGuard::kMaxWindows);
+    for (const char* bad :
+         {"kind=classifier,model=x",  // labels are required
+          "kind=classifier,model=x,labels=a,max_windows=0",
+          "kind=classifier,model=x,labels=a,max_windows=-1",
+          "kind=classifier,model=x,labels=a,max_windows=1.5",
+          "kind=classifier,model=x,labels=a,max_windows=many",
+          "kind=llama-guard,model=x,max_windows=8"}) {
+        CAPTURE(bad);
+        CHECK_THROWS_AS(parse_guard_spec(bad), std::invalid_argument);
+    }
+}
+
+TEST_CASE("a classifier guard holds a request to max_windows",
+          "[guard][classifier]") {
+    // context 80: 78 tokens a window, 64 shared, so a step of 14.
+    GuardSpec s = spec("INJECTION");
+    s.max_windows = 3;
+    ClassifierGuard g(fake_model(), s);
+    // 106 words: windows at 0, 14 and 28 (the last ends at 106); 14
+    // more words need a fourth.
+    std::string three;
+    for (int i = 0; i < 78 + 2 * 14; ++i) three += "a ";
+    std::string four = three;
+    for (int i = 0; i < 14; ++i) four += "a ";
+    CHECK(g.check(user(three)).kind == Kind::kSafe);
+    const auto v = g.check(user(four));
+    CHECK(v.kind == Kind::kMalformed);  // fails closed
+    CHECK(v.error.find("more than 3 windows") != std::string::npos);
+}
+
+namespace {
+
+const std::string kReranker = std::string(LOCUS_SOURCE_DIR) +
+                              "/tests/models/bge-reranker-v2-m3-q8_0.gguf";
+const std::string kToxicQ8 =
+    std::string(LOCUS_SOURCE_DIR) + "/tests/models/toxic-bert-q8_0.gguf";
+const std::string kToxicF32 =
+    std::string(LOCUS_SOURCE_DIR) + "/tests/models/toxic-bert-f32.gguf";
+
+}  // namespace
+
+TEST_CASE("an encoder classifier guard loads a llama.cpp reranker",
+          "[guard][classifier]") {
+    if (!std::filesystem::exists(kReranker)) {
+        SKIP("bge-reranker-v2-m3-q8_0.gguf absent");
+    }
+    // XLM-R's classification head keeps its dense + tanh (cls), so a
+    // llama.cpp reranker loads: one label, a sigmoid.
+    const auto g = locus::server::load_encoder_classifier(
+        parse_guard_spec("kind=classifier,model=" + kReranker +
+                         ",labels=LABEL_0@0.99"),
+        nullptr);
+    CHECK(g->kind() == "classifier");
+    CHECK(g->model_labels() == std::vector<std::string>{"LABEL_0"});
+    const auto v = g->check(user("hello there"));
+    CHECK((v.kind == Kind::kSafe || v.kind == Kind::kUnsafe));
+    CHECK_THROWS_WITH(
+        locus::server::load_encoder_classifier(
+            parse_guard_spec("kind=classifier,model=" + kReranker +
+                             ",labels=toxic"),
+            nullptr),
+        Catch::Matchers::ContainsSubstring("LABEL_0"));
+}
+
+// unitary/toxic-bert (multi-label, six labels) converted by
+// scripts/text/convert-bert-classifier.py; the golden is transformers'
+// float32 (scripts/text/make-classifier-golden.py).
+TEST_CASE("an encoder classifier guard matches transformers on toxic-bert",
+          "[guard][classifier][e2e]") {
+    std::ifstream f(std::string(LOCUS_SOURCE_DIR) +
+                    "/tests/golden/toxic_bert_hf.json");
+    REQUIRE(f.good());
+    const auto gold = nlohmann::json::parse(f);
+    const std::vector<std::string> labels =
+        gold["labels"].get<std::vector<std::string>>();
+    int ran = 0;
+    for (const auto& [path, tol] :
+         {std::pair{kToxicF32, 1e-3}, std::pair{kToxicQ8, 0.05}}) {
+        if (!std::filesystem::exists(path)) continue;
+        ++ran;
+        INFO("model " << path);
+        // The guard's own pieces, as load_encoder_classifier wires them.
+        const auto em = locus::embed::EmbeddingModel::load(path);
+        CHECK(em->label_names() == labels);
+        CHECK(em->problem_type() ==
+              std::optional<std::string>("multi_label_classification"));
+        CHECK(em->has_pooler());
+        for (const auto& item : gold["items"]) {
+            const std::string text = item["text"];
+            INFO("text " << text.substr(0, 40));
+            auto body = em->encode_literal(text);
+            Ids ids{em->cls_token()};
+            ids.insert(ids.end(), body.begin(), body.end());
+            ids.push_back(em->end_token());
+            CHECK(ids == item["ids"].get<Ids>());
+            const auto ws = guard_windows(body, em->context(),
+                                          ClassifierGuard::kOverlap,
+                                          em->cls_token(), em->end_token());
+            REQUIRE(ws == item["windows"].get<std::vector<Ids>>());
+            const auto got = em->logits(ws, locus::backend::best_backend().ops);
+            const auto want =
+                item["logits"].get<std::vector<std::vector<double>>>();
+            REQUIRE(got.size() == want.size());
+            for (std::size_t w = 0; w < got.size(); ++w) {
+                for (std::size_t l = 0; l < labels.size(); ++l) {
+                    CHECK(got[w][l] == Catch::Approx(want[w][l]).margin(tol));
+                }
+            }
+        }
+        // And as a guard: the insults reject on toxic and insult; the
+        // long text's insult sits in its second window only.
+        const auto g = locus::server::load_encoder_classifier(
+            parse_guard_spec("kind=classifier,model=" + path +
+                             ",labels=toxic:insult@0.5"),
+            nullptr);
+        for (const auto& item : gold["items"]) {
+            const auto top = item["top"].get<std::vector<double>>();
+            const bool want = top[0] >= 0.5 || top[4] >= 0.5;
+            const auto v = g->check(user(item["text"]));
+            INFO("text " << item["text"].get<std::string>().substr(0, 40));
+            CHECK((v.kind == Kind::kUnsafe) == want);
+        }
+    }
+    if (ran == 0) SKIP("toxic-bert GGUFs absent");
 }

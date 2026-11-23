@@ -96,11 +96,12 @@ class ClassifierGuard : public Guard {
         std::shared_ptr<void> owner;
     };
 
-    /** Windows over one request, at most: a longer one fails closed
-     *  rather than stall the chat engine (the guard runs on its
-     *  worker). 64 windows hold about 29k tokens and take about 15 s
-     *  of a DeBERTa v3 base on an M4 Max's CPU (0.24 s a window). */
-    static constexpr std::size_t kMaxWindows = 64;
+    /** The default of GuardSpec::max_windows: windows over one request,
+     *  at most; a longer one fails closed rather than stall the chat
+     *  engine (the guard runs on its worker). 64 windows hold about 29k
+     *  tokens and take about 15 s of a DeBERTa v3 base on an M4 Max's
+     *  CPU (0.24 s a window). */
+    static constexpr std::size_t kMaxWindows = kGuardMaxWindows;
     /** Tokens two neighbouring windows share. */
     static constexpr std::uint32_t kOverlap = 64;
     /** Windows per classify() call. */
@@ -136,6 +137,7 @@ class ClassifierGuard : public Guard {
     };
     Model model_;
     std::vector<Rule> rules_;
+    std::size_t max_windows_;  ///< GuardSpec::max_windows
     std::string last_error_;
     std::mutex mu_;
 };
@@ -152,5 +154,25 @@ class ClassifierGuard : public Guard {
  *     as ClassifierGuard's constructor does.
  */
 std::unique_ptr<ClassifierGuard> load_prompt_guard(const GuardSpec& spec);
+
+/**
+ * Loads an encoder sequence classifier (kind "classifier", i#1157): a
+ * BERT, XLM-R or nomic-bert GGUF with a classifier head (pooling
+ * rank), as scripts/text/convert-bert-classifier.py writes it, or a
+ * llama.cpp reranker. Labels come from {arch}.classifier.output_labels
+ * (LABEL_0, ... when absent), the problem type from
+ * {arch}.classifier.problem_type. A head without its pooler ("cls":
+ * llama.cpp's converter drops BertForSequenceClassification's
+ * pooler.dense) is refused, since its scores are not the model's.
+ * Text is encoded literally (typed special tokens stay text).
+ *
+ * @param spec The guard's spec (model path, name, labels).
+ * @param gpu GPU ops for large encoder passes, or null.
+ * @returns The guard.
+ * @throws gguf::Error when the GGUF is not such a model or lacks the
+ *     pooler; std::invalid_argument as ClassifierGuard's constructor.
+ */
+std::unique_ptr<ClassifierGuard> load_encoder_classifier(
+    const GuardSpec& spec, const backend::Ops* gpu);
 
 }  // namespace locus::server

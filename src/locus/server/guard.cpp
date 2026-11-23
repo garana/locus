@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -372,7 +373,7 @@ float parse_threshold(const std::string& text) {
 
 GuardSpec parse_guard_spec(std::string_view text) {
     GuardSpec s;
-    bool have_labels = false, have_threshold = false;
+    bool have_labels = false, have_threshold = false, have_max_windows = false;
     std::size_t at = 0;
     while (at <= text.size()) {
         const std::size_t comma = text.find(',', at);
@@ -421,6 +422,18 @@ GuardSpec parse_guard_spec(std::string_view text) {
         } else if (key == "threshold") {
             s.threshold = parse_threshold(value);
             have_threshold = true;
+        } else if (key == "max_windows") {
+            // A whole positive number: a request past it fails closed.
+            std::size_t w = 0;
+            const auto [end, ec] =
+                std::from_chars(value.data(), value.data() + value.size(), w);
+            if (ec != std::errc{} || end != value.data() + value.size() ||
+                w == 0) {
+                throw std::invalid_argument("--guard: max_windows '" + value +
+                                            "' is not a positive whole number");
+            }
+            s.max_windows = w;
+            have_max_windows = true;
         } else {
             throw std::invalid_argument("--guard: unknown key '" +
                                         std::string(key) + "'");
@@ -431,9 +444,11 @@ GuardSpec parse_guard_spec(std::string_view text) {
     if (s.kind.empty() || s.model.empty()) {
         throw std::invalid_argument("--guard needs kind= and model=");
     }
-    if (s.kind != "llama-guard" && s.kind != "prompt-guard") {
-        throw std::invalid_argument("--guard: unknown kind '" + s.kind +
-                                    "' (known: llama-guard, prompt-guard)");
+    if (s.kind != "llama-guard" && s.kind != "prompt-guard" &&
+        s.kind != "classifier") {
+        throw std::invalid_argument(
+            "--guard: unknown kind '" + s.kind +
+            "' (known: llama-guard, prompt-guard, classifier)");
     }
     if (have_labels && s.labels.empty()) {
         throw std::invalid_argument("--guard: labels= names no label");
@@ -447,6 +462,10 @@ GuardSpec parse_guard_spec(std::string_view text) {
                         [](float t) { return !std::isnan(t); })) {
             throw std::invalid_argument(
                 "--guard: kind=llama-guard takes no threshold");
+        }
+        if (have_max_windows) {
+            throw std::invalid_argument(
+                "--guard: kind=llama-guard takes no max_windows");
         }
     } else if (s.labels.empty()) {
         // "All labels" would reject on the benign label too.
@@ -467,12 +486,16 @@ GuardSpec parse_guard_spec(std::string_view text) {
 
 std::unique_ptr<Guard> make_guard(const GuardSpec& spec,
                                   const backend::Backend& backend,
-                                  std::uint32_t n_blocks) {
+                                  std::uint32_t n_blocks,
+                                  const backend::Ops* encoder_gpu) {
     if (spec.kind == "llama-guard") {
         return LlamaGuard::load(spec.model, backend, n_blocks, spec.labels,
                                 spec.name);
     }
     if (spec.kind == "prompt-guard") return load_prompt_guard(spec);
+    if (spec.kind == "classifier") {
+        return load_encoder_classifier(spec, encoder_gpu);
+    }
     throw std::invalid_argument("unknown guard kind '" + spec.kind + "'");
 }
 

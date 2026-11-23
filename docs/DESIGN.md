@@ -904,7 +904,22 @@ guarding the default path.
   tokens) fails closed rather than stall it longer. Prompt Guard
   itself is gated behind Meta's license; the tests use
   protectai/deberta-v3-base-prompt-injection-v2 (labels SAFE and
-  INJECTION), the same layout.
+  INJECTION), the same layout. `max_windows=` sets the cap per guard.
+- Encoder classifier (`kind=classifier`, `load_encoder_classifier`):
+  the same guard over a BERT, XLM-R or nomic-bert sequence
+  classifier, the reranker head with N outputs (the CLS state through
+  the pooler `cls` and tanh, then `cls.output`). Labels come from
+  `{arch}.classifier.output_labels` (llama.cpp's key; LABEL_0, ...
+  when absent), the problem type from `{arch}.classifier.problem_type`;
+  text is encoded literally (the plain encode parses typed special
+  tokens since #1151), windows between the model's single-sequence
+  first and last tokens. A head without `cls` is refused: llama.cpp's
+  converter drops BertForSequenceClassification's pooler, so its
+  scores are not the model's; `scripts/text/convert-bert-classifier.py`
+  keeps it. On unitary/toxic-bert the F32 GGUF's logits match
+  transformers' float32 within 1e-3 and the Q8_0's within 0.05
+  (`tests/golden/toxic_bert_hf.json`); a llama.cpp reranker
+  (bge-reranker-v2-m3) loads as one label.
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.
 - Metrics: every `/metrics` series carries `model` and `backend`

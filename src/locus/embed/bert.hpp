@@ -105,6 +105,10 @@ class BertEncoder {
     /** @returns The classifier's output count (0 unless kRank). */
     std::uint32_t labels() const { return labels_; }
 
+    /** @returns Whether the classifier head has its pooler (cls: the
+     *  CLS state through a dense layer and tanh before cls.output). */
+    bool has_cls() const { return cls_.w.data != nullptr; }
+
     /**
      * encode(), then pooling() per sequence and an L2 normalization.
      *
