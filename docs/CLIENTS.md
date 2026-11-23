@@ -430,6 +430,11 @@ calling. Reliable agent use therefore needs a capable instruct model.
   the request is not run.
   Replies are not checked, and the media endpoints (`/v1/images/*`,
   `/v1/videos`, `/v1/audio/speech`) are not guarded.
+- Guards behind locus-router: with `--guard`, the router checks those
+  four endpoints with a guard instance before routing and relays its
+  400 or 500; none answering gives a 503. A client that reaches a chat
+  instance directly skips the router's guard, so such instances need
+  their own guard or a firewall that lets only the router reach them.
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).

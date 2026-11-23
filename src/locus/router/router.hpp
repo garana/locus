@@ -170,6 +170,13 @@ struct RouterConfig {
     /** The browse (tests set a fake); null: pipeline::mdns_browse. */
     std::function<std::vector<pipeline::SrvTarget>(const std::string&)>
         mdns_lookup;
+    /** Guard instances (--guard, i#1161), as host:port or "srv:NAME":
+     * when any is set, each text request (chat, messages, responses,
+     * completions, image-to-text) is first sent to one of them
+     * (POST /v1/guard/{api}, the client's body) and goes on only when it
+     * allows it. Named explicitly, never discovered: a guard decides
+     * what passes. None answering rejects the request (503). */
+    std::vector<std::string> guards;
     /** Keys an instance may register itself with (POST /locus/register
      * and /locus/deregister, Authorization: Bearer KEY). Empty: registration
      * is off (404), since anyone who could register could take the
@@ -195,6 +202,12 @@ struct RouterConfig {
      *  streamed one nothing during its prefill, both minutes on a CPU
      *  (i#610). A dead instance is caught by the health polls. */
     int text_read_timeout_ms = 30 * 60 * 1000;
+    /** The read timeout of a guard check (ms; 0 = no limit): shorter
+     *  than a chat's, so a hung guard fails over sooner; above the
+     *  guard's cold check (121 s for a 2100-token chat with a 1B
+     *  llama-guard on an SSE4 CPU), so a slow guard is not taken for
+     *  a hung one. */
+    int guard_read_timeout_ms = 300 * 1000;
     int worker_threads = 16;
     /** Open connections one client address may hold (i#625 F21); 0 =
      *  no cap. */
@@ -291,6 +304,29 @@ class Router {
     void models(http::ServerResponse& res) const;
     /** The router's own Prometheus metrics, per instance. */
     void metrics(http::ServerResponse& res) const;
+
+    /** One guard instance's /metrics counters (i#1161), kept by
+     *  host:port so an SRV refresh does not reset them. */
+    struct GuardStats {
+        std::atomic<std::uint64_t> checks{0};    ///< answered verdicts
+        std::atomic<std::uint64_t> rejects{0};   ///< its 400s
+        std::atomic<std::uint64_t> failures{0};  ///< 500s, no answer
+        std::atomic<std::uint64_t> ns{0};        ///< time of its checks
+    };
+    /**
+     * Checks a text request with a guard instance (cfg_.guards): tries
+     * them in rendezvous order for the session key, moving on after a
+     * connect failure, a busy 503 or any reply that is not a verdict.
+     * @returns true to go on routing; false when res holds the reply
+     *     (the guard's own 400 or 500, or a 503 when none answered).
+     */
+    bool check_guard(const http::Request& req, const Route& rt,
+                     http::ServerResponse& res);
+    /** @returns The guard instances now, as (host, port): cfg_.guards'
+     *  host:port entries and each srv: name's current targets. */
+    std::vector<std::pair<std::string, int>> guard_targets() const;
+    /** @returns gstats_[key], made on first use. */
+    GuardStats& guard_stats(const std::string& key);
     /** An idle connection to instance i, or a new client. */
     std::shared_ptr<http::Client> take(std::size_t i);
     /** Returns a client to instance i's pool (up to pool_size). */
@@ -346,6 +382,15 @@ class Router {
     void poll(Instance& in) const;
 
     mutable std::mutex mu_;
+    /** Guard instances' counters, by host:port (gmu_). */
+    mutable std::mutex gmu_;
+    std::map<std::string, std::unique_ptr<GuardStats>> gstats_;
+    /** The guard instances now (gmu_): the host:port entries, then each
+     *  srv: name's targets as its last lookup gave them. */
+    std::vector<std::pair<std::string, int>> guard_cache_;
+    /** Each guard srv: name's last answer (gmu_). */
+    std::map<std::string, std::vector<std::pair<std::string, int>>>
+        guard_srv_;
     /** Only grows (under mu_), so an index stays the same instance. */
     std::vector<Instance> inst_;
     /** One per instance, kMaxInstances allocated up front: adding an

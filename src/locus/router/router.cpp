@@ -354,6 +354,24 @@ Router::Router(RouterConfig cfg)
         }
         inst_.push_back(std::move(in));
     }
+    // Guard instances (i#1161): host:port or srv:NAME, named explicitly
+    // (a guard decides what passes, so none is discovered).
+    for (const auto& g : cfg_.guards) {
+        if (g.rfind("srv:", 0) == 0) {
+            if (g.size() == 4) {
+                throw std::invalid_argument("--guard srv: needs a DNS name");
+            }
+            continue;
+        }
+        std::string host;
+        int port = 0;
+        if (!pipeline::parse_hostport(g, host, port) || host.empty() ||
+            port <= 0) {
+            throw std::invalid_argument("bad guard address: " + g +
+                                        " (host:port or srv:NAME)");
+        }
+        guard_cache_.emplace_back(host, port);
+    }
     if (!cfg_.auth_helper_argv.empty()) {
         std::vector<std::unique_ptr<auth::HelperConnection>> conns;
         for (std::size_t i = 0; i < std::max<std::size_t>(1, cfg_.auth_helpers);
@@ -748,6 +766,23 @@ void Router::poll(Instance& in) const {
 void Router::refresh() {
     expand_srv();
     expand_mdns();
+    // Guard srv: names (i#1161): the lowest priority's targets; an
+    // empty or failed answer keeps the last ones.
+    for (const auto& g : cfg_.guards) {
+        if (g.rfind("srv:", 0) != 0) continue;
+        const std::string name = g.substr(4);
+        auto all = cfg_.srv_lookup ? cfg_.srv_lookup(name)
+                                   : pipeline::dns_srv_lookup(name);
+        if (all.empty()) continue;
+        int lo = all.front().priority;
+        for (const auto& t : all) lo = std::min(lo, t.priority);
+        std::vector<std::pair<std::string, int>> picks;
+        for (const auto& t : all) {
+            if (t.priority == lo) picks.emplace_back(t.host, t.port);
+        }
+        std::lock_guard lk(gmu_);
+        guard_srv_[g] = std::move(picks);
+    }
     if (!scans_.empty() &&
         refreshes_.fetch_add(1) % std::max(1, cfg_.scan_every) == 0) {
         scan();
@@ -975,6 +1010,40 @@ void Router::metrics(http::ServerResponse& res) const {
                return u(static_cast<std::uint64_t>(
                    std::max(0, slots_[i].inflight.load())));
            });
+    // Guard instances (i#1161), by host:port.
+    {
+        std::lock_guard lk(gmu_);
+        if (!gstats_.empty()) {
+            const auto guard_family = [&](const char* name, const char* help,
+                                          const auto& value) {
+                out += std::string("# HELP ") + name + " " + help + "\n";
+                out += std::string("# TYPE ") + name + " counter\n";
+                for (const auto& [key, st] : gstats_) {
+                    out += std::string(name) + "{guard=\"" + key + "\"} " +
+                           value(*st) + "\n";
+                }
+            };
+            guard_family("locus_router_guard_checks_total",
+                         "Verdicts the guard instance gave (allow, reject or "
+                         "a failed guard's 500).",
+                         [&](const GuardStats& s) { return u(s.checks); });
+            guard_family("locus_router_guard_rejects_total",
+                         "Requests the guard instance rejected (its 400).",
+                         [&](const GuardStats& s) { return u(s.rejects); });
+            guard_family("locus_router_guard_failures_total",
+                         "Checks that failed there: no answer, a busy or "
+                         "other status, or the guard's 500.",
+                         [&](const GuardStats& s) { return u(s.failures); });
+            guard_family("locus_router_guard_seconds_total",
+                         "Time of the checks sent to the guard instance.",
+                         [&](const GuardStats& s) {
+                             char buf[32];
+                             std::snprintf(buf, sizeof buf, "%.6f",
+                                           static_cast<double>(s.ns) / 1e9);
+                             return std::string(buf);
+                         });
+        }
+    }
     res.set_content(std::move(out), "text/plain; version=0.0.4");
 }
 
@@ -1108,6 +1177,117 @@ void Router::registration(const http::Request& req,
         "application/json");
 }
 
+std::vector<std::pair<std::string, int>> Router::guard_targets() const {
+    std::lock_guard lk(gmu_);
+    auto out = guard_cache_;
+    for (const auto& [name, picks] : guard_srv_) {
+        out.insert(out.end(), picks.begin(), picks.end());
+    }
+    return out;
+}
+
+Router::GuardStats& Router::guard_stats(const std::string& key) {
+    std::lock_guard lk(gmu_);
+    auto& p = gstats_[key];
+    if (!p) p = std::make_unique<GuardStats>();
+    return *p;
+}
+
+bool Router::check_guard(const http::Request& req, const Route& rt,
+                         http::ServerResponse& res) {
+    auto targets = guard_targets();
+    // The session's guard first, as for chat, so a conversation keeps
+    // that guard's prefix cache.
+    const auto key_of = [](const std::pair<std::string, int>& t) {
+        return t.first + ":" + std::to_string(t.second);
+    };
+    std::stable_sort(targets.begin(), targets.end(),
+                     [&](const auto& a, const auto& b) {
+                         return rendezvous_score(rt.session, key_of(a)) >
+                                rendezvous_score(rt.session, key_of(b));
+                     });
+    http::ClientRequest up;
+    up.method = "POST";
+    up.target = "/v1/guard" + req.path.substr(3);  // "/v1/x" -> "/v1/guard/x"
+    up.body = req.body;
+    std::string last;
+    for (const auto& t : targets) {
+        const std::string key = key_of(t);
+        GuardStats& st = guard_stats(key);
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto took = [&] {
+            st.ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count());
+        };
+        Instance in;
+        in.host = t.first;
+        in.port = t.second;
+        up.headers = upstream_headers(req, in);
+        http::Client client(t.first, t.second, cfg_.upstream);
+        client.set_read_timeout_ms(cfg_.guard_read_timeout_ms);
+        const auto head = client.begin(up);
+        std::string body, err;
+        if (!head.ok || !client.read_body(
+                            [&](std::string_view d) {
+                                body.append(d);
+                                return true;
+                            },
+                            err)) {
+            ++st.failures;
+            took();
+            last = key + ": " + (head.ok ? err : head.error);
+            continue;
+        }
+        took();
+        const int status = head.head.status;
+        // Only the guard endpoint's own replies count: each carries
+        // X-Locus-Guard: verdict. Anything else at that address (a
+        // proxy's page, another service) is not a verdict, so it never
+        // allows or rejects: the next guard is tried (fail closed).
+        const bool marked =
+            head.head.get_header_value("X-Locus-Guard") == "verdict";
+        if (marked && status == 200) {
+            // Allow only on a JSON {"allow": true}.
+            const auto v = json::parse(body, nullptr, false);
+            if (v.is_object() && v.contains("allow") &&
+                v["allow"].is_boolean() && v["allow"].get<bool>()) {
+                ++st.checks;
+                return true;  // allowed
+            }
+        }
+        if (!marked || status == 200) {
+            ++st.failures;
+            last = key + ": HTTP " + std::to_string(status) +
+                   " that is not a guard verdict";
+            continue;
+        }
+        if (status == 400 || status == 500) {
+            // The guard's own rejection (flagged: 400; failed: 500), in
+            // the API's error shape: relayed as is.
+            ++st.checks;
+            if (status == 400) ++st.rejects; else ++st.failures;
+            res.status = status;
+            res.set_content(std::move(body),
+                            head.head.get_header_value("Content-Type"));
+            return false;
+        }
+        // Busy (503), no guard there (404), anything else: the next.
+        ++st.failures;
+        last = key + ": HTTP " + std::to_string(status);
+    }
+    res.status = 503;
+    res.set_header("Retry-After", "5");
+    res.set_content(
+        error_body("no guard instance answered" +
+                       (last.empty() ? std::string() : " (" + last + ")") +
+                       "; the request was not run",
+                   "server_error"),
+        "application/json");
+    return false;
+}
+
 void Router::handle(const http::Request& req, http::ServerResponse& res) {
     if (req.path == "/health") {
         res.set_content(R"({"status":"ok"})", "application/json");
@@ -1147,6 +1327,16 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
     }
     Route rt = *route;
     rt.session = session_key(req.get_header_value("X-Session-Id"), req.body);
+    // The guard check first (i#1161), on the four endpoints a guard
+    // judges (text and image-to-text; not embeddings).
+    const bool guarded = req.path == "/v1/chat/completions" ||
+                         req.path == "/v1/completions" ||
+                         req.path == "/v1/messages" ||
+                         req.path == "/v1/responses";
+    if (!cfg_.guards.empty() && guarded && req.method == "POST" &&
+        !check_guard(req, rt, res)) {
+        return;
+    }
     std::string target = req.target;
     std::vector<int> cands;
     // GET /v1/videos/{id}[/content]: the id names the instance that made

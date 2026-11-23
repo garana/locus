@@ -76,6 +76,18 @@ inline constexpr const char* kRouterUsage =
     "                      these keys like client keys: requests (and\n"
     "                      with --upstream-auth client, the clients'\n"
     "                      keys) go to the address a holder registers\n"
+    "  --guard LIST        check each text request with one of these\n"
+    "                      guard instances first (comma-separated\n"
+    "                      HOST:PORT or srv:NAME, repeatable; each a\n"
+    "                      locus-server with --guard-model or --guard);\n"
+    "                      a request goes on only when one allows it,\n"
+    "                      and none answering is a 503. Name them here,\n"
+    "                      never by discovery: a guard decides what\n"
+    "                      passes\n"
+    "  --guard-timeout S   longest silence from a guard instance before\n"
+    "                      the next one is tried (default 300; 0 =\n"
+    "                      none); set it above the guard's cold check\n"
+    "                      time and lower it for fast guards\n"
     "  -h, --help          show this help and exit\n";
 
 /**
@@ -154,6 +166,27 @@ inline std::string parse_router_args(int argc, char** argv, int first,
                 cfg.instance_keys = locus::router::parse_instance_keys(ss.str());
             } catch (const std::exception& e) {
                 return e.what();
+            }
+        } else if (a == "--guard-timeout" && i + 1 < argc) {
+            int n = 0;
+            if (!parse_nonneg_int(argv[++i], n) || n > 86400) {
+                return std::string("bad --guard-timeout: ") + argv[i];
+            }
+            cfg.guard_read_timeout_ms = n * 1000;
+        } else if (a == "--guard" && i + 1 < argc) {
+            // Comma-separated host:port / srv:NAME entries; repeatable.
+            const std::string list = argv[++i];
+            std::size_t at = 0;
+            while (at <= list.size()) {
+                const std::size_t c = list.find(',', at);
+                const std::string g = list.substr(
+                    at, c == std::string::npos ? std::string::npos : c - at);
+                if (!g.empty()) cfg.guards.push_back(g);
+                if (c == std::string::npos) break;
+                at = c + 1;
+            }
+            if (cfg.guards.empty()) {
+                return "--guard names no guard instance";
             }
         } else if (a == "--register-keys" && i + 1 < argc) {
             std::ifstream f(argv[++i]);

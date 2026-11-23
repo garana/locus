@@ -286,7 +286,11 @@ class OpenAiServer {
         kCompletions, kChat, kMessages, kResponses, kEmbeddings,
         kRerank, kClassify, kAudioSpeech,
         kImages, kImageEdits,
-        kVideos, kVideoById, kVideoContent, kUnknown
+        kVideos, kVideoById, kVideoContent,
+        /** POST /v1/guard/{api}: this instance's guards' verdict on
+         *  that API's request body (locus-router, i#1161). */
+        kGuard,
+        kUnknown
     };
     /** Classifies a request. GET and HEAD both match the GET routes;
      * /v1/models/{id} matches by prefix (the regex route retired). */
