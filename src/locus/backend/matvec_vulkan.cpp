@@ -325,16 +325,10 @@ struct State {
     void free_buffers(bool kv = true) {
         // Weight pool: every model's weights are uploaded once and kept
         // resident (unbounded by default) -- the unbounded accumulator
-        // across a multi-model test process. Free them all.
-        for (auto& [ptr, e] : pool.map_) {
-            pool.destroy(e.buf);
-        }
-        pool.map_.clear();
-        for (auto& b : pool.transient_) {
-            pool.destroy(b);
-        }
-        pool.transient_.clear();
-        pool.used_ = 0;
+        // across a multi-model test process. Free them all, and the
+        // spill state with them (i#1164): the next model starts with
+        // an empty spill cache and the full budget.
+        pool.reset();
         // GPU-mapped KV pools still live (vulkan_free_kv frees one when
         // its cache goes): only at teardown.
         if (kv) {

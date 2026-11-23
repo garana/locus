@@ -422,7 +422,9 @@ device memory still runs.
   memory) is a spill: the device budget drops to what the pool holds
   there, and spills are cached apart, under a quarter of the host's
   RAM (`LOCUS_GPU_SPILL_MB` overrides) with their own LRU; past that a
-  spill serves one batch. Once the device is full a miss goes to the
+  spill serves one batch, so pinned memory stays under the cap plus
+  one batch's overflow. A reset between models clears the spill state
+  with the buffers. Once the device is full a miss goes to the
   spill cache first, since evicting device weights read every token
   would make each eviction the next miss. So a dense model a little
   larger than the device stays resident (Orpheus 3B Q4_K_M on a 2 GB

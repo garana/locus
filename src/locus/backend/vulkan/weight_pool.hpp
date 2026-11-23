@@ -244,6 +244,27 @@ struct WeightPoolT {
         }
     }
 
+    /**
+     * Destroys every buffer and starts over as a new pool (between
+     * models): no device or spill bytes held, the device not known to
+     * be full, and the budget read again on the next acquire. The
+     * hit, miss, eviction, spill and upload counts keep adding up.
+     */
+    void reset() {
+        for (auto& [ptr, e] : map_) {
+            destroy(e.buf);
+        }
+        map_.clear();
+        for (auto& b : transient_) {
+            destroy(b);
+        }
+        transient_.clear();
+        used_ = 0;
+        spill_used_ = 0;
+        device_full_ = false;
+        budget_ = 0;
+    }
+
     /** End-of-batch: unpin all and drop transient buffers. */
     void on_batch_end() {
         for (auto& kv : map_) {

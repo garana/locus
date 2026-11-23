@@ -258,4 +258,21 @@ TEST_CASE("weight pool caps the weights that spill off the device",
     REQUIRE(h.pool.spill_used_ <= 20);
     h.pool.on_batch_end();
     REQUIRE(h.live == 4);
+
+    // A reset between models frees everything and the spill state: the
+    // next model's spills are kept again, not served one batch each.
+    h.pool.reset();
+    REQUIRE(h.live == 0);
+    REQUIRE(h.pool.used_ == 0);
+    REQUIRE(h.pool.spill_used_ == 0);
+    REQUIRE_FALSE(h.pool.device_full_);
+    const char* keys[] = {"w", "x", "y", "z"};
+    for (const char* k : keys) {
+        h.get(k, 10);
+    }
+    h.pool.on_batch_end();
+    REQUIRE(h.pool.used_ == 20);
+    REQUIRE(h.pool.spill_used_ == 20);
+    REQUIRE(h.live == 4);  // nothing served as a transient
+    REQUIRE(h.pool.transient_.empty());
 }
