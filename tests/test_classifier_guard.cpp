@@ -456,3 +456,118 @@ TEST_CASE("an encoder classifier guard matches transformers on toxic-bert",
     }
     if (ran == 0) SKIP("toxic-bert GGUFs absent");
 }
+
+TEST_CASE("a linear-head --guard needs its embedding model",
+          "[guard][classifier]") {
+    const GuardSpec s = parse_guard_spec(
+        "kind=linear-head,model=/m/head.gguf,embedding=/m/bge.gguf,"
+        "labels=INJECTION@0.7");
+    CHECK(s.kind == "linear-head");
+    CHECK(s.embedding == "/m/bge.gguf");
+    CHECK(s.name == "head");
+    for (const char* bad :
+         {"kind=linear-head,model=h.gguf,labels=A",  // no embedding=
+          "kind=linear-head,model=h.gguf,embedding=e.gguf",  // no labels
+          "kind=prompt-guard,model=p.gguf,embedding=e.gguf,labels=A",
+          "kind=llama-guard,model=l.gguf,embedding=e.gguf"}) {
+        CAPTURE(bad);
+        CHECK_THROWS_AS(parse_guard_spec(bad), std::invalid_argument);
+    }
+}
+
+TEST_CASE("a linear head scores as its training script did",
+          "[guard][classifier][e2e]") {
+    const std::string dir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
+    const std::string emb = dir + "models/bge-small-en-v1.5-q8_0.gguf";
+    // scripts/text/train-linear-head.py on locus-embed's vectors of
+    // tests/golden/linear_head_examples.jsonl (bge-small), every 5th
+    // example held out; the holdout file has those examples' vectors
+    // and the script's scores.
+    const std::string head = dir + "golden/linear_head_bge_small.gguf";
+    if (!std::filesystem::exists(emb)) {
+        SKIP("bge-small-en-v1.5-q8_0.gguf absent; see "
+             "scripts/tests/fetch-test-model.sh bge");
+    }
+    std::ifstream f(dir + "golden/linear_head_bge_small_holdout.json");
+    REQUIRE(f.good());
+    const auto golden = nlohmann::json::parse(f);
+    REQUIRE(golden["labels"] ==
+            std::vector<std::string>{"BENIGN", "INJECTION"});
+    const auto items = golden["items"];
+    REQUIRE(items.size() == 12);
+
+    // The guard embeds as /v1/embeddings does: the vectors match.
+    const auto em = locus::embed::EmbeddingModel::load(emb);
+    for (const auto& it : items) {
+        const auto v =
+            em->embed({it["text"].get<std::string>()},
+                      locus::backend::best_backend().ops)[0];
+        const auto want = it["embedding"].get<std::vector<float>>();
+        REQUIRE(v.size() == want.size());
+        float d = 0.0f;
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            d = std::max(d, std::fabs(v[i] - want[i]));
+        }
+        CHECK(d < 1e-5f);
+    }
+    // Each held-out text's INJECTION score is the script's: a threshold
+    // 1e-4 under it rejects, 1e-4 over it allows.
+    const auto spec_at = [&](float t) {
+        return parse_guard_spec("kind=linear-head,model=" + head +
+                                ",embedding=" + emb + ",labels=INJECTION@" +
+                                std::to_string(t));
+    };
+    for (const auto& it : items) {
+        const float s = it["scores"][1].get<float>();
+        const std::vector<Message> turns = user(it["text"].get<std::string>());
+        INFO(it["text"].get<std::string>() << ": " << s);
+        const auto lo = locus::server::load_linear_head(spec_at(s - 1e-4f),
+                                                        nullptr);
+        CHECK(lo->check(turns).kind == Kind::kUnsafe);
+        const auto hi = locus::server::load_linear_head(spec_at(s + 1e-4f),
+                                                        nullptr);
+        CHECK(hi->check(turns).kind == Kind::kSafe);
+    }
+}
+
+TEST_CASE("a linear head refuses an embedding model it was not trained on",
+          "[guard][classifier]") {
+    const std::string dir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
+    const std::string emb = dir + "models/bge-small-en-v1.5-q8_0.gguf";
+    const std::string head = dir + "golden/linear_head_bge_small.gguf";
+    if (!std::filesystem::exists(emb)) {
+        SKIP("bge-small-en-v1.5-q8_0.gguf absent");
+    }
+    // The same model with other bytes: its file size differs.
+    const auto other = std::filesystem::temp_directory_path() /
+                       "locus-linear-head-other.gguf";
+    std::filesystem::copy_file(
+        emb, other, std::filesystem::copy_options::overwrite_existing);
+    {
+        std::ofstream tail(other, std::ios::app | std::ios::binary);
+        tail << std::string(64, '\0');
+    }
+    try {
+        locus::server::load_linear_head(
+            parse_guard_spec("kind=linear-head,model=" + head +
+                             ",embedding=" + other.string() +
+                             ",labels=INJECTION"),
+            nullptr);
+        FAIL("a mismatched embedding model must be refused");
+    } catch (const locus::gguf::Error& e) {
+        CHECK(std::string(e.what()).find("file size") != std::string::npos);
+    }
+    std::filesystem::remove(other);
+    // A head file is not an embedding model, nor the reverse.
+    CHECK_THROWS(locus::server::load_linear_head(
+        parse_guard_spec("kind=linear-head,model=" + emb + ",embedding=" +
+                         emb + ",labels=INJECTION"),
+        nullptr));
+    // A label the head lacks.
+    CHECK_THROWS_AS(locus::server::load_linear_head(
+                        parse_guard_spec("kind=linear-head,model=" + head +
+                                         ",embedding=" + emb +
+                                         ",labels=JAILBREAK"),
+                        nullptr),
+                    std::invalid_argument);
+}

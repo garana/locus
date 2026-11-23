@@ -295,7 +295,11 @@ for a DeBERTa classifier such as Prompt Guard (from
 with an optional threshold, 0.5 by default), or `kind=classifier` the
 same way for a BERT, XLM-R or nomic-bert sequence classifier (from
 `scripts/text/convert-bert-classifier.py`; a llama.cpp conversion of
-a BERT classifier lacks its pooler and is refused); `max_windows=`
+a BERT classifier lacks its pooler and is refused), or
+`kind=linear-head,model=HEAD,embedding=EMBED` for a linear head on an
+embedding model, trained from labeled examples by
+`scripts/text/train-linear-head.py` on vectors from `locus-embed` (the
+safe stand-in for a SetFit head, which is a pickle); `max_windows=`
 raises a classifier's window cap (64); they run in order and any one
 can reject. Guards run on the chat model's worker, between
 its steps; each llama-guard guard holds its own KV pool (`--ctx`,

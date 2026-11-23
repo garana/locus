@@ -175,4 +175,25 @@ std::unique_ptr<ClassifierGuard> load_prompt_guard(const GuardSpec& spec);
 std::unique_ptr<ClassifierGuard> load_encoder_classifier(
     const GuardSpec& spec, const backend::Ops* gpu);
 
+/**
+ * Loads a linear head on an embedding model (kind "linear-head",
+ * i#1160): the head GGUF (arch "linear-head", from
+ * scripts/text/train-linear-head.py) at spec.model, and the embedding
+ * GGUF at spec.embedding. Each window of a turn is embedded as
+ * EmbeddingModel::embed does (pooled, L2-normalized), and the head's
+ * logits are (W v + b) / temperature. The head names the embedding
+ * model it was trained on, and a mismatch is refused: its general.name
+ * (else file name), width, pooling and file size must match (the
+ * head's sha256 is information, not checked at every start).
+ *
+ * @param spec The guard's spec (head path, embedding path, labels).
+ * @param gpu GPU ops for large encoder passes, or null.
+ * @returns The guard.
+ * @throws gguf::Error when either GGUF is not such a model or they do
+ *     not match; std::invalid_argument as ClassifierGuard's
+ *     constructor.
+ */
+std::unique_ptr<ClassifierGuard> load_linear_head(const GuardSpec& spec,
+                                                  const backend::Ops* gpu);
+
 }  // namespace locus::server
