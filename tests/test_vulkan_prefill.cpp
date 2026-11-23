@@ -1267,3 +1267,35 @@ TEST_CASE("vulkan survives a scratch buffer that fails to grow",
     CHECK(run(longp).size() == nv);
     CHECK(run(shortp) == want);
 }
+
+// i#1164: a failed host-visible allocation names its size, memory
+// type and heap, and that heap's state, so a full suite's failure says
+// which memory ran out.
+TEST_CASE("a failed vulkan allocation names its heap", "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    // Past the host heaps of a test host but within a driver's largest
+    // buffer, so the allocation (not the buffer) is what fails; the
+    // first size the driver lets through to memory is used.
+    std::string msg;
+    for (const int shift : {36, 35, 34}) {  // 64, 32, 16 GB
+        try {
+            auto b = ctx.create_buffer(std::size_t{1} << shift);
+            ctx.destroy_buffer(b);
+        } catch (const std::exception& e) {
+            msg = e.what();
+            if (msg.find("allocate memory") != std::string::npos) break;
+        }
+    }
+    if (msg.find("allocate memory") == std::string::npos) {
+        // The driver refused every buffer itself, or fit them all.
+        SKIP("no allocation failure to read: " << msg);
+    }
+    INFO(msg);
+    CHECK(msg.find("host-visible") != std::string::npos);
+    CHECK(msg.find("type ") != std::string::npos);
+    CHECK(msg.find("heap ") != std::string::npos);
+    CHECK(msg.find("this context has") != std::string::npos);
+}
