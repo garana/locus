@@ -269,6 +269,11 @@ class TransformerModel {
      *  token at a time, so they match the per-token forward. */
     bool metal_forward_supported() const;
 
+    /** @returns Why metal_forward does not take this model on its
+     *  backend ("" when it does): the gate's first failing condition,
+     *  e.g. "qwen2vl's M-RoPE" (the boot line names it, i#867). */
+    std::string metal_forward_why_not() const;
+
     /**
      * Picks this model's backend and uses it (i#867). An explicit
      * choice (--backend, else LOCUS_BACKEND) is resolve_backend's. The
@@ -279,11 +284,17 @@ class TransformerModel {
      *
      * @param choice The --backend value, empty for none.
      * @param kv_type The KV cache type the model will run with.
+     * @param why Set, when not null, to why this backend: "--backend",
+     *     "LOCUS_BACKEND", or for the default what decided it, e.g.
+     *     "default; metal_forward takes this model", or "default;
+     *     metal_forward does not take this model: <reason>; metal would
+     *     be used if it did" (the boot line prints it).
      * @returns The backend picked.
      * @throws std::invalid_argument for an unknown or unusable choice.
      */
     const backend::Backend& use_backend_for(
-        std::string_view choice, kv::KvType kv_type = kv::KvType::kF32);
+        std::string_view choice, kv::KvType kv_type = kv::KvType::kF32,
+        std::string* why = nullptr);
 
     /** @returns The backend currently doing the math. */
     const backend::Backend& active_backend() const {

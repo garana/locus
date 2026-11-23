@@ -231,8 +231,12 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         auto g = locus::gguf::GgufFile::open(model_path);
         auto model = locus::model::TransformerModel::load(g);
         // On Apple the default follows the model (i#867).
+        std::string why;
         const auto& backend =
-            model.use_backend_for(args.choice, args.kv_type);
+            model.use_backend_for(args.choice, args.kv_type, &why);
+        // Which backend and why (i#867): the default's reason too.
+        std::fprintf(stderr, "locus-server: backend: %s (%s)\n",
+                     std::string(backend.name).c_str(), why.c_str());
         const std::string gpu_warn = locus::backend::gpu_idle_warning(
             locus::backend::backend_defaulted(args.choice), backend);
         locus::backend::vulkan_set_prefill_f16(args.prefill_f16);

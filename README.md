@@ -335,7 +335,10 @@ measurements behind each choice: [docs/HOSTS.md](docs/HOSTS.md).
 
 Without `--backend` or `LOCUS_BACKEND`, a Mac runs a model on metal
 when metal's whole-token forward takes it (and the KV cache is f32),
-else on vulkan where usable, else on neon (#867).
+else on vulkan where usable, else on neon (#867). locus-server and
+locus-run print the pick and why at start, e.g. `backend: vulkan
+(default; metal_forward does not take this model: qwen2vl's M-RoPE;
+metal would be used if it did)`, or `backend: neon (--backend)`.
 
 Every selectable backend must reproduce the golden outputs. A GPU does
 not always beat the CPU: on a tile GPU streaming a model larger than

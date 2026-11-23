@@ -684,7 +684,7 @@ struct BatchRec : MetalRec {
 
 }  // namespace
 
-bool TransformerModel::metal_forward_supported() const {
+std::string TransformerModel::metal_forward_why_not() const {
     using namespace backend;
     static const bool off = [] {
         const char* e = std::getenv("LOCUS_METAL_FORWARD");
@@ -694,27 +694,50 @@ bool TransformerModel::metal_forward_supported() const {
     // not qwen2vl's M-RoPE, whose text positions are not the
     // sequence's), or qwen3moe's (per-head q / k norm, NEOX RoPE).
     const bool qwen3 = spec_->name == "qwen3moe";
+    const std::string arch(spec_->name);
+    if (off) return "LOCUS_METAL_FORWARD=0";
+    if (backend_->name != "metal") return "the backend is not metal";
+    if (!Context::usable()) return "no usable Metal device";
     const bool attn_ok =
         spec_->plain_attention || qwen3 ||
         (spec_->qwen2_attention && hp_.rope_sections[0] == 0);
-    if (off || backend_->name != "metal" || !attn_ok ||
-        hp_.custom_layer || spec_->layer != nullptr ||
-        spec_->forward != nullptr || layer_begin_ != 0 ||
-        layer_end_ != hp_.n_layers || hp_.norm_type != NormType::kRmsNorm ||
-        hp_.embd_norm || hp_.n_kv_heads == 0 || out_w_.rows != hp_.n_vocab ||
-        hp_.head_dim % 4 != 0 || hp_.n_heads % hp_.n_kv_heads != 0 ||
-        !Context::usable()) {
-        return false;
+    if (!attn_ok) {
+        return spec_->qwen2_attention ? arch + "'s M-RoPE"
+                                      : arch + "'s attention";
     }
-    const auto ok_w = [](const Mat& m) {
-        return metal::matvec_shape_ok(m.type, m.cols);
+    if (hp_.custom_layer || spec_->layer != nullptr ||
+        spec_->forward != nullptr) {
+        return arch + "'s own layer or forward";
+    }
+    if (layer_begin_ != 0 || layer_end_ != hp_.n_layers) {
+        return "a pipeline stage's slice of the layers";
+    }
+    if (hp_.norm_type != NormType::kRmsNorm) return "a norm other than RMS";
+    if (hp_.embd_norm) return "a norm on the embeddings";
+    if (hp_.n_kv_heads == 0 || hp_.n_heads % hp_.n_kv_heads != 0) {
+        return "its head counts";
+    }
+    if (out_w_.rows != hp_.n_vocab) return "an output matrix not one row "
+                                           "a token";
+    if (hp_.head_dim % 4 != 0) return "a head width not a multiple of 4";
+    // A weight type or shape without a Metal kernel: the first found.
+    std::string bad;
+    const auto ok_w = [&](const Mat& m) {
+        if (metal::matvec_shape_ok(m.type, m.cols)) return true;
+        if (bad.empty()) {
+            bad = "weights of type " +
+                  std::string(gguf::tensor_type_name(m.type)) +
+                  " (no Metal kernel)";
+        }
+        return false;
     };
     // MoE (i#868): routed experts in the forward, routing on the CPU;
     // not the hybrid or another host's experts.
     if (moe_hybrid_on() || remote_experts_ != nullptr) {
         for (const Layer& lay : layers_) {
             if (lay.is_moe()) {
-                return false;
+                return moe_hybrid_on() ? "the MoE hybrid"
+                                       : "experts on another host";
             }
         }
     }
@@ -730,19 +753,27 @@ bool TransformerModel::metal_forward_supported() const {
                (lay.gate_inp_shexp.rows == 0 || ok_w(lay.gate_inp_shexp));
     };
     for (const Layer& lay : layers_) {
-        if (!lay.has_separate_qkv(hp_) ||
-            (lay.has_qkv_bias() && !spec_->qwen2_attention) ||
-            (lay.has_qk_norm() && !qwen3) ||
-            !lay.post_attn_norm.empty() || !lay.post_ffw_norm.empty() ||
-            !ok_w(lay.wq) || !ok_w(lay.wk) || !ok_w(lay.wv) || !ok_w(lay.wo) ||
-            !ok_moe(lay)) {
-            return false;
+        if (!lay.has_separate_qkv(hp_)) return "a fused q / k / v matrix";
+        if (lay.has_qkv_bias() && !spec_->qwen2_attention) {
+            return "q / k / v biases outside qwen2's attention";
+        }
+        if (lay.has_qk_norm() && !qwen3) {
+            return "q / k norms outside qwen3moe's attention";
+        }
+        if (!lay.post_attn_norm.empty() || !lay.post_ffw_norm.empty()) {
+            return "post-attention or post-FFN norms";
+        }
+        if (!ok_w(lay.wq) || !ok_w(lay.wk) || !ok_w(lay.wv) ||
+            !ok_w(lay.wo) || !ok_moe(lay)) {
+            return bad;
         }
     }
-    if (!ok_w(out_w_)) {
-        return false;
-    }
-    return true;
+    if (!ok_w(out_w_)) return bad;
+    return "";
+}
+
+bool TransformerModel::metal_forward_supported() const {
+    return metal_forward_why_not().empty();
 }
 
 std::uint32_t TransformerModel::metal_neox() const {

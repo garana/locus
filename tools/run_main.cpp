@@ -144,7 +144,9 @@ int main(int argc, char** argv) {
         auto g = locus::gguf::GgufFile::open(model_path);
         auto model = locus::model::TransformerModel::load(g);
         // On Apple the default follows the model (i#867).
-        const auto& backend = model.use_backend_for(args.choice, args.kv_type);
+        std::string why;
+        const auto& backend =
+            model.use_backend_for(args.choice, args.kv_type, &why);
         locus::backend::vulkan_set_prefill_f16(args.prefill_f16);
         auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
         auto& tok = *tok_ptr;
@@ -161,6 +163,8 @@ int main(int argc, char** argv) {
                          .c_str(),
                      be.c_str(), device.c_str(), hp.n_layers, hp.n_embd,
                      hp.n_heads, hp.n_kv_heads, hp.n_vocab);
+        // Which backend and why (i#867): the default's reason too.
+        std::fprintf(stderr, "backend: %s (%s)\n", be.c_str(), why.c_str());
         const std::string gpu_warn = locus::backend::gpu_idle_warning(
             locus::backend::backend_defaulted(args.choice), backend);
         if (!gpu_warn.empty()) {

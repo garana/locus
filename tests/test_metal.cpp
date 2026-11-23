@@ -1548,21 +1548,40 @@ TEST_CASE("the default backend follows metal_forward's gate",
     const auto img = qwen_tiny::lm("qwen2");
     const auto g = locus::gguf::GgufFile::parse(img);
     auto model = locus::model::TransformerModel::load(g);
-    // qwen2's attention is one metal_forward takes.
-    CHECK(model.use_backend_for("").name == (metal ? "metal" : best));
+    // qwen2's attention is one metal_forward takes. The boot line's
+    // reason comes with the pick.
+    std::string why;
+    CHECK(model.use_backend_for("", KvType::kF32, &why).name ==
+          (metal ? "metal" : best));
     CHECK(model.active_backend().name == (metal ? "metal" : best));
+    if (metal) {
+        CHECK(why == "default; metal_forward takes this model");
+    }
     // metal_forward declines a quantized cache.
-    CHECK(model.use_backend_for("", KvType::kQ8).name == best);
+    CHECK(model.use_backend_for("", KvType::kQ8, &why).name == best);
+    if (metal) {
+        CHECK(why == "default; metal_forward does not take this model: "
+                     "a q8 KV cache (metal_forward takes f32); metal would "
+                     "be used if it did");
+    }
     // An explicit choice wins.
     const char* cpu =
         locus::backend::find_backend("neon") != nullptr ? "neon" : "scalar";
-    CHECK(model.use_backend_for(cpu).name == cpu);
+    CHECK(model.use_backend_for(cpu, KvType::kF32, &why).name == cpu);
+    CHECK(why == "--backend");
 
-    // qwen2vl's M-RoPE is not one metal_forward takes.
+    // qwen2vl's M-RoPE is not one metal_forward takes, and the reason
+    // is the gate's own.
     const auto img_vl = qwen_tiny::lm("qwen2vl");
     const auto g_vl = locus::gguf::GgufFile::parse(img_vl);
     auto vl = locus::model::TransformerModel::load(g_vl);
-    CHECK(vl.use_backend_for("").name == best);
+    CHECK(vl.use_backend_for("", KvType::kF32, &why).name == best);
+    if (metal) {
+        CHECK(why.find("qwen2vl's M-RoPE") != std::string::npos);
+        vl.use_backend(*mt);
+        CHECK(vl.metal_forward_why_not() == "qwen2vl's M-RoPE");
+        CHECK_FALSE(vl.metal_forward_supported());
+    }
 }
 
 // i#1074: the prefill matmuls alone, at Llama 3.2 1B's layer shapes and
