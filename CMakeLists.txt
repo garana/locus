@@ -197,6 +197,8 @@ target_link_libraries(locus-auth-helper PRIVATE locus)
 
 add_executable(locus-prefix-helper tools/prefix_helper_main.cpp)
 target_link_libraries(locus-prefix-helper PRIVATE locus)
+add_executable(locus-prefix-clean tools/prefix_clean_main.cpp)
+target_link_libraries(locus-prefix-clean PRIVATE locus)
 
 add_executable(locus-stage tools/stage_main.cpp)
 target_link_libraries(locus-stage PRIVATE locus)

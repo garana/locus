@@ -105,7 +105,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   `locus-auth-helper` (a reference auth helper,
   see docs/CLIENTS.md); `locus-prefix-helper` (a reference prefix
   cache helper that keeps the blobs in a directory, see
-  docs/DESIGN.md).
+  docs/DESIGN.md); `locus-prefix-clean` (removes the disk prefix cache
+  files of other models, backends or builds, keeping those of the keys
+  the servers print at boot).
 
 ### Media: from what to what
 

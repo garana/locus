@@ -54,7 +54,8 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
     // The backend, and a digest of the sources that computed the KV:
     // another build's kernels or forward may sum in another order
     // (i#1180), and an entry without one (an older binary's) misses.
-    k.backend = std::string(m.active_backend().name) + ":" + kComputeDigest;
+    const std::string_view be = m.active_backend().name;
+    k.backend = std::string(be) + ":" + kComputeDigest;
 
     const auto& hp = m.hparams();
     std::uint64_t o = kFnvOffset;
@@ -75,12 +76,13 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
         const std::string s = v != nullptr ? std::string("=") + v : "";
         o = fnv(fnv(o, var, std::strlen(var)), s.data(), s.size());
     }
-    if (k.backend == "vulkan") {
+    // The backend's own name: k.backend carries the digest after it.
+    if (be == "vulkan") {
         o = fnv(o, backend::vulkan_prefill_f16());
         o = fnv(o, backend::vulkan_batch_invariant());
         const std::string dev = backend::vulkan_device_name();
         o = fnv(o, dev.data(), dev.size());
-    } else if (k.backend == "cuda") {
+    } else if (be == "cuda") {
         const std::string dev = backend::cuda_device_name();
         o = fnv(o, dev.data(), dev.size());
     }

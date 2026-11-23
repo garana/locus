@@ -775,7 +775,15 @@ guarding the default path.
   world-writable (else startup fails), and symlinks in it are never
   followed. With `--prefix-cache-key-file`, each file (or helper blob)
   also ends with an HMAC-SHA-256 of its bytes, so one written without
-  the key is a miss: for a store others can write (#830). Entries
+  the key is a miss: for a store others can write (#830). Files of
+  another key stay until the byte cap evicts them; the server prints
+  its key's hash at boot (`prefix cache key <16 hex>`, the checksum of
+  the key's header, which seeds every file name), and
+  `locus-prefix-clean --keep KEY [--keep KEY ...] DIR` removes every
+  file whose header hashes to none of them (one KEY for each server
+  that shares DIR; `--dry-run` lists them). It never follows a
+  symlink (DIR, an entry or a file), and leaves files whose header it
+  cannot parse alone (i#1180). Entries
   evicted from RAM are written back by a worker thread, and the rest
   at shutdown; a prompt whose prefix is at least one block longer on
   disk waits in a LOADING state while the worker reads it into its

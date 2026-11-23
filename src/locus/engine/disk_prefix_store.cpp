@@ -31,6 +31,14 @@ constexpr std::size_t kMaxBackend = 32;
 constexpr const char* kSuffix = ".lkv";
 constexpr const char* kTmpSuffix = ".tmp";
 
+// header()'s layout with no prompt: the magic, then u32 version,
+// n_tokens and n_blocks (n_tokens at 12, then n_blocks), and the rest
+// of the key up to the 32 backend bytes.
+constexpr std::size_t kNTokensAt = sizeof kMagic + 4;
+constexpr std::size_t kKeyHeaderBytes =
+    sizeof kMagic + 4 * 4 + 8 * 4 + 4 * 2 + 8 + 4 * 4 + 4 + kMaxBackend;
+constexpr std::size_t kBackendLenAt = kKeyHeaderBytes - kMaxBackend - 4;
+
 constexpr std::uint64_t kFnvPrime = 0x100000001b3ull;
 constexpr std::uint64_t kLanePrime = 0x9e3779b97f4a7c15ull;
 
@@ -256,6 +264,10 @@ std::vector<std::uint8_t> DiskPrefixStore::header(
     char backend[kMaxBackend] = {};
     std::memcpy(backend, key_.backend.data(), key_.backend.size());
     h.insert(h.end(), backend, backend + kMaxBackend);
+    if (h.size() != kKeyHeaderBytes) {
+        // disk_prefix_file_key reads this layout back.
+        throw std::logic_error("DiskPrefixStore: header layout changed");
+    }
     for (std::uint32_t i = 0; i < n_tokens; ++i) {
         put(h, prompt[i]);
     }
@@ -684,6 +696,93 @@ void DiskPrefixStore::set_experts_on_host_cpu(bool on) {
 std::uint64_t DiskPrefixStore::used_bytes() const {
     std::lock_guard lock(mu_);
     return used_;
+}
+
+std::uint64_t DiskPrefixStore::key_hash() const {
+    std::lock_guard lock(mu_);
+    return key_seed_;
+}
+
+std::optional<std::uint64_t> disk_prefix_file_key(const fs::path& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return std::nullopt;  // a symlink (ELOOP), or unreadable
+    }
+    std::uint8_t h[kKeyHeaderBytes];
+    struct stat st {};
+    const bool ok = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+                    pread_full(fd, h, sizeof h, 0);
+    ::close(fd);
+    if (!ok || std::memcmp(h, kMagic, sizeof kMagic) != 0) {
+        return std::nullopt;
+    }
+    std::uint32_t version, backend_len;
+    std::memcpy(&version, h + sizeof kMagic, 4);
+    std::memcpy(&backend_len, h + kBackendLenAt, 4);
+    if (version != DiskPrefixStore::kFormatVersion ||
+        backend_len > kMaxBackend) {
+        return std::nullopt;
+    }
+    // The key's header is the file's with no prompt: zero tokens and
+    // blocks (the prompt's tokens follow these bytes).
+    std::memset(h + kNTokensAt, 0, 8);
+    return checksum(h, sizeof h);
+}
+
+PrefixCleanResult clean_disk_prefix(const fs::path& dir,
+                                    std::span<const std::uint64_t> keep,
+                                    bool dry_run,
+                                    std::vector<fs::path>* removed_paths) {
+    if (keep.empty()) {
+        throw std::invalid_argument(
+            "clean_disk_prefix: no key to keep (that would remove every "
+            "file)");
+    }
+    struct stat st {};
+    if (::lstat(dir.c_str(), &st) != 0) {
+        throw std::runtime_error(dir.string() + ": " +
+                                 std::strerror(errno));
+    }
+    if (S_ISLNK(st.st_mode)) {
+        throw std::runtime_error(dir.string() +
+                                 ": a symlink; give the directory itself");
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        throw std::runtime_error(dir.string() + ": not a directory");
+    }
+    if (st.st_uid != ::geteuid()) {
+        throw std::runtime_error(dir.string() +
+                                 ": owned by another user");
+    }
+    PrefixCleanResult r;
+    for (const fs::directory_entry& e : fs::directory_iterator(dir)) {
+        std::error_code ec;
+        std::uint64_t digest;
+        if (!fs::is_regular_file(e.symlink_status(ec)) ||
+            !parse_name(e.path().filename().string(), digest)) {
+            continue;  // not a store file (or a symlink to one)
+        }
+        const std::optional<std::uint64_t> k = disk_prefix_file_key(e.path());
+        if (!k) {
+            ++r.skipped;
+            continue;
+        }
+        if (std::find(keep.begin(), keep.end(), *k) != keep.end()) {
+            ++r.kept;
+            continue;
+        }
+        const std::uint64_t bytes = e.file_size(ec);
+        // remove() unlinks the name: had it become a symlink since, the
+        // link goes, never its target.
+        if (dry_run || fs::remove(e.path(), ec)) {
+            ++r.removed;
+            r.removed_bytes += ec ? 0 : bytes;
+            if (removed_paths != nullptr) {
+                removed_paths->push_back(e.path());
+            }
+        }
+    }
+    return r;
 }
 
 }  // namespace locus::engine
