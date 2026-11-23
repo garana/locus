@@ -31,8 +31,15 @@ Match rule: Apple GPU family apple8 (M2). Measured on an M2 Pro: arm64
 with neon, dotprod and i8mm; 32 GB unified memory; macOS. Vulkan runs
 on MoltenVK.
 
-Recommended: `--backend metal` for text. Images and video take the
-GPU through Vulkan by themselves.
+Recommended: `--backend metal` for text, the default since #1042
+(metal for the models its forward takes, else vulkan). Images and
+video take the GPU through Vulkan by themselves. Several concurrent
+clients get more total throughput with `--backend vulkan` until
+#1184: locus-server, Llama 1B Q8_0, 128 tokens streamed, one request
+111.4 tok/s on Metal and 98.7 on Vulkan (a 1820-token prompt's first
+token 1.13 s against 2.44 s), but 4 clients 108.4 tok/s in all on
+Metal against 171.2 on Vulkan, since Metal decodes the sequences one
+at a time.
 
 | workload                         | command                        | locus Metal     | locus Vulkan | llama.cpp Metal                 | source       |
 |----------------------------------|--------------------------------|-----------------|--------------|---------------------------------|--------------|
@@ -57,8 +64,10 @@ memory. Measured on an M4 Max: 14 CPU cores (10 performance, 4
 efficiency), 32 GPU cores; arm64 with neon, dotprod and i8mm; 36 GB;
 macOS.
 
-Recommended: `--backend metal` for text: it leads Vulkan on every
-prefill and on most decode rows. On the decode of Orpheus and
+Recommended: `--backend metal` for text, the default since #1042: it
+leads Vulkan on every prefill and on most decode rows. As on the M2
+Pro, several concurrent clients do better on `--backend vulkan` until
+#1184 (Metal decodes the sequences one at a time). On the decode of Orpheus and
 Qwen3-Coder the two are within 1%.
 
 | workload, model                    | locus Metal | locus Vulkan | llama.cpp Metal | source |
