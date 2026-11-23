@@ -248,6 +248,11 @@ bool TransformerModel::experts_on_gpu() const {
            backend::vulkan_moe_gpu_route(*this);
 }
 
+bool TransformerModel::experts_on_host_cpu() const {
+    return hp_.n_expert > 0 && backend_->name == "vulkan" &&
+           backend::vulkan_moe_host_cpu_picks(*this);
+}
+
 bool TransformerModel::q8k_activations_for(const backend::Backend* b) const {
     if (q8k_override_ >= 0) {
         return q8k_override_ == 1;

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <string_view>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -559,6 +560,34 @@ TEST_CASE("the engine keys the disk prefix store on the vulkan expert "
     const auto id = engine.submit({3, 7, 1}, 2);
     engine.run_to_completion();
     REQUIRE(engine.get(id)->generated.size() == 2);
+    REQUIRE_FALSE(store->key().experts_on_host_cpu);
+
+    // i#1179: experts that do not fit route on the host and run their
+    // picks on the CPU (i#1174); the key says so, apart from GPU picks.
+    locus::backend::vulkan_moe_misfit_for_test(true);
+    struct Off {
+        ~Off() { locus::backend::vulkan_moe_misfit_for_test(false); }
+    } off;
+    auto store2 = locus::engine::open_disk_prefix(
+        (base / "kv2").string(), 1 << 20, g, path, model,
+        locus::kv::KvType::kF32);
+    locus::engine::Engine::Config cfg2;
+    cfg2.disk_prefix = store2;
+    locus::engine::Engine engine2(
+        model, static_cast<locus::tok::TokenId>(-1), cfg2);
+    REQUIRE_FALSE(store2->key().experts_on_gpu);
+    REQUIRE(store2->key().experts_on_host_cpu ==
+            model.experts_on_host_cpu());
+    const char* host_experts = std::getenv("LOCUS_VK_HOST_EXPERTS");
+    if (std::getenv("LOCUS_VK_CPU_ROUTE") == nullptr &&
+        std::getenv("LOCUS_GPU_POOL_MB") == nullptr &&
+        !locus::model::MoeStats::enabled() &&
+        (host_experts == nullptr || std::string_view(host_experts) != "0")) {
+        REQUIRE(store2->key().experts_on_host_cpu);
+    }
+    const auto id2 = engine2.submit({3, 7, 1}, 2);
+    engine2.run_to_completion();
+    REQUIRE(engine2.get(id2)->generated.size() == 2);
 }
 
 TEST_CASE("the disk prefix tier takes a cuda MoE model with the hybrid "

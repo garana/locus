@@ -315,6 +315,14 @@ class TransformerModel {
     bool experts_on_gpu() const;
 
     /**
+     * Settles, like experts_on_gpu, whether some MoE layer routes on
+     * the host with its picks on the CPU (Vulkan, experts that do not
+     * fit the device, i#1174); the disk prefix key holds it (i#1179).
+     * @returns false for a dense model or another backend.
+     */
+    bool experts_on_host_cpu() const;
+
+    /**
      * @returns Whether the MoE hybrid (hot experts on the GPU, the rest
      *     on the CPU) runs for this model: moe_hybrid() is set up
      *     (moe_hybrid_wanted() on the first call's backend, i#652). The

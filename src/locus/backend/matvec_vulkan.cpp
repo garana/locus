@@ -2702,6 +2702,20 @@ bool vulkan_moe_gpu_route(const model::TransformerModel& m) {
     return any;
 }
 
+bool vulkan_moe_host_cpu_picks(const model::TransformerModel& m) {
+    if (m.hparams().n_expert == 0 || !vulkan_backend_usable()) {
+        return false;
+    }
+    std::lock_guard lk(state_mu());
+    State& s = state();
+    for (const auto& lay : m.layers()) {
+        if (lay.is_moe() && !gpu_route_ok(s, m, lay) && host_experts(s, m)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool vulkan_forward_layers(const model::TransformerModel& m,
                            tok::TokenId token,
                            std::span<const float> hidden_in,

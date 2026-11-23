@@ -46,6 +46,12 @@ struct DiskKey {
      *  free device memory once the KV pool exists, so the engine sets
      *  it (DiskPrefixStore::set_experts_on_gpu). */
     bool experts_on_gpu = false;
+    /** Routed on the host, the picks ran on the CPU, not uploaded to
+     *  the GPU (Vulkan, experts that do not fit, i#1174): other K/V
+     *  bits again. The header stores the route as 0 (host, GPU picks:
+     *  all a binary before i#1174 wrote), 1 (GPU) or 2 (host, CPU
+     *  picks), so older files keep their meaning (i#1179). */
+    bool experts_on_host_cpu = false;
 };
 
 /**
@@ -152,6 +158,9 @@ class DiskPrefixStore {
     void set_device_attention(bool on);
     /** Sets DiskKey::experts_on_gpu, as set_device_attention does. */
     void set_experts_on_gpu(bool on);
+    /** Sets DiskKey::experts_on_host_cpu, as set_device_attention
+     *  does. */
+    void set_experts_on_host_cpu(bool on);
     /**
      * Ends every file with an HMAC-SHA-256 of its bytes under `key`
      * (i#830), so a file that someone without the key planted or

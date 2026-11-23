@@ -759,8 +759,9 @@ guarding the default path.
   wrong prefix. A disk tier (`--prefix-cache-dir`, i#416) keeps one
   file per prefix with the full key (the model's GGUF header, size and
   mtime, the backend and device, the KV geometry, RoPE settings and
-  the numeric modes that change KV bits, and on Vulkan whether the MoE
-  experts run on the GPU, settled once the KV pool exists; a model with
+  the numeric modes that change KV bits, and on Vulkan where the MoE
+  experts run: routed on the GPU, or on the host with the picks on the
+  GPU or on the CPU (i#1179), settled once the KV pool exists; a model with
   the MoE hybrid on is refused, since its hot set follows the requests
   served before), the tokens and a checksum per block, so a mismatch
   or a torn file reads as a miss; a byte cap evicts the least recently
