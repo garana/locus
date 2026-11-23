@@ -998,9 +998,10 @@ kernel void attn_merge(device const float* part_out [[buffer(0)]],
 // for Q4_K W rows and f32 token rows of X and Y. A threadgroup of 128
 // (4 simdgroups) takes 64 weight rows x 32 tokens and walks k in stages
 // of 32 (one sub-block): the threads dequantize the weight tile and
-// stage the activations in threadgroup memory (float), then each
-// simdgroup runs a 32 x 16 piece as eight 8 x 8 simdgroup_matrix tiles.
-// Rows and tokens past the matrix load as zero and are not stored.
+// stage it with the activations in threadgroup memory (float, as whole
+// 8 x 8 blocks), then each simdgroup runs a 32 x 16 piece as eight
+// 8 x 8 simdgroup_matrix tiles (mm_tile). Rows and tokens past the
+// matrix load as zero and are not stored.
 
 
 struct MmBlockQ4K {
@@ -1028,14 +1029,10 @@ struct MmParams {
 constant constexpr uint kMmTM = 64;
 constant constexpr uint kMmTN = 32;
 constant constexpr uint kMmTK = 32;
-constant constexpr uint kMmPA = kMmTK + 8;
-constant constexpr uint kMmPO = kMmTM + 4;
-// B staged as [k][token] (tokens padded), so its blocks load straight.
-constant constexpr uint kMmPBT = kMmTN + 4;
-// The output tile reuses A's threadgroup memory after the K loop: a
-// threadgroup then holds 15 KB, not 24, so more fit a core at once
-// (i#1063: +14 to 16% on the prefill).
-static_assert(kMmTN * kMmPO <= kMmTM * kMmPA, "mm_tile: so fits in sa");
+// A threadgroup holds A (8 KB) and B (4 KB); the output tile, when it
+// is staged, reuses A's memory after the K loop, so more threadgroups
+// fit a core at once (i#1063).
+static_assert(kMmTN * kMmTM <= kMmTM * kMmTK, "mm_tile: so fits in sa");
 
 // Sub-block j's 6-bit scale and min (ggml's get_scale_min_k4).
 inline void mm_scale_min(uint j, device const uchar* q, thread uint& sc,
@@ -1049,13 +1046,13 @@ inline void mm_scale_min(uint j, device const uchar* q, thread uint& sc,
     }
 }
 
-// The weight loaders: each fills da[0 .. 16) with the dequantized
-// weights k0 + ah .. k0 + ah + 15 of a row (ah 0 or 16; a k stage of
-// 32 lies in one sub-block or block), and gives a row's bytes.
+// The weight loaders: each fills the thread array da[0 .. 16) with the
+// dequantized weights k0 + ah .. k0 + ah + 15 of a row (ah 0 or 16; a k
+// stage of 32 lies in one sub-block or block), and gives a row's bytes.
 struct MmLoadQ4K {
     static ulong row_bytes(uint cols) { return ulong(cols / 256) * 144; }
     static void load(device const uchar* row, uint k0, uint ah,
-                     threadgroup float* da) {
+                     thread float* da) {
         device const MmBlockQ4K& blk =
             ((device const MmBlockQ4K*)row)[k0 / 256];
         const uint j = (k0 % 256) / 32;
@@ -1082,7 +1079,7 @@ struct MmLoadQ6K {
     // Stage k0 is quarter qq of half hn of its block: l = ah + i (the
     // layout as mv_q6_k; 210-byte blocks, read bytewise).
     static void load(device const uchar* row, uint k0, uint ah,
-                     threadgroup float* da) {
+                     thread float* da) {
         device const uchar* blk = row + (k0 / 256) * 210;
         const uint e0 = k0 % 256, hn = e0 / 128, qq = (e0 % 128) / 32;
         device const uchar* ql = blk + 64 * hn + 32 * (qq & 1) + ah;
@@ -1105,7 +1102,7 @@ struct MmLoadQ8_0 {
     static ulong row_bytes(uint cols) { return ulong(cols / 32) * 34; }
     // Stage k0 is block k0 / 32: d, then 32 int8.
     static void load(device const uchar* row, uint k0, uint ah,
-                     threadgroup float* da) {
+                     thread float* da) {
         device const uchar* blk = row + (k0 / 32) * 34;
         const float d = f16_at(blk);
         device const char* qv = (device const char*)(blk + 2) + ah;
@@ -1120,7 +1117,7 @@ struct MmLoadQ8_0 {
 struct MmLoadQ4_0 {
     static ulong row_bytes(uint cols) { return ulong(cols / 32) * 18; }
     static void load(device const uchar* row, uint k0, uint ah,
-                     threadgroup float* da) {
+                     thread float* da) {
         device const uchar* blk = row + (k0 / 32) * 18;
         const float d = f16_at(blk);
         device const uchar* q = blk + 2;
@@ -1136,7 +1133,7 @@ struct MmLoadQ4_0 {
 struct MmLoadQ5_0 {
     static ulong row_bytes(uint cols) { return ulong(cols / 32) * 22; }
     static void load(device const uchar* row, uint k0, uint ah,
-                     threadgroup float* da) {
+                     thread float* da) {
         device const uchar* blk = row + (k0 / 32) * 22;
         const float d = f16_at(blk);
         const uint qh = uint(blk[2]) | (uint(blk[3]) << 8) |
@@ -1155,7 +1152,7 @@ struct MmLoadQ5_0 {
 struct MmLoadF32 {
     static ulong row_bytes(uint cols) { return ulong(cols) * 4; }
     static void load(device const uchar* row, uint k0, uint ah,
-                     threadgroup float* da) {
+                     thread float* da) {
         device const float* v = (device const float*)row + k0 + ah;
         for (uint i = 0; i < 16; ++i) {
             da[i] = v[i];
@@ -1166,7 +1163,7 @@ struct MmLoadF32 {
 struct MmLoadF16 {
     static ulong row_bytes(uint cols) { return ulong(cols) * 2; }
     static void load(device const uchar* row, uint k0, uint ah,
-                     threadgroup float* da) {
+                     thread float* da) {
         device const half* v = (device const half*)row + k0 + ah;
         for (uint i = 0; i < 16; ++i) {
             da[i] = float(v[i]);
@@ -1177,7 +1174,7 @@ struct MmLoadF16 {
 struct MmLoadBF16 {
     static ulong row_bytes(uint cols) { return ulong(cols) * 2; }
     static void load(device const uchar* row, uint k0, uint ah,
-                     threadgroup float* da) {
+                     thread float* da) {
         device const ushort* v = (device const ushort*)row + k0 + ah;
         for (uint i = 0; i < 16; ++i) {
             da[i] = as_type<float>(uint(v[i]) << 16);
@@ -1214,14 +1211,34 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
         perm = idx + tile[1];
         n0 = 0;
     }
-    const uint rm = (sg & 1) * 32;
-    const uint rn = (sg >> 1) * 16;
-    simdgroup_float8x8 acc[4][2];
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 2; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
+    // The tile is computed transposed, C = X W^T as [token][row] 8 x 8
+    // blocks, so it lands in the output's own layout (i#1074, as
+    // llama.cpp's kernel_mul_mm). A and B are staged as whole 8 x 8
+    // blocks, 64 contiguous floats each, so each simdgroup_load reads
+    // one run: A (64 rows x 32 k) as [k][row] blocks, block (kb, rb) at
+    // sa + 64 (8 kb + rb); B (32 tokens x 32 k) as [token][k] blocks,
+    // block (kb, tb) at sb + 64 (4 kb + tb). Simdgroup sg takes rows
+    // 32 (sg & 1) .. + 32 and tokens 16 (sg >> 1) .. + 16: mc[i] is
+    // token block i / 4 and row block i % 4 of that.
+    const bool full = m0 + kMmTM <= p.rows && n0 + kMmTN <= n_tok;
+    // A full tile goes to the output directly; adding to it starts the
+    // sums from what is there. Others (a partial tile, a scale, routed
+    // rows) are staged and stored element by element.
+    const bool direct = !G && full && p.scale == 1.0f;
+    device float* yt = y + ulong(n0 + 16 * (sg >> 1)) * p.out_stride + m0 +
+                       32 * (sg & 1);
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8; ++i) {
+        if (direct && p.accumulate != 0) {
+            simdgroup_load(mc[i], yt + 8 * (i % 4) + 8 * p.out_stride * (i / 4),
+                           p.out_stride);
+        } else {
+            mc[i] = simdgroup_float8x8(0.0f);
+        }
+    }
 
-    // Loaders: A, row tid / 2, 16 elements at (tid & 1) * 16; B, token
-    // tid / 4, 8 elements at (tid & 3) * 8.
+    // Loaders: A, row tid / 2, 16 k at (tid & 1) * 16; B, token tid / 4,
+    // 8 k at (tid & 3) * 8.
     const uint ar = tid >> 1;
     const uint ah = (tid & 1) * 16;
     const uint bt = tid >> 2;
@@ -1232,49 +1249,71 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
         w + (a_in ? ulong(m0 + ar) * L::row_bytes(p.cols) : 0);
     const uint xr = !b_in ? 0 : G ? perm[bt] / p.slot_div : n0 + bt;
     device const float* xrow = x + ulong(xr) * p.x_stride;
+    // Where this thread's values go: A's k = ah + i is row ar of block
+    // (ah / 8 + i / 8, ar / 8) at [k % 8][ar % 8]; B's 8 k are row bt % 8
+    // of block (bk / 8, bt / 8).
+    threadgroup float* da = sa + 64 * (8 * (ah / 8) + ar / 8) + ar % 8;
+    threadgroup float* db = sb + 64 * (4 * (bk / 8) + bt / 8) + 8 * (bt % 8);
+    threadgroup const float* lsa0 = sa + 4 * 64 * (sg & 1);
+    threadgroup const float* lsb0 = sb + 2 * 64 * (sg >> 1);
 
     for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
-        threadgroup float* da = sa + ar * kMmPA + ah;
+        float va[16];
         if (a_in) {
-            L::load(wrow, k0, ah, da);
+            L::load(wrow, k0, ah, va);
         } else {
-            for (uint i = 0; i < 16; ++i) da[i] = 0.0f;
+            for (uint i = 0; i < 16; ++i) va[i] = 0.0f;
         }
-        threadgroup float* db = sb + bk * kMmPBT + bt;
+        float4 vb0 = float4(0.0f), vb1 = float4(0.0f);
         if (b_in) {
-            device const float* src = xrow + k0 + bk;
-            for (uint i = 0; i < 8; ++i) db[i * kMmPBT] = src[i];
-        } else {
-            for (uint i = 0; i < 8; ++i) db[i * kMmPBT] = 0.0f;
+            // packed: a token row's offset need not be 16-byte aligned.
+            device const packed_float4* src =
+                (device const packed_float4*)(xrow + k0 + bk);
+            vb0 = float4(src[0]);
+            vb1 = float4(src[1]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < kMmTK; kk += 8) {
-            simdgroup_float8x8 a[4], bm[2];
-            for (uint i = 0; i < 4; ++i)
-                simdgroup_load(a[i], sa + (rm + 8 * i) * kMmPA + kk, kMmPA);
-            // B is k x tokens, staged that way.
-            for (uint j = 0; j < 2; ++j)
-                simdgroup_load(bm[j], sb + kk * kMmPBT + rn + 8 * j, kMmPBT);
-            for (uint i = 0; i < 4; ++i)
-                for (uint j = 0; j < 2; ++j)
-                    simdgroup_multiply_accumulate(acc[i][j], a[i], bm[j],
-                                                  acc[i][j]);
-        }
+        for (uint i = 0; i < 8; ++i) da[8 * i] = va[i];
+        for (uint i = 0; i < 8; ++i) da[64 * 8 + 8 * i] = va[8 + i];
+        ((threadgroup float4*)db)[0] = vb0;
+        ((threadgroup float4*)db)[1] = vb1;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const float* lsa = lsa0;
+        threadgroup const float* lsb = lsb0;
+        for (uint kk = 0; kk < kMmTK / 8; ++kk) {
+            simdgroup_float8x8 ma[4], mb[2];
+            for (uint i = 0; i < 4; ++i) simdgroup_load(ma[i], lsa + 64 * i, 8);
+            for (uint i = 0; i < 2; ++i) simdgroup_load(mb[i], lsb + 64 * i, 8);
+            for (uint i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4],
+                                              mc[i]);
+            }
+            lsa += 8 * 64;
+            lsb += 4 * 64;
+        }
     }
-    // The tile as [token][row] in threadgroup memory, then each thread
-    // stores its share inside the matrix.
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 2; ++j)
-            simdgroup_store(acc[i][j], so + (rn + 8 * j) * kMmPO + rm + 8 * i,
-                            kMmPO, ulong2(0, 0), true);
+    if (direct) {
+        for (uint i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i],
+                            yt + 8 * (i % 4) + 8 * p.out_stride * (i / 4),
+                            p.out_stride);
+        }
+        return;
+    }
+    // The tile as [token][row] (stride kMmTM) in threadgroup memory,
+    // then each thread stores its share inside the matrix.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* st = so + 16 * (sg >> 1) * kMmTM + 32 * (sg & 1);
+    for (uint i = 0; i < 8; ++i) {
+        simdgroup_store(mc[i], st + 8 * (i % 4) + 8 * kMmTM * (i / 4), kMmTM);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < kMmTM * kMmTN; e += 128) {
         const uint t = e / kMmTM, r = e % kMmTM;
         if (n0 + t < n_tok && m0 + r < p.rows) {
             const uint orow = G ? perm[t] : n0 + t;
             device float* o = y + ulong(orow) * p.out_stride + m0 + r;
-            const float v = p.scale * so[t * kMmPO + r];
+            const float v = p.scale * so[t * kMmTM + r];
             *o = p.accumulate != 0 ? *o + v : v;
         }
     }
@@ -1288,8 +1327,8 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
                      uint tgi [[threadgroup_position_in_grid]],         \
                      uint tid [[thread_index_in_threadgroup]],          \
                      uint sg [[simdgroup_index_in_threadgroup]]) {      \
-        threadgroup float sa[kMmTM * kMmPA];                            \
-        threadgroup float sb[kMmTK * kMmPBT];                           \
+        threadgroup float sa[kMmTM * kMmTK];                            \
+        threadgroup float sb[kMmTN * kMmTK];                            \
         threadgroup float* so = sa;                                     \
         mm_tile<loader, false>(wbase, xbase, ybase, p, tgi, tid, sg,    \
                                sa, sb, so, nullptr);                    \
@@ -1302,8 +1341,8 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
                           uint tgi [[threadgroup_position_in_grid]],    \
                           uint tid [[thread_index_in_threadgroup]],     \
                           uint sg [[simdgroup_index_in_threadgroup]]) { \
-        threadgroup float sa[kMmTM * kMmPA];                            \
-        threadgroup float sb[kMmTK * kMmPBT];                           \
+        threadgroup float sa[kMmTM * kMmTK];                            \
+        threadgroup float sb[kMmTN * kMmTK];                            \
         threadgroup float* so = sa;                                     \
         mm_tile<loader, true>(wbase, xbase, ybase, p, tgi, tid, sg, sa, \
                               sb, so, idx);                             \
