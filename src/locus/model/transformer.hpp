@@ -374,6 +374,22 @@ class TransformerModel {
                     Workspace& ws) const;
 
     /**
+     * expert_out on backend `b`'s ops instead of the model's, with the
+     * caller's scratch: a GPU forward that routes on the host computes
+     * the picks on the CPU this way (i#1174).
+     *
+     * @param b The backend whose matvecs run (a CPU one).
+     * @param gate Scratch, at least n_ff_exp floats.
+     * @param up Scratch, at least n_ff_exp floats.
+     * @param d Output, n_embd floats.
+     * @throws std::out_of_range for a layer or expert the model lacks.
+     */
+    void expert_out_on(const backend::Backend& b, std::uint32_t layer,
+                       std::uint32_t expert, std::span<const float> xb,
+                       std::span<float> gate, std::span<float> up,
+                       std::span<float> d) const;
+
+    /**
      * Sends the experts `r` names to other hosts from the per-token
      * moe_ffn, whatever its backend's ops; null computes them all here.
      * Not owned; it must outlive the forwards that use it. The batched

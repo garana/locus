@@ -397,6 +397,13 @@ std::size_t vulkan_kv_pool_count();
 void vulkan_fail_allocations_for_test(int n);
 
 /**
+ * Test seam (i#1174): while on, the calling thread's device finds that
+ * no model's MoE experts fit, so they route on the host (and run on
+ * the CPU, as on a small GPU); setting it drops the cached verdicts.
+ */
+void vulkan_moe_misfit_for_test(bool on);
+
+/**
  * Frees the process-lifetime Vulkan backend state: the weight pool
  * buffers and activation scratch; the GPU-mapped KV pools stay with
  * their caches, which free them (i#428). TEST
