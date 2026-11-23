@@ -659,7 +659,7 @@ TEST_CASE("metal tiled and simdgroup-matrix attention match attn_rows",
     std::mt19937 rng(23);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     // Head widths 32 (64-position chunks before the cap), 64 and 128;
-    // queries off the 8- and 32-query tiles (and past one 32-query
+    // queries off the 8- and 64-query tiles (and past one 64-query
     // block); a base so chunks span blocks.
     for (const auto& [hd, m] :
          {std::pair<std::uint32_t, std::uint32_t>{32, 21}, {64, 21},
@@ -701,8 +701,9 @@ TEST_CASE("metal tiled and simdgroup-matrix attention match attn_rows",
         ctx.dispatch("attn_rows_tiled", a2, params, ((m + 7) / 8) * H * 256,
                      256);
         const Context::Arg a3[] = {{&qb, 0}, {&pb, 0}, {&bb, 0}, {&o3, 0}};
-        ctx.dispatch("attn_rows_mma", a3, params, ((m + 31) / 32) * H * 128,
-                     128);
+        // 64 queries of a head a threadgroup (8 simdgroups).
+        ctx.dispatch("attn_rows_mma", a3, params, ((m + 63) / 64) * H * 256,
+                     256);
         const auto* r = static_cast<const float*>(o1.data);
         const auto* t = static_cast<const float*>(o2.data);
         const auto* u = static_cast<const float*>(o3.data);

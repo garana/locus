@@ -1923,6 +1923,9 @@ inline void attn_mma(thread const S& src, uint g, uint sg,
     }
 }
 
+// Simdgroups (8 queries each) a threadgroup of attn_rows_mma: each staged
+// K / V chunk serves 8 * kAttnRowsSg queries (i#1074).
+constant constexpr uint kAttnRowsSg = 8;
 kernel void attn_rows_mma(device const float* q [[buffer(0)]],
                           device const float* pool [[buffer(1)]],
                           device const uint* blocks [[buffer(2)]],
@@ -1932,10 +1935,10 @@ kernel void attn_rows_mma(device const float* q [[buffer(0)]],
                           uint sg [[simdgroup_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float kv[kFaC * 128];
-    threadgroup float spall[4 * 8 * kFaC];
-    threadgroup float dgall[4 * 64];
+    threadgroup float spall[kAttnRowsSg * 8 * kFaC];
+    threadgroup float dgall[kAttnRowsSg * 64];
     const MmaPaged src{q, pool, blocks, out, &pr};
-    attn_mma<MmaPaged, 4>(src, g, sg, lane, kv, spall, dgall);
+    attn_mma<MmaPaged, kAttnRowsSg>(src, g, sg, lane, kv, spall, dgall);
 }
 
 // Unmasked attention of n_q query rows over n_kv key / value rows (the
