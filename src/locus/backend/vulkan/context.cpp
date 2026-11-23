@@ -2265,6 +2265,10 @@ bool VulkanContext::device_local_weights() const {
     return impl_->split_memory;
 }
 
+bool VulkanContext::device_local(Buffer b) const {
+    return static_cast<const Impl::HostBuffer*>(b.impl)->local;
+}
+
 bool VulkanContext::timestamps() const {
     return impl_->qpool != VK_NULL_HANDLE;
 }
@@ -2828,6 +2832,7 @@ VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
 }
 bool VulkanContext::host_import() const { no_kernels(); }
 bool VulkanContext::device_local_weights() const { no_kernels(); }
+bool VulkanContext::device_local(Buffer) const { no_kernels(); }
 bool VulkanContext::moltenvk() const { no_kernels(); }
 bool VulkanContext::timestamps() const { no_kernels(); }
 void VulkanContext::destroy_buffer(Buffer) { no_kernels(); }

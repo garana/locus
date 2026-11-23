@@ -514,6 +514,13 @@ class VulkanContext {
     bool device_local_weights() const;
 
     /**
+     * @returns Whether `b` lives in device-local memory; false for a
+     *     weights buffer that fell back to mappable (pinned system)
+     *     memory because the device heap was full (i#1164).
+     */
+    bool device_local(Buffer b) const;
+
+    /**
      * @returns Whether batches can carry GPU timestamps (device time):
      *     every batch under LOCUS_VK_PROFILE, else about 1 in 16.
      */

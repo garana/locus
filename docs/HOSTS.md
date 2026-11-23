@@ -88,7 +88,7 @@ Qwen3-Coder the two are within 1%.
 
 Match rule: x86-64 with SSE4.1 and AVX, no AVX2 and no FMA; an NVIDIA
 GPU of compute capability 5.0. Measured on an Intel Core i5-2400
-(Sandy Bridge, 4 cores), 31 GB RAM without ECC, and a GTX 750 Ti (2
+(Sandy Bridge, 4 cores), 16 GB RAM without ECC, and a GTX 750 Ti (2
 GB; driver 580.178.04, CUDA 12.6); Ubuntu 24.04, GCC 13.
 
 Automatic: the CPU backend `sse4` (its AVX build). locus does not move
@@ -116,6 +116,12 @@ CPU default for larger ones.
   at 1.1, all page faults.
 - llama.cpp here is a CPU build (commit e8e6c7a, 4 threads), so the
   CUDA rows compare with locus's own CPU.
+- Vulkan on this card has 2 GB of device memory and no host import:
+  an MoE whose experts do not fit routes on the host and uploads the
+  picked experts each token. The weight pool keeps at most 4 GB (a
+  quarter of RAM) of them in pinned system memory (i#1164); before,
+  they piled up until a pin failed. Qwen1.5-MoE Q4_K_M decodes there
+  at 0.3 tok/s against 4.2 on the CPU: use the CPU for it.
 
 ## Raspberry Pi 5
 
