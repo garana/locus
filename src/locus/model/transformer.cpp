@@ -2490,6 +2490,34 @@ void TransformerModel::expert_out(std::uint32_t layer, std::uint32_t expert,
                   hp_.n_ff_exp, xb, ws.gate, ws.up, d);
 }
 
+void TransformerModel::expert_out_on(const backend::Backend& b,
+                                     std::uint32_t layer,
+                                     std::uint32_t expert,
+                                     std::span<const float> xb,
+                                     std::span<float> gate,
+                                     std::span<float> up,
+                                     std::span<float> d) const {
+    if (layer < layer_begin_ || layer >= layer_end_ ||
+        layers_[layer].gate_exps.base.rows == 0) {
+        throw std::out_of_range("expert_out_on: no MoE layer " +
+                                std::to_string(layer));
+    }
+    if (expert >= hp_.n_expert) {
+        throw std::out_of_range("expert_out_on: no expert " +
+                                std::to_string(expert));
+    }
+    if (xb.size() != hp_.n_embd || d.size() != hp_.n_embd ||
+        gate.size() < hp_.n_ff_exp || up.size() < hp_.n_ff_exp) {
+        throw std::invalid_argument(
+            "expert_out_on: xb and d take n_embd, gate and up n_ff_exp");
+    }
+    const Layer& lay = layers_[layer];
+    const backend::Ops op = effective_ops(&b, q8k_activations_for(&b));
+    swiglu_expert(op, lay.gate_exps.expert(expert),
+                  lay.up_exps.expert(expert), lay.down_exps.expert(expert),
+                  hp_.n_ff_exp, xb, gate, up, d);
+}
+
 void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
                          std::uint32_t layer) const {
     using namespace locus::backend;

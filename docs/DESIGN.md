@@ -416,6 +416,17 @@ cache policies (LRU, LFU, Belady, step WLRU, static top) for a given
 GPU budget. On Vulkan both variables route MoE layers on the host, so
 the picks reach the CPU.
 
+On Vulkan, when the experts do not fit the device (over 80% of its
+available memory), each MoE layer routes on the host and the CPU runs
+the picks from the file map, adding them into the residual stream it
+read back; attention, the dense layers and the shared experts stay on
+the GPU (i#1174). Uploading the picks each token instead
+(`LOCUS_VK_HOST_EXPERTS=0`) costs PCIe bandwidth for nothing:
+Qwen1.5-MoE on a 2 GB GTX 750 Ti decodes at 0.1 tok/s that way and
+3.9 with the CPU picks. Routed on the host for another reason (no
+batched kernel, a bias the GPU router lacks), the experts fit and
+still run on the GPU.
+
 On a cold spinning disk, GLM-5.2 runs faster end to end than a
 CPU-only llama.cpp (50.7 versus 92 minutes for 16 tokens), because
 locus streams lazily instead of loading the whole model first. Major
@@ -1053,7 +1064,8 @@ guarding the default path.
   routed expert run: `device` is `gpu` or `cpu`, `api` is `cuda`,
   `vulkan`, `moltenvk` or the CPU kernel set (`neon`, `avx2`, `sse4`,
   `scalar`). Vulkan's GPU-routed MoE layers keep the picks on the
-  device and are not counted.
+  device and are not counted; picks its host-routed layers run on the
+  CPU count as `cpu` with the CPU kernel set.
 - KV-cache quantization: Q8 or Q4 blocks of 32 (f16 scale) in a
   separate byte pool, for the llama-family attention. Each layer's
   past rows are dequantized into scratch, so the attention math is the

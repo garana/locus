@@ -16,6 +16,7 @@
 #include "locus/backend/fallbacks.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/model/expert_metrics.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
@@ -420,6 +421,52 @@ TEST_CASE("kolibri1 matches the reference graph", "[model][kolibri1]") {
                           want[p].begin());
             }
         }
+    }
+}
+
+// i#1174: on a GPU too small for the experts, Vulkan routes them on the
+// host and runs the picks on the CPU (no upload); the logits still
+// match the reference graph, and the calls count as the CPU's.
+TEST_CASE("kolibri1 on Vulkan with its experts on the CPU matches the "
+          "reference graph",
+          "[model][kolibri1][vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    const std::vector<int> toks = {3, 17, 9, 30, 1, 22, 5, 14, 27, 8};
+    const auto ts = make_tensors();
+    const auto want = Reference(ts, true).run(toks);
+    auto img = build_image(ts, true);
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+    locus::backend::vulkan_moe_misfit_for_test(true);
+    struct Off {
+        ~Off() { locus::backend::vulkan_moe_misfit_for_test(false); }
+    } off;
+    REQUIRE_FALSE(locus::backend::vulkan_moe_gpu_route(model));
+    locus::model::ExpertCalls::reset();
+    const std::uint64_t fb0 = vulkan_fallbacks();
+    const auto got = run(model, toks);
+    CHECK(vulkan_fallbacks() > fb0);  // the host route was taken
+    std::uint64_t cpu = 0, gpu = 0;
+    for (const auto& s : locus::model::ExpertCalls::snapshot()) {
+        (s.device == "cpu" ? cpu : gpu) += s.calls;
+    }
+    CHECK(cpu > 0);
+    CHECK(gpu == 0);
+    for (std::size_t p = 0; p < toks.size(); ++p) {
+        INFO("position " << p);
+        double err = 0.0, ref = 0.0;
+        for (std::uint32_t i = 0; i < kV; ++i) {
+            err = std::max(err, std::abs(got[p][i] - want[p][i]));
+            ref = std::max(ref, std::abs(want[p][i]));
+        }
+        CHECK(err <= 1e-3 * ref);
+        CHECK(std::max_element(got[p].begin(), got[p].end()) -
+                  got[p].begin() ==
+              std::max_element(want[p].begin(), want[p].end()) -
+                  want[p].begin());
     }
 }
 

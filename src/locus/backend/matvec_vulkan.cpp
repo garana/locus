@@ -261,6 +261,8 @@ struct State {
     bool prefill_f16 = false;
     /** Per-model GPU-routing verdict (memory fit), decided once. */
     std::unordered_map<const void*, bool> moe_gpu_fits;
+    /** vulkan_moe_misfit_for_test: every model's experts misfit. */
+    bool moe_misfit_for_test = false;
 
     explicit State(int d) : ctx(d), device(d) {
         pool.create = [this](std::size_t n) {
@@ -1991,6 +1993,13 @@ void vulkan_fail_allocations_for_test(int n) {
     state().ctx.fail_allocations_for_test(n);
 }
 
+void vulkan_moe_misfit_for_test(bool on) {
+    std::lock_guard lk(state_mu());
+    State& s = state();
+    s.moe_misfit_for_test = on;
+    s.moe_gpu_fits.clear();
+}
+
 void vulkan_free_kv(float* pool) {
     if (pool == nullptr) {
         return;
@@ -2559,7 +2568,9 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
         const std::uint64_t experts = copied + imported;
         const std::uint64_t avail = s.ctx.memory_available();
         fit = s.moe_gpu_fits
-                  .emplace(&m, vk::moe_experts_fit(copied, imported, avail))
+                  .emplace(&m, !s.moe_misfit_for_test &&
+                                   vk::moe_experts_fit(copied, imported,
+                                                       avail))
                   .first;
         if (!fit->second) {
             std::fprintf(stderr,
@@ -2572,6 +2583,37 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
         }
     }
     return fit->second;
+}
+
+/** @returns Whether the host-routed decode computes the picked experts
+ *  on the CPU (i#1174): gpu_route_ok found that they do not fit the
+ *  device, and LOCUS_VK_HOST_EXPERTS is not "0". Experts routed on the
+ *  host for another reason (no batched kernel, a bias the GPU router
+ *  lacks) fit, and still run on the GPU. */
+bool host_experts(const State& s, const model::TransformerModel& m) {
+    static const bool off = [] {
+        const char* e = std::getenv("LOCUS_VK_HOST_EXPERTS");
+        return e != nullptr && std::string_view(e) == "0";
+    }();
+    if (off) {
+        return false;
+    }
+    const auto fit = s.moe_gpu_fits.find(&m);
+    return fit != s.moe_gpu_fits.end() && !fit->second;
+}
+
+/** @returns The CPU backend host_experts' picks run on: the best CPU
+ *  variant (registry order puts every CPU one before the GPUs), or
+ *  scalar when that one cannot run beside the GPU forward. */
+const backend::Backend& host_cpu_backend() {
+    static const backend::Backend* const b = [] {
+        const backend::Backend* best = &backend::best_backend();
+        if (best->ops.self_parallel || !best->ops.mt_safe) {
+            best = backend::find_backend("scalar");
+        }
+        return best;
+    }();
+    return *b;
 }
 
 /** @returns true when every layer has the attention shape the GPU
@@ -3544,9 +3586,34 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                                             hp.n_expert);
                 }
             }
+            // The experts do not fit the device (i#1174): compute the
+            // picks on the CPU too, from the mapped file, and add them
+            // into x here; uploading them each token is the slow part
+            // (Qwen1.5-MoE on a 2 GB GTX 750 Ti: 0.3 tok/s against 4.2
+            // on the CPU). LOCUS_VK_HOST_EXPERTS=0 keeps the uploads.
+            const bool cpu_experts = host_experts(s, m);
             for (const auto& [e, wgt] : picked) {
-                model::ExpertCalls::record(l, e, hp.n_layers, hp.n_expert,
-                                           true, vulkan_api_name());
+                model::ExpertCalls::record(
+                    l, e, hp.n_layers, hp.n_expert, !cpu_experts,
+                    cpu_experts ? host_cpu_backend().name
+                                : vulkan_api_name());
+            }
+            if (cpu_experts) {
+                const backend::Backend& cpu = host_cpu_backend();
+                std::vector<float> x_host(hp.n_embd), d(hp.n_embd),
+                    g(hp.n_ff_exp), u(hp.n_ff_exp);
+                s.ctx.read_buffer(s.x, std::as_writable_bytes(
+                                           std::span<float>(x_host)));
+                const std::span<const float> xb(xb_host.data(), hp.n_embd);
+                // In moe_select order, x += wgt * d, as moe_ffn adds.
+                for (const auto& [e, wgt] : picked) {
+                    m.expert_out_on(cpu, l, e, xb, g, u, d);
+                    for (std::uint32_t i = 0; i < hp.n_embd; ++i) {
+                        x_host[i] += wgt * d[i];
+                    }
+                }
+                s.ctx.write_buffer(s.x, std::as_bytes(
+                                            std::span<const float>(x_host)));
             }
             s.ctx.begin_batch();
             // Upload only the ROUTED experts, each to its own
@@ -3563,6 +3630,9 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                     return s.upload_rows(m.data, m, em.expert_bytes);
                 };
             for (const auto& [e, wgt] : picked) {
+                if (cpu_experts) {
+                    break;  // added into x above
+                }
                 VulkanContext::Buffer bg =
                     up_expert(lay.gate_exps, e);
                 VulkanContext::Buffer bu =

@@ -117,11 +117,11 @@ CPU default for larger ones.
 - llama.cpp here is a CPU build (commit e8e6c7a, 4 threads), so the
   CUDA rows compare with locus's own CPU.
 - Vulkan on this card has 2 GB of device memory and no host import:
-  an MoE whose experts do not fit routes on the host and uploads the
-  picked experts each token. The weight pool keeps at most 4 GB (a
-  quarter of RAM) of them in pinned system memory (i#1164); before,
-  they piled up until a pin failed. Qwen1.5-MoE Q4_K_M decodes there
-  at 0.3 tok/s against 4.2 on the CPU: use the CPU for it.
+  an MoE whose experts do not fit routes on the host and runs the
+  picked experts on the CPU (i#1174), the rest on the GPU. Qwen1.5-MoE
+  Q4_K_M, 48 tokens, page cache warm: decode 3.9 tok/s, against 2.6
+  on the CPU backend and 0.1 when the picks were uploaded each token
+  (`LOCUS_VK_HOST_EXPERTS=0` still does that).
 
 ## Raspberry Pi 5
 
