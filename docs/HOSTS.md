@@ -65,10 +65,26 @@ efficiency), 32 GPU cores; arm64 with neon, dotprod and i8mm; 36 GB;
 macOS.
 
 Recommended: `--backend metal` for text, the default since #1042: it
-leads Vulkan on every prefill and on most decode rows. As on the M2
-Pro, several concurrent clients do better on `--backend vulkan` until
-#1184 (Metal decodes the sequences one at a time). On the decode of Orpheus and
-Qwen3-Coder the two are within 1%.
+leads Vulkan on every prefill and on most decode rows. On the decode
+of Orpheus and Qwen3-Coder the two are within 1%. Concurrent clients
+decode together since #1184; locus-server, Llama 1B, 128 tokens a
+client, tok/s in all:
+
+| model  | clients | Metal before #1184 | Metal | Metal, invariant off | Vulkan |
+|--------|---------|--------------------|-------|----------------------|--------|
+| Q8_0   | 1       | 214.8              | 208.0 | 213.9                | 208.0  |
+| Q8_0   | 4       | 207.8              | 503.7 | 517.5                | 434.3  |
+| Q8_0   | 8       | 203.7              | 530.7 | 545.5                | 431.1  |
+| Q4_K_M | 1       | 282.3              | 280.2 | 280.4                | 284.4  |
+| Q4_K_M | 4       | 274.4              | 373.5 | 379.3                | 403.5  |
+| Q4_K_M | 8       | 267.0              | 392.7 | 398.2                | 415.1  |
+
+A Q4_K_M model with several clients still does 5 to 7% better on
+`--backend vulkan` (Metal has no Q4_K columns kernel yet). The
+batch-invariant mode (the default: a request decodes to the same bits
+alone or batched) costs a lone sequence about 2%;
+`LOCUS_METAL_BATCH_INVARIANT=0` takes it back for a single-user
+server.
 
 | workload, model                    | locus Metal | locus Vulkan | llama.cpp Metal | source |
 |------------------------------------|-------------|--------------|-----------------|--------|

@@ -686,6 +686,36 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   make 140, 155 and 166 tok/s in all, against 102 one forward per
   sequence (M2 Pro: 46.5, 43.2 and 45.8 against 41.5), and 3 and 4
   sequences 147 -> 154 and 156 -> 162 tok/s with the NT 4 builds.
+  On Metal it runs `metal_forward_multi` on groups of up to 8
+  sequences (#1184; dense models, as `metal_forward` takes them; a MoE
+  model runs one forward per sequence), one command batch for the
+  whole step: each matrix is read once for all the rows where its type
+  has a columns kernel (Q8_0, `mv_q8_0_cols{2,4}`, 5 to 8 columns as
+  two dispatches; with the RMSNorm folded in as a prologue), and the
+  others run one matvec a row. Each sequence takes its own RoPE
+  position, K / V rows (written straight into its blocks when alone,
+  else copied by `kv_scatter`) and attention. A column's sum runs in
+  the same order whatever the column count, so a sequence's bits do
+  not depend on the batch. Batch-invariant mode is on by default
+  (`LOCUS_METAL_BATCH_INVARIANT=0` or
+  `backend::metal::set_batch_invariant` turns it off): a lone sequence
+  takes `metal_forward_multi` too, as do `forward()`, a whole-model
+  `forward_layers` and `forward_batch`'s chunks too short for the
+  prefill, so a request's logits are bit-identical alone and batched
+  (and the disk prefix key records the mode). Off, a lone sequence
+  takes `metal_forward` (RoPE in its matvecs' epilogue, and the F32
+  norm fold), 2% faster. Llama 3.2 1B on an M4 Max, decode tok/s in
+  all:
+
+| model  | sequences | one forward a sequence | metal_forward_multi |
+|--------|-----------|------------------------|---------------------|
+| Q8_0   | 1         | 224.9                  | 220.3               |
+| Q8_0   | 4         | 225.7                  | 696.3               |
+| Q8_0   | 8         | 224.4                  | 784.1               |
+| Q4_K_M | 1         | 302.5                  | 296.2               |
+| Q4_K_M | 4         | 302.5                  | 449.4               |
+| Q4_K_M | 8         | 301.9                  | 494.2               |
+
 - Prompt ingestion is batched by default (`--no-batch-prefill` turns
   it off). Vulkan has its own chunked prefill, `vulkan_forward_batch`
   (chunks of up to 512 tokens, 2048 for MoE; token-exact, not

@@ -1461,6 +1461,13 @@ TEST_CASE("metal decode norm fold tracks the unfolded decode", "[metal]") {
             }
         }
     } guard;
+    // metal_forward's fold: with the batch-invariant mode on, forward()
+    // takes metal_forward_multi, whose fold "metal decode over several
+    // sequences tracks one at a time" covers.
+    struct Mode {
+        Mode() { locus::backend::metal::set_batch_invariant(false); }
+        ~Mode() { locus::backend::metal::reset_batch_invariant(); }
+    } const mode;
     auto g = locus::gguf::GgufFile::open(path);
     auto model = locus::model::TransformerModel::load(g);
     model.use_backend(*locus::backend::find_backend("metal"));
@@ -1634,5 +1641,349 @@ TEST_CASE("bench: metal prefill matmuls at Llama 1B's shapes",
                                   << " ms, 16 layers " << 16 * total * 1e3
                                   << " ms, " << flops / total / 1e12
                                   << " TFLOP/s");
+    }
+}
+
+// i#1184: for N sequences' decode, one matmul over N rows (each weight
+// read once) against N matvecs, at Llama 1B's shapes.
+TEST_CASE("bench: metal matmul against matvecs for a few rows",
+          "[.bench][metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    Context& ctx = Context::get();
+    for (const TensorType ty : {TensorType::kQ8_0, TensorType::kQ4_K}) {
+        for (const auto& [rows, cols] :
+             {std::pair<std::uint32_t, std::uint32_t>{2048, 2048},
+              {8192, 2048}, {2048, 8192}}) {
+            const auto w = random_weights(ty, rows, cols, rows);
+            Context::Buffer wb = ctx.upload(w);
+            std::vector<float> x(std::size_t{8} * cols, 0.25f);
+            Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
+            std::vector<float> o(std::size_t{8} * rows);
+            Context::Buffer ob = ctx.upload(std::as_bytes(std::span(o)));
+            for (const std::uint32_t n : {1u, 2u, 4u, 8u}) {
+                // 50 of each in one command batch, as a forward runs.
+                const auto time = [&](auto&& f) {
+                    std::lock_guard lk(mb::device_mutex());
+                    ctx.begin_batch();
+                    f();
+                    ctx.end_batch();
+                    const auto t0 = std::chrono::steady_clock::now();
+                    ctx.begin_batch();
+                    for (int i = 0; i < 50; ++i) f();
+                    ctx.end_batch();
+                    return std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count() /
+                           50 * 1e6;
+                };
+                const double mm = time([&] {
+                    REQUIRE(mb::record_matmul(ctx, ty, rows, cols, n, wb, 0,
+                                              xb, 0, cols, ob, 0, rows,
+                                              false));
+                });
+                const double cols_us = time([&] {
+                    if (!mb::record_matvec_cols(ctx, ty, rows, cols, wb, 0,
+                                                xb, 0, cols, ob, 0, rows, n,
+                                                false)) {
+                        for (std::uint32_t t = 0; t < n; ++t) {
+                            mb::record_matvec(ctx, ty, rows, cols, wb, 0,
+                                              xb, t * cols, ob,
+                                              std::uint64_t{t} * rows,
+                                              false);
+                        }
+                    }
+                });
+                const double mv = time([&] {
+                    for (std::uint32_t t = 0; t < n; ++t) {
+                        mb::record_matvec(ctx, ty, rows, cols, wb, 0, xb,
+                                          t * cols, ob,
+                                          std::uint64_t{t} * rows, false);
+                    }
+                });
+                WARN(static_cast<int>(ty) << " " << rows << "x" << cols
+                                          << " n=" << n << ": matmul " << mm
+                                          << " us, matvecs " << mv
+                                          << " us, cols " << cols_us
+                                          << " us");
+            }
+            ctx.free(wb);
+            ctx.free(xb);
+            ctx.free(ob);
+        }
+    }
+}
+
+// i#1184: a matvec over several activation columns gives, for each
+// column, what its own matvec gives (within rounding: the lanes split
+// the blocks differently), for every column count up to 8, rows off
+// the kernel's 32-row groups, strided columns and accumulate.
+TEST_CASE("metal matvec over columns matches a matvec a column",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    Context& ctx = Context::get();
+    std::mt19937 rng(1184);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const TensorType ty : {TensorType::kQ8_0}) {
+        for (const auto& [rows, cols] :
+             {std::pair<std::uint32_t, std::uint32_t>{37, 256},
+              {200, 1024}, {1027, 2048}}) {
+            const auto w = random_weights(ty, rows, cols, rows);
+            Context::Buffer wb = ctx.upload(w);
+            const std::uint32_t xs = cols + 8, os = rows + 4;
+            std::vector<float> x(std::size_t{8} * xs), init(8 * os);
+            for (auto& v : x) v = dist(rng);
+            for (auto& v : init) v = dist(rng);
+            Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
+            for (std::uint32_t n = 1; n <= 8; ++n) {
+                for (const bool acc : {false, true}) {
+                    CAPTURE(rows, cols, n, acc);
+                    Context::Buffer o1 =
+                        ctx.upload(std::as_bytes(std::span(init)));
+                    Context::Buffer o2 =
+                        ctx.upload(std::as_bytes(std::span(init)));
+                    {
+                        std::lock_guard lk(mb::device_mutex());
+                        REQUIRE(mb::record_matvec_cols(ctx, ty, rows, cols,
+                                                       wb, 0, xb, 0, xs, o1,
+                                                       0, os, n, acc));
+                        for (std::uint32_t c = 0; c < n; ++c) {
+                            mb::record_matvec(ctx, ty, rows, cols, wb, 0, xb,
+                                              c * xs, o2,
+                                              std::uint64_t{c} * os, acc);
+                        }
+                    }
+                    const auto* a = static_cast<const float*>(o1.data);
+                    const auto* b = static_cast<const float*>(o2.data);
+                    for (std::uint32_t c = 0; c < 8; ++c) {
+                        for (std::uint32_t r = 0; r < os; ++r) {
+                            const std::size_t i = std::size_t{c} * os + r;
+                            if (c < n && r < rows) {
+                                REQUIRE(a[i] == Catch::Approx(b[i])
+                                                    .margin(1e-4)
+                                                    .epsilon(1e-5));
+                            } else {
+                                // Other columns and the stride's padding
+                                // are untouched.
+                                REQUIRE(a[i] == init[i]);
+                            }
+                        }
+                    }
+                    ctx.free(o1);
+                    ctx.free(o2);
+                }
+            }
+            ctx.free(wb);
+            ctx.free(xb);
+        }
+    }
+}
+
+// i#1184: forward_batch_decode on Metal runs up to 8 sequences through
+// one forward (each matrix read once for all of them); a sequence's
+// logits track its own metal_forward, at its own length (one past 512
+// tokens, so its attention is the split one), and the KV it wrote
+// serves the next step. A MoE model keeps a forward a sequence. With
+// the batch-invariant mode off, so the reference is metal_forward
+// (on, a lone sequence takes the batched forward too:
+// test_batch_invariance.cpp).
+TEST_CASE("metal decode over several sequences tracks one at a time",
+          "[metal][e2e]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    using locus::kv::PagedKvCache;
+    struct Mode {
+        Mode() { locus::backend::metal::set_batch_invariant(false); }
+        ~Mode() { locus::backend::metal::reset_batch_invariant(); }
+    } const mode;
+    int ran = 0;
+    for (const char* name :
+         {"llama-3.2-1b-q8_0.gguf", "llama-3.2-1b-q4_k_m.gguf",
+          "qwen2.5-0.5b-instruct-q8_0.gguf",
+          "Qwen1.5-MoE-A2.7B.Q4_K_M.gguf"}) {
+        const std::string path =
+            std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
+        if (!std::filesystem::exists(path)) {
+            WARN(path << " absent: skipped");
+            continue;
+        }
+        ++ran;
+        CAPTURE(name);
+        auto g = locus::gguf::GgufFile::open(path);
+        auto model = locus::model::TransformerModel::load(g);
+        model.use_backend(*locus::backend::find_backend("metal"));
+        const bool moe = model.hparams().n_expert > 0;
+        const auto tok = locus::tok::tokenizer_from_gguf(g);
+        const std::uint32_t nv = model.hparams().n_vocab;
+        std::string long_text;
+        for (int i = 0; i < 60; ++i) {
+            long_text += "The quick brown fox jumps over the lazy dog. ";
+        }
+        const std::vector<std::string> texts{
+            "Hello", "Once upon a time, in a land far away,", long_text,
+            "def fib(n):\n    return", "The capital of France is",
+            "1, 2, 3, 4, 5,", "Water boils at", "Roses are red,"};
+        for (const std::size_t n : {std::size_t{3}, std::size_t{8}}) {
+            CAPTURE(n);
+            // Each sequence prefilled, then two decode steps of one
+            // forward a sequence, each fed its own argmax.
+            const auto run = [&] {
+                auto cache = model.make_cache();
+                auto ws = model.make_workspace();
+                std::vector<PagedKvCache::Seq> seqs(n);
+                std::vector<PagedKvCache::Seq*> ptrs;
+                std::vector<locus::tok::TokenId> next(n);
+                std::vector<float> lg(nv);
+                for (std::size_t c = 0; c < n; ++c) {
+                    const auto ids = tok->encode(texts[c], true);
+                    REQUIRE(cache.ensure_capacity(
+                        seqs[c], static_cast<std::uint32_t>(ids.size()) + 2));
+                    model.forward_batch(ids, cache, seqs[c], ws, lg);
+                    next[c] = locus::model::argmax(std::span<const float>(lg));
+                    ptrs.push_back(&seqs[c]);
+                }
+                std::vector<std::vector<float>> steps;
+                for (int step = 0; step < 2; ++step) {
+                    std::vector<float> out(n * nv);
+                    for (std::size_t c = 0; c < n; ++c) {
+                        model.forward(next[c], cache, seqs[c], ws,
+                                      {out.data() + c * nv, nv});
+                    }
+                    steps.push_back(out);
+                    for (std::size_t c = 0; c < n; ++c) {
+                        next[c] = locus::model::argmax(std::span<const float>(
+                            out.data() + c * nv, nv));
+                    }
+                }
+                for (auto& sq : seqs) {
+                    cache.release(sq);
+                }
+                return steps;
+            };
+            const auto one = run();
+            const std::uint64_t before =
+                locus::model::TransformerModel::metal_multi_tokens();
+            // The batched run feeds the tokens the first run chose: its
+            // first step from the prefill (same in both), its second
+            // from the first run's step-1 argmax.
+            const auto batched = [&] {
+                auto cache = model.make_cache();
+                auto ws = model.make_workspace();
+                std::vector<PagedKvCache::Seq> seqs(n);
+                std::vector<PagedKvCache::Seq*> ptrs;
+                std::vector<locus::tok::TokenId> next(n);
+                std::vector<float> lg(nv);
+                for (std::size_t c = 0; c < n; ++c) {
+                    const auto ids = tok->encode(texts[c], true);
+                    REQUIRE(cache.ensure_capacity(
+                        seqs[c], static_cast<std::uint32_t>(ids.size()) + 2));
+                    model.forward_batch(ids, cache, seqs[c], ws, lg);
+                    next[c] = locus::model::argmax(std::span<const float>(lg));
+                    ptrs.push_back(&seqs[c]);
+                }
+                std::vector<std::vector<float>> steps;
+                for (int step = 0; step < 2; ++step) {
+                    std::vector<float> out(n * nv);
+                    model.forward_batch_decode(next, cache, ptrs, ws, out);
+                    steps.push_back(out);
+                    for (std::size_t c = 0; c < n; ++c) {
+                        next[c] = locus::model::argmax(std::span<const float>(
+                            one[0].data() + c * nv, nv));
+                    }
+                }
+                for (std::size_t c = 0; c < n; ++c) {
+                    REQUIRE(seqs[c].n_tokens ==
+                            tok->encode(texts[c], true).size() + 2);
+                    cache.release(seqs[c]);
+                }
+                return steps;
+            }();
+            const std::uint64_t multi =
+                locus::model::TransformerModel::metal_multi_tokens() - before;
+            CHECK(multi == (moe ? 0 : 2 * n));
+            for (int step = 0; step < 2; ++step) {
+                for (std::size_t c = 0; c < n; ++c) {
+                    CAPTURE(step, c);
+                    const std::span<const float> a(
+                        batched[step].data() + c * nv, nv);
+                    const std::span<const float> b(
+                        one[step].data() + c * nv, nv);
+                    CHECK(locus::model::argmax(a) ==
+                          locus::model::argmax(b));
+                    float worst = 0.0f, scale = 0.0f;
+                    for (std::size_t r = 0; r < nv; ++r) {
+                        worst = std::max(worst, std::abs(a[r] - b[r]));
+                        scale = std::max(scale, std::abs(b[r]));
+                    }
+                    CHECK(worst <= 0.01f * scale);
+                }
+            }
+        }
+    }
+    if (ran == 0) {
+        SKIP("no test models");
+    }
+}
+
+// i#1184: decode tokens / s over N sequences, one forward for all
+// against one a sequence (LOCUS_METAL_MULTI=0). Hidden: a benchmark.
+TEST_CASE("bench: metal decode over several sequences", "[.bench][metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    using locus::kv::PagedKvCache;
+    for (const char* name :
+         {"llama-3.2-1b-q8_0.gguf", "llama-3.2-1b-q4_k_m.gguf"}) {
+        const std::string path =
+            std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
+        if (!std::filesystem::exists(path)) {
+            continue;
+        }
+        auto g = locus::gguf::GgufFile::open(path);
+        auto model = locus::model::TransformerModel::load(g);
+        model.use_backend(*locus::backend::find_backend("metal"));
+        const std::uint32_t nv = model.hparams().n_vocab;
+        const std::vector<locus::tok::TokenId> prompt(128, 791);
+        constexpr int kSteps = 64;
+        for (const std::size_t n :
+             {std::size_t{1}, std::size_t{4}, std::size_t{8}}) {
+            for (const bool multi : {false, true}) {
+                if (!multi) {
+                    setenv("LOCUS_METAL_MULTI", "0", 1);
+                }
+                auto cache = model.make_cache();
+                auto ws = model.make_workspace();
+                std::vector<PagedKvCache::Seq> seqs(n);
+                std::vector<PagedKvCache::Seq*> ptrs;
+                std::vector<float> lg(nv), out(n * nv);
+                for (auto& sq : seqs) {
+                    REQUIRE(cache.ensure_capacity(sq, 128 + kSteps + 8));
+                    model.forward_batch(prompt, cache, sq, ws, lg);
+                    ptrs.push_back(&sq);
+                }
+                std::vector<locus::tok::TokenId> next(n, 791);
+                model.forward_batch_decode(next, cache, ptrs, ws, out);
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int s = 0; s < kSteps; ++s) {
+                    model.forward_batch_decode(next, cache, ptrs, ws, out);
+                }
+                const double sec = std::chrono::duration<double>(
+                                       std::chrono::steady_clock::now() - t0)
+                                       .count();
+                unsetenv("LOCUS_METAL_MULTI");
+                std::printf("%s n=%zu %s: %.1f tok/s (%.2f ms a step)\n",
+                            name, n, multi ? "multi" : "one a seq",
+                            n * kSteps / sec, 1e3 * sec / kSteps);
+                for (auto& sq : seqs) {
+                    cache.release(sq);
+                }
+            }
+        }
     }
 }

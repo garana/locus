@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/engine/compute_digest.hpp"
 
@@ -82,6 +83,10 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
         o = fnv(o, backend::vulkan_batch_invariant());
         const std::string dev = backend::vulkan_device_name();
         o = fnv(o, dev.data(), dev.size());
+    } else if (be == "metal") {
+        // Batch-invariant decode: a lone sequence's K / V from
+        // metal_forward_multi, not metal_forward (i#1184).
+        o = fnv(o, backend::metal::batch_invariant());
     } else if (be == "cuda") {
         const std::string dev = backend::cuda_device_name();
         o = fnv(o, dev.data(), dev.size());

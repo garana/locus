@@ -15,6 +15,10 @@
 #include "locus/backend/registry.hpp"
 #include "locus/sys/mmap_file.hpp"
 
+#include <atomic>
+#include <cstdlib>
+#include <string_view>
+
 namespace locus::backend::metal {
 
 namespace {
@@ -274,6 +278,72 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint64_t out_off, bool accumulate) {
     record_mv(ctx, t, rows, cols, w, w_off, 0, nullptr, 0, x, x_off, out,
               out_off, accumulate);
+}
+
+bool record_matvec_cols(Context& ctx, gguf::TensorType t,
+                        std::uint32_t rows, std::uint32_t cols,
+                        const Context::Buffer& w, std::uint64_t w_off,
+                        const Context::Buffer& x, std::uint32_t x_off,
+                        std::uint32_t x_stride, const Context::Buffer& out,
+                        std::uint64_t out_off, std::uint32_t out_stride,
+                        std::uint32_t n, bool accumulate,
+                        const Context::Buffer* norm_w, float eps) {
+    // Q8_0 only for now: a first Q4_K form (mv_q4_k's layout) was no
+    // faster than its matvecs (i#1184).
+    if (t != TensorType::kQ8_0 || n == 0 || n > 8 || cols % 32 != 0 ||
+        x_off % 4 != 0 || x_stride % 4 != 0) {
+        return false;
+    }
+    if (n > 4) {
+        // Two dispatches of up to 4 columns, overlapping (different
+        // columns): mv_q8_0_cols8 holds 8 columns of sums a lane and
+        // ran 8 sequences at 639 tok/s against 707 this way (Llama 1B
+        // Q8_0, M4 Max; i#1184).
+        record_matvec_cols(ctx, t, rows, cols, w, w_off, x, x_off,
+                           x_stride, out, out_off, out_stride, 4,
+                           accumulate, norm_w, eps);
+        ctx.overlap_next();
+        return record_matvec_cols(ctx, t, rows, cols, w, w_off, x,
+                                  x_off + 4 * x_stride, x_stride, out,
+                                  out_off + std::uint64_t{4} * out_stride,
+                                  out_stride, n - 4, accumulate, norm_w,
+                                  eps);
+    }
+    const MvParams p{w_off,  out_off,    0,          rows,
+                     cols,   accumulate ? 1u : 0u,  x_off,
+                     1.0f,   kNoRoute,   n,          x_stride,
+                     out_stride, 1,      0,          eps};
+    const Context::Arg args[] = {{&w, 0},
+                                 {&x, 0},
+                                 {&out, 0},
+                                 {norm_w != nullptr ? norm_w : &x, 0, 9}};
+    const std::string size =
+        std::string(n <= 2 ? "2" : "4") + (norm_w != nullptr ? "_pn" : "");
+    // 32 rows (8 groups of 16 lanes, 4 rows a lane) a threadgroup.
+    const std::uint32_t groups = (rows + 31) / 32;
+    ctx.dispatch((std::string("mv_q8_0_cols") + size).c_str(), args,
+                 std::as_bytes(std::span(&p, 1)), groups * 128, 128);
+    return true;
+}
+
+namespace {
+
+// -1: unset (the environment or the default); 0 / 1: set.
+std::atomic<int> g_batch_invariant{-1};
+
+}  // namespace
+
+void set_batch_invariant(bool on) { g_batch_invariant.store(on ? 1 : 0); }
+
+void reset_batch_invariant() { g_batch_invariant.store(-1); }
+
+bool batch_invariant() {
+    const int v = g_batch_invariant.load();
+    if (v >= 0) {
+        return v == 1;
+    }
+    const char* e = std::getenv("LOCUS_METAL_BATCH_INVARIANT");
+    return e == nullptr || std::string_view(e) != "0";
 }
 
 bool matvec_prenorm_ok(gguf::TensorType t) {

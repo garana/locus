@@ -100,6 +100,31 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t x_off, const Context::Buffer& out,
                    std::uint64_t out_off, bool accumulate);
 
+/**
+ * out[c] (+)= w x[c] for n activation columns at once (i#1184: one
+ * decode token from each of n sequences): each weight block is read
+ * once for all of them.
+ *
+ * A column's bits do not depend on n or on the other columns, so a
+ * sequence decodes alike alone or in a batch.
+ *
+ * @param x_stride, out_stride Floats between columns.
+ * @param n The columns, 1 to 8.
+ * @param norm_w When set, the RMSNorm (weights norm_w, epsilon eps) as
+ *     a prologue, each column over its own x (as MvFuse::norm_w).
+ * @returns false when this type or shape has no such kernel (the
+ *     caller then runs n matvecs).
+ */
+bool record_matvec_cols(Context& ctx, gguf::TensorType t,
+                        std::uint32_t rows, std::uint32_t cols,
+                        const Context::Buffer& w, std::uint64_t w_off,
+                        const Context::Buffer& x, std::uint32_t x_off,
+                        std::uint32_t x_stride, const Context::Buffer& out,
+                        std::uint64_t out_off, std::uint32_t out_stride,
+                        std::uint32_t n, bool accumulate,
+                        const Context::Buffer* norm_w = nullptr,
+                        float eps = 0.0f);
+
 /** The steps a matvec can take around its dot (i#1064), so the decode
  *  saves their dispatches and barriers. */
 struct MvFuse {
@@ -117,6 +142,20 @@ struct MvFuse {
     const Context::Buffer* norm_w = nullptr;
     float eps = 0.0f;
 };
+
+/**
+ * Batch-invariant Metal decode (i#1184, as Vulkan's #432): when on, a
+ * lone sequence also decodes through metal_forward_multi, so a
+ * request's logits are bit-identical alone or batched; off, it takes
+ * metal_forward. LOCUS_METAL_BATCH_INVARIANT=1 / 0, or this call, sets
+ * it; the default is on.
+ */
+void set_batch_invariant(bool on);
+/** Drops a set_batch_invariant setting: back to the
+ * LOCUS_METAL_BATCH_INVARIANT or the default. */
+void reset_batch_invariant();
+/** @returns Whether batch-invariant Metal decode is on. */
+bool batch_invariant();
 
 /** @returns Whether t's matvec takes MvFuse::norm_w. */
 bool matvec_prenorm_ok(gguf::TensorType t);

@@ -227,6 +227,109 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
     mv_q8_0_impl<false>(w, xb, out, p, route, nw, tg, tid);
 }
 
+// Q8_0 over several activation columns (i#1184: one decode token from
+// each of N sequences): each weight block is read once and dotted with
+// every column's x, so N sequences cost about one matvec's weight
+// traffic. n_slots columns (at most kMvCols), column c's x at x_off +
+// c * x_slot_stride and its output at out_off + c * out_slot_stride.
+// A lane takes kMvColRpl rows of a 16-lane group, so each x float4 it
+// loads serves that many rows: the column loads, not the weights, bound
+// this kernel (each lane reads N x float4 per weight float4).
+constant constexpr uint kMvColRpl = 4;
+constant constexpr uint kMvColRows = kMvRows * kMvColRpl;  // a group
+// PN: the RMSNorm prologue, as mv_q8_0_pn's: each column's x^2 summed
+// over the row in the lane's own block order, whatever N is, so a
+// column's bits do not depend on the columns beside it.
+template <uint N, bool PN>
+inline void mv_q8_0_cols_impl(device const uchar* w, device const float* xb,
+                              device float* out, constant MvParams& p,
+                              device const float* nw, uint tg, uint tid) {
+    const uint lane = tid % kMvLanes;
+    // Rows r0, r0 + kMvRows, ... (kMvColRpl of them) for this lane.
+    const uint r0 = tg * kMvColRows + tid / kMvLanes;
+    // Columns past n_slots (N rounds it up) read column 0 and are not
+    // stored.
+    device const float* xc[N];
+    for (uint c = 0; c < N; ++c) {
+        xc[c] = xb + p.x_off +
+                ulong(c < p.n_slots ? c : 0) * p.x_slot_stride;
+    }
+    float acc[kMvColRpl][N];
+    for (uint i = 0; i < kMvColRpl; ++i)
+        for (uint c = 0; c < N; ++c) acc[i][c] = 0.0f;
+    float ss[N];  // PN: each column's sum of x^2
+    for (uint c = 0; c < N; ++c) ss[c] = 0.0f;
+    const uint nb = p.cols / 32;
+    device const uchar* rows[kMvColRpl];
+    for (uint i = 0; i < kMvColRpl; ++i) {
+        const uint r = r0 + i * kMvRows;
+        rows[i] = w + p.w_off + ulong(r < p.rows ? r : 0) * nb * 34;
+    }
+    for (uint b = lane; b < nb; b += kMvLanes) {
+        float sum[kMvColRpl][N];
+        for (uint i = 0; i < kMvColRpl; ++i)
+            for (uint c = 0; c < N; ++c) sum[i][c] = 0.0f;
+        for (uint k = 0; k < 8; ++k) {
+            float4 xv[N];
+            for (uint c = 0; c < N; ++c) {
+                xv[c] = ((device const float4*)(xc[c] + b * 32))[k];
+            }
+            if (PN) {
+                const float4 g = ((device const float4*)(nw + b * 32))[k];
+                for (uint c = 0; c < N; ++c) {
+                    ss[c] += dot(xv[c], xv[c]);
+                    xv[c] *= g;
+                }
+            }
+            for (uint i = 0; i < kMvColRpl; ++i) {
+                device const char* q =
+                    (device const char*)(rows[i] + b * 34 + 2) + 4 * k;
+                const float4 qv(q[0], q[1], q[2], q[3]);
+                for (uint c = 0; c < N; ++c) sum[i][c] += dot(qv, xv[c]);
+            }
+        }
+        for (uint i = 0; i < kMvColRpl; ++i) {
+            const float d = f16_at(rows[i] + b * 34);
+            for (uint c = 0; c < N; ++c) acc[i][c] += d * sum[i][c];
+        }
+    }
+    float inv[N];
+    for (uint c = 0; c < N; ++c) {
+        inv[c] = PN ? mv_inv_rms(half_simd_sum(ss[c]), p) : 1.0f;
+    }
+    for (uint i = 0; i < kMvColRpl; ++i) {
+        const uint r = r0 + i * kMvRows;
+        for (uint c = 0; c < N; ++c) {
+            float t = half_simd_sum(acc[i][c]);
+            if (PN) {
+                t *= inv[c];
+            }
+            if (lane == 0 && r < p.rows && c < p.n_slots) {
+                device float* o = out + p.out_off +
+                                  ulong(c) * p.out_slot_stride + r;
+                const float v = p.scale * t;
+                *o = p.accumulate != 0 ? *o + v : v;
+            }
+        }
+    }
+}
+
+#define MV_Q8_0_COLS(N, PN, SUF)                                          \
+    kernel void mv_q8_0_cols##N##SUF(                                     \
+        device const uchar* w [[buffer(0)]],                              \
+        device const float* xb [[buffer(1)]],                             \
+        device float* out [[buffer(2)]],                                  \
+        constant MvParams& p [[buffer(3)]],                               \
+        device const float* nw [[buffer(9)]],                             \
+        uint tg [[threadgroup_position_in_grid]],                         \
+        uint tid [[thread_index_in_threadgroup]]) {                       \
+        mv_q8_0_cols_impl<N, PN>(w, xb, out, p, nw, tg, tid);             \
+    }
+MV_Q8_0_COLS(2, false, )
+MV_Q8_0_COLS(4, false, )
+MV_Q8_0_COLS(2, true, _pn)
+MV_Q8_0_COLS(4, true, _pn)
+
 kernel void mv_q8_0_pn(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
                     device float* out [[buffer(2)]],

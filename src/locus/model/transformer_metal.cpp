@@ -110,11 +110,16 @@ struct MetalWeights {
 namespace {
 
 std::atomic<std::uint64_t> g_metal_tokens{0};
+std::atomic<std::uint64_t> g_metal_multi_tokens{0};
 
 }  // namespace
 
 std::uint64_t TransformerModel::metal_forward_tokens() {
     return g_metal_tokens.load();
+}
+
+std::uint64_t TransformerModel::metal_multi_tokens() {
+    return g_metal_multi_tokens.load();
 }
 
 namespace {
@@ -1106,6 +1111,338 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
     return true;
 }
 
+
+namespace {
+
+/** metal_forward_multi's scratch: N rows of each (grow-only). */
+struct MultiScratch {
+    Context::Buffer x, xb, q, k, v, att, gate, up, logits, cs, blocks,
+        rows, scores, parts;
+};
+
+MultiScratch& multi_scratch() {
+    static MultiScratch s;
+    return s;
+}
+
+}  // namespace
+
+bool TransformerModel::metal_forward_multi(
+    std::span<const tok::TokenId> toks,
+    std::span<kv::PagedKvCache::Seq* const> seqs, kv::PagedKvCache& cache,
+    std::span<float> logits) const {
+    using namespace backend;
+    const auto n = static_cast<std::uint32_t>(toks.size());
+    const std::uint32_t E = hp_.n_embd, hd = hp_.head_dim, H = hp_.n_heads,
+                        KV = hp_.n_kv_heads, ff = hp_.n_ff, V = hp_.n_vocab,
+                        L = hp_.n_layers;
+    const char* multi_env = std::getenv("LOCUS_METAL_MULTI");
+    if ((multi_env != nullptr && std::string_view(multi_env) == "0") ||
+        n == 0 || n > kMultiMax || seqs.size() != n ||
+        !metal_forward_supported() || cache.quantized() ||
+        logits.size() < std::size_t{n} * V) {
+        return false;
+    }
+    // Dense layers without per-head q / k norms: a MoE row's picks
+    // differ per sequence, and the norms have no row form here yet.
+    for (const Layer& lay : layers_) {
+        if (lay.is_moe() || lay.has_qk_norm()) {
+            return false;
+        }
+    }
+    std::vector<std::uint32_t> pos(n);
+    std::uint32_t most = 0;
+    for (std::uint32_t c = 0; c < n; ++c) {
+        if (toks[c] < 0 || static_cast<std::uint32_t>(toks[c]) >= V) {
+            return false;  // the host path reports it
+        }
+        pos[c] = seqs[c]->n_tokens;
+        if (pos[c] + 1 > hp_.n_ctx || pos[c] >= cache.capacity(*seqs[c])) {
+            return false;
+        }
+        most = std::max(most, pos[c] + 1);
+    }
+    const std::size_t qd = std::size_t{H} * hd, kvd = std::size_t{KV} * hd;
+    const std::uint32_t bt = cache.geometry().block_tokens;
+    const char* passes = std::getenv("LOCUS_METAL_ATTN_PASSES");
+    const bool three = passes != nullptr && std::string_view(passes) == "3";
+    const bool head_fits = hd <= kAttnGroup && kAttnGroup % hd == 0;
+    const char* split_env = std::getenv("LOCUS_METAL_ATTN_SPLIT");
+    const bool split_ok =
+        split_env == nullptr || std::string_view(split_env) != "0";
+    const std::uint32_t max_parts = (most + kAttnGroup - 1) / kAttnGroup;
+    // Each sequence's block table, back to back.
+    std::vector<std::uint32_t> blk_at(n);
+    std::uint32_t n_blk = 0;
+    for (std::uint32_t c = 0; c < n; ++c) {
+        blk_at[c] = n_blk;
+        n_blk += (pos[c] + 1 + bt - 1) / bt;
+    }
+
+    std::lock_guard lk(metal::device_mutex());
+    const Context::Buffer* pool = metal::kv_buffer(cache.pool_data());
+    if (pool == nullptr) {
+        return false;  // not a Metal pool
+    }
+    try {
+        Context& ctx = Context::get();
+        MultiScratch& s = multi_scratch();
+        const auto grow = [&](Context::Buffer& b, std::size_t bytes) {
+            Scratch::grow(ctx, b, bytes);
+        };
+        grow(s.x, std::size_t{n} * E * 4);
+        grow(s.xb, std::size_t{n} * E * 4);
+        grow(s.q, n * qd * 4);
+        grow(s.att, n * qd * 4);
+        grow(s.k, n * kvd * 4);
+        grow(s.v, n * kvd * 4);
+        grow(s.gate, std::size_t{n} * ff * 4);
+        grow(s.up, std::size_t{n} * ff * 4);
+        grow(s.logits, std::size_t{n} * V * 4);
+        grow(s.cs, std::size_t{n} * hd * 4);
+        grow(s.blocks, std::size_t{n_blk} * 4);
+        grow(s.rows, std::size_t{n} * L * 8);
+        // One slice of scores and of parts a sequence: the sequences'
+        // attentions overlap.
+        const std::size_t score_bytes = std::size_t{H} * most * 4;
+        const std::size_t part_bytes =
+            std::size_t{H} * max_parts * (std::size_t{hd} + 4) * 4;
+        grow(s.scores, n * score_bytes);
+        grow(s.parts, n * part_bytes);
+
+        auto* x = static_cast<float*>(s.x.data);
+        auto* cs = static_cast<float*>(s.cs.data);
+        auto* blocks = static_cast<std::uint32_t*>(s.blocks.data);
+        auto* rows = static_cast<std::uint64_t*>(s.rows.data);
+        const float* base = cache.pool_data();
+        for (std::uint32_t c = 0; c < n; ++c) {
+            ops().dequant_row(embd_, static_cast<std::uint32_t>(toks[c]),
+                              {x + std::size_t{c} * E, E});
+            rope_norm_table(hd, pos[c], hp_.rope_freq_base, rope_factors(),
+                            {cs + std::size_t{c} * hd, hd});
+            const auto& sb = seqs[c]->blocks;
+            std::copy_n(sb.begin(), (pos[c] + 1 + bt - 1) / bt,
+                        blocks + blk_at[c]);
+            // Row (l, c): sequence c's K row at its position in layer l.
+            for (std::uint32_t l = 0; l < L; ++l) {
+                rows[std::size_t{l} * n + c] = static_cast<std::uint64_t>(
+                    cache.k(*seqs[c], l, pos[c]) - base);
+            }
+        }
+
+        const MetalRec r{ctx, weights_of(metal_weights_, file_backed_), hp_,
+                         hd, metal_neox()};
+        // out[c] (+)= wt in[c] for the n rows: one matvec over the
+        // columns (each weight read once), else one a row; norm, when
+        // set, as the matvec's RMSNorm prologue (in is then the norm's
+        // input). Either way a row's bits do not depend on n.
+        const auto mm = [&](const Mat& wt, const Context::Buffer& in,
+                            std::uint32_t in_stride,
+                            const Context::Buffer& out,
+                            std::uint64_t out_off,
+                            std::uint32_t out_stride, bool acc,
+                            const Context::Buffer* norm = nullptr) {
+            const auto wb = r.w(wt);
+            if (metal::record_matvec_cols(ctx, wt.type, wt.rows, wt.cols,
+                                          *wb.buf, wb.off, in, 0, in_stride,
+                                          out, out_off, out_stride, n, acc,
+                                          norm, hp_.rms_eps)) {
+                return;
+            }
+            if (norm != nullptr) {
+                // fold_ok gave a type with no columns kernel a norm.
+                throw std::logic_error(
+                    "metal multi decode: a folded matvec not recorded");
+            }
+            for (std::uint32_t c = 0; c < n; ++c) {
+                if (c > 0) {
+                    ctx.overlap_next();  // independent rows
+                }
+                metal::record_matvec(
+                    ctx, wt.type, wt.rows, wt.cols, *wb.buf, wb.off, in,
+                    c * in_stride, out,
+                    out_off + std::uint64_t{c} * out_stride, acc);
+            }
+        };
+        // Fold a norm into the matvecs that read it where every one of
+        // them is Q8_0 (the columns kernel's prologue), for any n, so
+        // the choice and the bits do not depend on n. metal_forward's
+        // gate otherwise (it folds F32 too).
+        const char* nf_env = std::getenv("LOCUS_METAL_NORM_FOLD");
+        const bool norm_fold =
+            nf_env != nullptr ? std::string_view(nf_env) != "0"
+                              : ctx.apple_family() >= 9;
+        const auto fold_ok = [&](std::initializer_list<const Mat*> ms) {
+            return norm_fold &&
+                   std::all_of(ms.begin(), ms.end(), [](const Mat* m) {
+                       return m->type == gguf::TensorType::kQ8_0;
+                   });
+        };
+        const auto norm_rows = [&](std::span<const float> wt) {
+            const RowNormParams np{E, E, hp_.rms_eps};
+            const Context::Arg a[] = {{&s.x, 0}, {&r.f(wt), 0}, {&s.xb, 0}};
+            ctx.dispatch("rmsnorm_rows", a, bytes_of(np), n * kNormGroup,
+                         kNormGroup);
+        };
+        const auto rope_row = [&](const Context::Buffer& b, std::uint64_t off,
+                                  std::uint32_t heads, std::uint32_t c) {
+            const RopeParams rp{off, heads, hd, r.neox};
+            const Context::Arg a[] = {
+                {&b, 0}, {&s.cs, std::size_t{c} * hd * 4}};
+            ctx.dispatch("rope_norm", a, bytes_of(rp), heads * hd / 2, 64);
+        };
+
+        run_batch(ctx, [&] {
+            for (std::uint32_t l = 0; l < L; ++l) {
+                const Layer& lay = layers_[l];
+                const bool fold_attn = fold_ok({&lay.wq, &lay.wk, &lay.wv});
+                const Context::Buffer* an = nullptr;
+                if (fold_attn) {
+                    an = &r.f(lay.attn_norm);
+                } else {
+                    norm_rows(lay.attn_norm);
+                }
+                const Context::Buffer& qin = fold_attn ? s.x : s.xb;
+                // A lone row writes its K and V straight into its blocks
+                // (as metal_forward); rows write theirs to k / v, then
+                // kv_scatter copies each into its own sequence's. The
+                // same kernels either way, so the same bits.
+                const bool direct = n == 1;
+                const std::uint64_t krow = rows[std::size_t{l} * n];
+                const std::uint64_t vrow =
+                    krow + cache.layer_floats() / 2;
+                const Context::Buffer& kb = direct ? *pool : s.k;
+                const Context::Buffer& vb = direct ? *pool : s.v;
+                const std::uint64_t ko = direct ? krow : 0,
+                                    vo = direct ? vrow : 0;
+                mm(lay.wq, qin, E, s.q, 0, static_cast<std::uint32_t>(qd),
+                   false, an);
+                ctx.overlap_next();
+                mm(lay.wk, qin, E, kb, ko, static_cast<std::uint32_t>(kvd),
+                   false, an);
+                ctx.overlap_next();
+                mm(lay.wv, qin, E, vb, vo, static_cast<std::uint32_t>(kvd),
+                   false, an);
+                if (lay.has_qkv_bias()) {
+                    r.bias(s.q, 0, lay.wq_bias, n,
+                           static_cast<std::uint32_t>(qd));
+                    ctx.overlap_next();
+                    r.bias(kb, ko, lay.wk_bias, n,
+                           static_cast<std::uint32_t>(kvd));
+                    ctx.overlap_next();
+                    r.bias(vb, vo, lay.wv_bias, n,
+                           static_cast<std::uint32_t>(kvd));
+                }
+                // Each row's RoPE at its own position (independent rows).
+                for (std::uint32_t c = 0; c < n; ++c) {
+                    if (c > 0) ctx.overlap_next();
+                    rope_row(s.q, c * qd, H, c);
+                    ctx.overlap_next();
+                    rope_row(kb, ko + c * kvd, KV, c);
+                }
+                if (!direct) {
+                    // Each row's K and V into its own sequence's blocks.
+                    const ScatterParams sp{cache.layer_floats() / 2, n,
+                                           static_cast<std::uint32_t>(kvd)};
+                    const Context::Arg sa[] = {
+                        {&s.k, 0}, {&s.v, 0}, {pool, 0},
+                        {&s.rows, std::size_t{l} * n * 8}};
+                    ctx.dispatch("kv_scatter", sa, bytes_of(sp),
+                                 static_cast<std::uint32_t>(n * kvd), 256);
+                }
+                // Each sequence's attention over its own blocks, as
+                // metal_forward picks it for its length.
+                for (std::uint32_t c = 0; c < n; ++c) {
+                    const std::uint32_t np = pos[c] + 1;
+                    const AttnParams ap{cache.block_floats(),
+                                        cache.layer_offset(l),
+                                        cache.layer_floats() / 2,
+                                        np,
+                                        bt,
+                                        H,
+                                        KV,
+                                        hd,
+                                        hp_.kq_scale};
+                    const std::size_t qo = c * qd * 4, bo = blk_at[c] * 4,
+                                      so = c * score_bytes,
+                                      po = c * part_bytes;
+                    if (c > 0) ctx.overlap_next();  // independent rows
+                    if (!three && head_fits && split_ok &&
+                        np > 2 * kAttnGroup) {
+                        const std::uint32_t parts =
+                            (np + kAttnGroup - 1) / kAttnGroup;
+                        const AttnSplitParams spp{ap, parts};
+                        const Context::Arg pa[] = {{&s.q, qo},
+                                                   {pool, 0},
+                                                   {&s.blocks, bo},
+                                                   {&s.parts, po}};
+                        ctx.dispatch("attn_split", pa, bytes_of(spp),
+                                     H * parts * kAttnGroup, kAttnGroup);
+                        const Context::Arg ma[] = {{&s.parts, po},
+                                                   {&s.att, qo}};
+                        ctx.dispatch("attn_merge", ma, bytes_of(spp), H * hd,
+                                     64);
+                    } else if (!three && head_fits && np <= kAttnMaxPos) {
+                        const Context::Arg fa[] = {{&s.q, qo},
+                                                   {pool, 0},
+                                                   {&s.blocks, bo},
+                                                   {&s.att, qo}};
+                        ctx.dispatch("attn_fused", fa, bytes_of(ap),
+                                     H * kAttnGroup, kAttnGroup);
+                    } else {
+                        const Context::Arg sca[] = {{&s.q, qo},
+                                                    {pool, 0},
+                                                    {&s.blocks, bo},
+                                                    {&s.scores, so}};
+                        ctx.dispatch("attn_scores", sca, bytes_of(ap),
+                                     H * np, 64);
+                        const Context::Arg sm[] = {{&s.scores, so}};
+                        ctx.dispatch("attn_softmax", sm, bytes_of(ap),
+                                     H * kNormGroup, kNormGroup);
+                        const Context::Arg va[] = {{&s.scores, so},
+                                                   {pool, 0},
+                                                   {&s.blocks, bo},
+                                                   {&s.att, qo}};
+                        ctx.dispatch("attn_values", va, bytes_of(ap),
+                                     H * hd, 64);
+                    }
+                }
+                mm(lay.wo, s.att, static_cast<std::uint32_t>(qd), s.x, 0, E,
+                   true);
+                const bool fold_ffn = fold_ok({&lay.w_gate, &lay.w_up});
+                const Context::Buffer* fn = nullptr;
+                if (fold_ffn) {
+                    fn = &r.f(lay.ffn_norm);
+                } else {
+                    norm_rows(lay.ffn_norm);
+                }
+                const Context::Buffer& fin = fold_ffn ? s.x : s.xb;
+                mm(lay.w_gate, fin, E, s.gate, 0, ff, false, fn);
+                ctx.overlap_next();
+                mm(lay.w_up, fin, E, s.up, 0, ff, false, fn);
+                const SiluParams sp2{n * ff};
+                const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
+                ctx.dispatch("silu_mul", su, bytes_of(sp2), n * ff, 256);
+                mm(lay.w_down, s.gate, ff, s.x, 0, E, true);
+            }
+            norm_rows(out_norm_);
+            mm(out_w_, s.xb, E, s.logits, 0, V, false);
+        });
+
+        const auto* lg = static_cast<const float*>(s.logits.data);
+        for (std::uint32_t c = 0; c < n; ++c) {
+            const auto row = logits.subspan(std::size_t{c} * V, V);
+            std::copy_n(lg + std::size_t{c} * V, V, row.begin());
+            scale_logits(row);
+            seqs[c]->n_tokens = pos[c] + 1;
+        }
+        g_metal_tokens.fetch_add(n);
+        g_metal_multi_tokens.fetch_add(n);
+    } catch (const std::exception&) {
+        return false;  // a device error: the host path runs the tokens
+    }
+    return true;
+}
 
 bool TransformerModel::metal_forward_batch(
     std::span<const tok::TokenId> toks, std::span<const float* const> embd,
