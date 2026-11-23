@@ -1245,10 +1245,10 @@ bool TransformerModel::metal_forward_batch(
                     const Context::Arg aa[] = {
                         {&s.q, 0}, {pool, 0}, {&s.blocks, 0}, {&s.att, 0}};
                     if (mma_attn) {
-                        // 32 queries of a head a threadgroup, on the
+                        // 64 queries of a head a threadgroup, on the
                         // simdgroup matrices.
                         ctx.dispatch("attn_rows_mma", aa, bytes_of(ap),
-                                     ((m + 31) / 32) * H * 128, 128);
+                                     ((m + 63) / 64) * H * 256, 256);
                     } else if (tiled_attn) {
                         // 8 queries of a head a threadgroup, K / V staged.
                         ctx.dispatch("attn_rows_tiled", aa, bytes_of(ap),
