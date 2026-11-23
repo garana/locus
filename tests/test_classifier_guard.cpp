@@ -498,6 +498,8 @@ TEST_CASE("a linear head scores as its training script did",
 
     // The guard embeds as /v1/embeddings does: the vectors match.
     const auto em = locus::embed::EmbeddingModel::load(emb);
+    // The name the head recorded: the GGUF's general.name.
+    CHECK(em->general_name() == "Bge Small En v1.5");
     for (const auto& it : items) {
         const auto v =
             em->embed({it["text"].get<std::string>()},
