@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/vulkan/weight_pool.hpp"
@@ -177,4 +179,83 @@ TEST_CASE("weight pool releases the entries over a freed range",
     // The import is made again for a later model, not served stale.
     h.pool.acquire_external(other + 1, mapping + 8, import);
     REQUIRE(made == 2);
+}
+
+// i#1164: on a discrete GPU, a weight that missed the device heap
+// (pinned system memory instead) is a spill. Spills are cached under
+// their own cap, so a model a little larger than the device stays
+// resident, and many distinct weights never pin more than the cap.
+TEST_CASE("weight pool caps the weights that spill off the device",
+          "[vulkan-pool]") {
+    Harness h;
+    h.pool.budget_ = 0;
+    h.pool.init_budget();  // unbounded, as with LOCUS_GPU_POOL_MB unset
+    h.pool.spill_cap_ = 20;
+    // The device holds 20 bytes of weights; any more spills.
+    int device_bytes = 0;
+    std::vector<int> spilled_ids;
+    h.pool.create = [&](std::size_t n) {
+        ++h.live;
+        FakeBuf b{++h.next_id};
+        if (device_bytes + static_cast<int>(n) > 20) {
+            spilled_ids.push_back(b.id);
+        } else {
+            device_bytes += static_cast<int>(n);
+        }
+        return b;
+    };
+    h.pool.destroy = [&](FakeBuf b) {
+        --h.live;
+        if (std::find(spilled_ids.begin(), spilled_ids.end(), b.id) ==
+            spilled_ids.end()) {
+            device_bytes -= 10;
+        }
+    };
+    h.pool.spilled = [&](FakeBuf b) {
+        return std::find(spilled_ids.begin(), spilled_ids.end(), b.id) !=
+               spilled_ids.end();
+    };
+    // A dense model of four weights, read every token: two fit the
+    // device, two spill and stay cached.
+    const auto token = [&] {
+        for (const char* k : {A, B, C, D}) {
+            h.get(k, 10);
+        }
+        h.pool.on_batch_end();
+    };
+    token();
+    REQUIRE(h.pool.spills_ == 2);
+    REQUIRE(h.pool.budget_ == 20);  // what the device held when it filled
+    REQUIRE(h.pool.used_ == 20);
+    REQUIRE(h.pool.spill_used_ == 20);
+    REQUIRE(h.live == 4);
+    const auto uploaded = h.pool.uploaded_;
+    for (int i = 0; i < 5; ++i) {
+        token();
+    }
+    // Later tokens: all hits, nothing evicted or uploaded again.
+    REQUIRE(h.pool.uploaded_ == uploaded);
+    REQUIRE(h.pool.evictions_ == 0);
+    REQUIRE(h.pool.hits_ == 20);
+    // Many distinct weights (an MoE's experts): spills evict each other
+    // within the cap; system memory never holds more than the cap.
+    for (int i = 0; i < 50; ++i) {
+        h.get(reinterpret_cast<const void*>(
+                  static_cast<std::uintptr_t>(0x1000 + i)),
+              10);
+        h.pool.on_batch_end();
+        REQUIRE(h.pool.spill_used_ <= 20);
+        REQUIRE(h.pool.used_ <= 20);
+    }
+    REQUIRE(h.live == 4);
+    // A weight read while every spill is pinned: served for the batch.
+    h.pool.on_batch_end();
+    for (int i = 0; i < 3; ++i) {
+        h.get(reinterpret_cast<const void*>(
+                  static_cast<std::uintptr_t>(0x2000 + i)),
+              10);
+    }
+    REQUIRE(h.pool.spill_used_ <= 20);
+    h.pool.on_batch_end();
+    REQUIRE(h.live == 4);
 }

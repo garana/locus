@@ -31,6 +31,7 @@
 #include "locus/model/expert_metrics.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/model/stage_metrics.hpp"
+#include "locus/sys/meminfo.hpp"
 #include "locus/sys/mmap_file.hpp"
 
 namespace locus::backend {
@@ -268,6 +269,24 @@ struct State {
         pool.destroy = [this](VulkanContext::Buffer b) {
             ctx.destroy_buffer(b);
         };
+        // A discrete GPU (i#1164): a weight that missed the device heap
+        // fell back to pinned system memory. The pool keeps such spills
+        // under a quarter of the host's RAM (LOCUS_GPU_SPILL_MB
+        // overrides), so a model a little larger than the device stays
+        // resident and an MoE's experts never pin the whole model.
+        // Unified memory has nothing to spill.
+        if (ctx.device_local_weights()) {
+            pool.spilled = [this](VulkanContext::Buffer b) {
+                return !ctx.device_local(b);
+            };
+            pool.spill_cap_ =
+                static_cast<std::size_t>(sys::total_ram_bytes() / 4);
+            if (const char* mb = std::getenv("LOCUS_GPU_SPILL_MB")) {
+                pool.spill_cap_ =
+                    static_cast<std::size_t>(std::strtoull(mb, nullptr, 10))
+                    << 20;
+            }
+        }
         // A model file unmapped drops the buffers over its pages.
         if (g_states_live.fetch_add(1) == 0) {
             sys::set_unmap_hook(&on_unmap);

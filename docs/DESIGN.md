@@ -417,9 +417,20 @@ device memory still runs.
 - Page unit: a whole tensor for static weights; one expert slice for
   routed experts, so paging granularity matches routing granularity.
 - Budget: `LOCUS_GPU_POOL_MB`; unbounded by default, so a model that
-  fits stays resident. Weights stay quantized on the device for every
-  type whose kernel dequantizes in-shader (Q4_K is about 0.5 bytes per
-  weight).
+  fits stays resident. On a discrete GPU under Vulkan, a weight that
+  misses the device heap (the driver falls back to pinned system
+  memory) is a spill: the device budget drops to what the pool holds
+  there, and spills are cached apart, under a quarter of the host's
+  RAM (`LOCUS_GPU_SPILL_MB` overrides) with their own LRU; past that a
+  spill serves one batch. Once the device is full a miss goes to the
+  spill cache first, since evicting device weights read every token
+  would make each eviction the next miss. So a dense model a little
+  larger than the device stays resident (Orpheus 3B Q4_K_M on a 2 GB
+  GTX 750 Ti: 6.3 tok/s, as before), and an MoE's experts pin at most
+  the cap (i#1164: they pinned 7.4 GB of a 16 GB host until a pin
+  failed). Unified memory (V3D, MoltenVK) keeps the unbounded default.
+  Weights stay quantized on the device for every type whose kernel
+  dequantizes in-shader (Q4_K is about 0.5 bytes per weight).
 - Page table: host pointer to {buffer, last use, pinned}. Buffers used
   by the command batch being recorded are pinned; unpinned ones evict
   least-recently-used. The host mmap stays the source of truth.
