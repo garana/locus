@@ -388,6 +388,55 @@ float dsa_index_score(std::span<const float> q,
     return score;
 }
 
+const backend::Backend& TransformerModel::use_backend_for(
+    std::string_view choice, kv::KvType kv_type, std::string* why) {
+    std::string note;
+    const backend::Backend& b = [&]() -> const backend::Backend& {
+        if (!backend::backend_defaulted(choice)) {
+            note = choice.empty() ? "LOCUS_BACKEND" : "--backend";
+            const backend::Backend& r = backend::resolve_backend(choice);
+            use_backend(r);
+            return r;
+        }
+        const auto usable = [](const backend::Backend* p) {
+            return p != nullptr && p->available && p->selectable;
+        };
+        const backend::Backend* mt = backend::find_backend("metal");
+        if (usable(mt)) {
+            std::string not_taken;
+            if (kv_type == kv::KvType::kF32) {
+                use_backend(*mt);  // metal_forward_why_not reads it
+                not_taken = metal_forward_why_not();
+                if (not_taken.empty()) {
+                    note = "default; metal_forward takes this model";
+                    return *mt;
+                }
+            } else {
+                const char* name = kv_type == kv::KvType::kQ8   ? "q8"
+                                   : kv_type == kv::KvType::kQ4 ? "q4"
+                                                                : "f16";
+                not_taken = std::string("a ") + name +
+                            " KV cache (metal_forward takes f32)";
+            }
+            note = "default; metal_forward does not take this model: " +
+                   not_taken + "; metal would be used if it did";
+            // Not Metal's per-op path: Vulkan, where it is usable.
+            if (const backend::Backend* vk = backend::find_backend("vulkan");
+                usable(vk)) {
+                use_backend(*vk);
+                return *vk;
+            }
+        } else {
+            note = "default; the best backend here";
+        }
+        const backend::Backend& r = backend::best_backend();
+        use_backend(r);
+        return r;
+    }();
+    if (why != nullptr) *why = std::move(note);
+    return b;
+}
+
 TransformerModel TransformerModel::load(const GgufFile& g,
                             std::uint32_t layer_begin,
                             std::uint32_t layer_end) {

@@ -36,6 +36,7 @@
 #include "locus/model/transformer.hpp"
 #include "locus/sys/mmap_file.hpp"
 #include "locus/tok/tokenizer.hpp"
+#include "qwen_tiny.hpp"
 
 using locus::backend::metal::Context;
 
@@ -1510,6 +1511,77 @@ TEST_CASE("metal decode norm fold tracks the unfolded decode", "[metal]") {
         }
     }
     CHECK(worst_any > 0.0f);
+}
+
+// i#867: with no --backend and no LOCUS_BACKEND, a host with Metal runs
+// a model on Metal when metal_forward takes it, else on Vulkan where
+// usable, else best_backend(); an explicit choice wins.
+TEST_CASE("the default backend follows metal_forward's gate",
+          "[metal][backend]") {
+    // The test's own default: put LOCUS_BACKEND back after.
+    struct EnvGuard {
+        std::string old;
+        bool had = false;
+        EnvGuard() {
+            if (const char* e = std::getenv("LOCUS_BACKEND")) {
+                old = e;
+                had = true;
+            }
+            ::unsetenv("LOCUS_BACKEND");
+        }
+        ~EnvGuard() {
+            if (had) {
+                ::setenv("LOCUS_BACKEND", old.c_str(), 1);
+            }
+        }
+    } guard;
+    using locus::kv::KvType;
+    const auto* mt = locus::backend::find_backend("metal");
+    const bool metal = mt != nullptr && mt->available;
+    // Where Metal does not take a model: Vulkan, if usable.
+    const auto* vk = locus::backend::find_backend("vulkan");
+    const std::string best =
+        metal && vk != nullptr && vk->available && vk->selectable
+            ? "vulkan"
+            : std::string(locus::backend::best_backend().name);
+
+    const auto img = qwen_tiny::lm("qwen2");
+    const auto g = locus::gguf::GgufFile::parse(img);
+    auto model = locus::model::TransformerModel::load(g);
+    // qwen2's attention is one metal_forward takes. The boot line's
+    // reason comes with the pick.
+    std::string why;
+    CHECK(model.use_backend_for("", KvType::kF32, &why).name ==
+          (metal ? "metal" : best));
+    CHECK(model.active_backend().name == (metal ? "metal" : best));
+    if (metal) {
+        CHECK(why == "default; metal_forward takes this model");
+    }
+    // metal_forward declines a quantized cache.
+    CHECK(model.use_backend_for("", KvType::kQ8, &why).name == best);
+    if (metal) {
+        CHECK(why == "default; metal_forward does not take this model: "
+                     "a q8 KV cache (metal_forward takes f32); metal would "
+                     "be used if it did");
+    }
+    // An explicit choice wins.
+    const char* cpu =
+        locus::backend::find_backend("neon") != nullptr ? "neon" : "scalar";
+    CHECK(model.use_backend_for(cpu, KvType::kF32, &why).name == cpu);
+    CHECK(why == "--backend");
+
+    // qwen2vl's M-RoPE is not one metal_forward takes, and the reason
+    // is the gate's own.
+    const auto img_vl = qwen_tiny::lm("qwen2vl");
+    const auto g_vl = locus::gguf::GgufFile::parse(img_vl);
+    auto vl = locus::model::TransformerModel::load(g_vl);
+    CHECK(vl.use_backend_for("", KvType::kF32, &why).name == best);
+    if (metal) {
+        CHECK(why.find("qwen2vl's M-RoPE") != std::string::npos);
+        vl.use_backend(*mt);
+        CHECK(vl.metal_forward_why_not() == "qwen2vl's M-RoPE");
+        CHECK_FALSE(vl.metal_forward_supported());
+    }
 }
 
 // i#1074: the prefill matmuls alone, at Llama 3.2 1B's layer shapes and

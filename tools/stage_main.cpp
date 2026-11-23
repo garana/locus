@@ -226,14 +226,17 @@ int main(int argc, char** argv) {
                          rt.layer_end, model.hparams().n_layers);
             return 2;
         }
-        // Bind the chosen math backend (empty = the model's auto default,
-        // unchanged from before this seam). An unavailable backend (e.g.
-        // --backend cuda on a CPU-only host) throws here -- fail loud, no
-        // silent CPU fallback (i#24 inc 4).
-        if (!dev.backend.empty()) {
-            model.use_backend(
-                locus::backend::resolve_backend(dev.backend));
-        }
+        // Bind the math backend as locus-server does (i#867): an
+        // explicit --backend (or LOCUS_BACKEND) is resolve_backend's and
+        // an unavailable one throws here, fail loud with no silent CPU
+        // fallback (i#24 inc 4); the default follows metal_forward's
+        // gate, which declines a slice of the layers, so a stage of part
+        // of a model runs on Vulkan on Apple.
+        std::string why;
+        const auto& be =
+            model.use_backend_for(dev.backend, locus::kv::KvType::kF32, &why);
+        std::fprintf(stderr, "locus-stage: backend: %s (%s)\n",
+                     std::string(be.name).c_str(), why.c_str());
         // Each executor (--executors, i#24 inc 3) owns its own KV pool,
         // so N executors commit N pools. Refuse to allocate what would
         // not fit in RAM, rather than letting malloc overcommit and the
