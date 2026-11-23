@@ -470,6 +470,69 @@ TEST_CASE("kolibri1 on Vulkan with its experts on the CPU matches the "
     }
 }
 
+// i#1178: routed on the host for another reason first (a pool budget:
+// gpu_route_ok returns before its fit check), misfitting experts still
+// run their picks on the CPU, not uploaded.
+TEST_CASE("kolibri1 under a pool budget runs misfitting picks on the CPU",
+          "[model][kolibri1][vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    if (std::getenv("LOCUS_VK_HOST_EXPERTS") != nullptr) {
+        SKIP("LOCUS_VK_HOST_EXPERTS is set");
+    }
+    // Puts back the caller's LOCUS_GPU_POOL_MB (later tests read it),
+    // then resets so the pool reads it again.
+    struct Restore {
+        std::string old;
+        bool had = false;
+        Restore() {
+            if (const char* e = std::getenv("LOCUS_GPU_POOL_MB")) {
+                old = e;
+                had = true;
+            }
+        }
+        ~Restore() {
+            if (had) {
+                setenv("LOCUS_GPU_POOL_MB", old.c_str(), 1);
+            } else {
+                unsetenv("LOCUS_GPU_POOL_MB");
+            }
+            locus::backend::vulkan_moe_misfit_for_test(false);
+            locus::backend::vulkan_reset_state();
+        }
+    } restore;
+    setenv("LOCUS_GPU_POOL_MB", "4096", 1);
+    locus::backend::vulkan_reset_state();  // the pool reads it again
+    locus::backend::vulkan_moe_misfit_for_test(true);
+    const std::vector<int> toks = {3, 17, 9, 30, 1, 22, 5, 14, 27, 8};
+    const auto ts = make_tensors();
+    const auto want = Reference(ts, true).run(toks);
+    auto img = build_image(ts, true);
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+    REQUIRE_FALSE(locus::backend::vulkan_moe_gpu_route(model));
+    REQUIRE(model.experts_on_host_cpu());
+    locus::model::ExpertCalls::reset();
+    const auto got = run(model, toks);
+    std::uint64_t cpu = 0, gpu = 0;
+    for (const auto& s : locus::model::ExpertCalls::snapshot()) {
+        (s.device == "cpu" ? cpu : gpu) += s.calls;
+    }
+    CHECK(cpu > 0);
+    CHECK(gpu == 0);
+    for (std::size_t p = 0; p < toks.size(); ++p) {
+        INFO("position " << p);
+        double err = 0.0, ref = 0.0;
+        for (std::uint32_t i = 0; i < kV; ++i) {
+            err = std::max(err, std::abs(got[p][i] - want[p][i]));
+            ref = std::max(ref, std::abs(want[p][i]));
+        }
+        CHECK(err <= 1e-3 * ref);
+    }
+}
+
 // i#730: Vulkan's batched prefill against its per-token forward, every
 // position's logits, with the window of 3 on layer 0 met at chunk
 // boundaries. Chunks of 6 or more (2 of 6 experts a token: shorter
