@@ -52,6 +52,9 @@ class EmbeddingModel {
                                                 std::string name = {});
 
     const std::string& name() const { return name_; }
+    /** @returns The GGUF's general.name, else its file name (what a
+     *  linear head records as its embedding model, i#1160). */
+    const std::string& general_name() const { return general_name_; }
     std::uint32_t width() const { return enc_.width(); }
     /** @returns The most tokens one input may have, CLS and SEP included. */
     std::uint32_t context() const { return enc_.context(); }
@@ -179,6 +182,7 @@ class EmbeddingModel {
     std::unique_ptr<tok::Tokenizer> tok_;
     BertEncoder enc_;
     std::string name_;
+    std::string general_name_;  ///< general_name()
     PairFormat pair_;
     std::vector<std::string> labels_;
     std::optional<std::string> problem_type_;

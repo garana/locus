@@ -369,11 +369,7 @@ std::unique_ptr<ClassifierGuard> load_linear_head(const GuardSpec& spec,
         throw gguf::Error(spec.embedding + ": a classifier, not an embedding "
                                            "model");
     }
-    const auto meta = gguf::GgufFile::open(spec.embedding);
-    const auto gname = meta.get_string("general.name");
-    const std::string emb_name =
-        gname ? std::string(*gname)
-              : std::filesystem::path(spec.embedding).filename().string();
+    const std::string& emb_name = em->general_name();
     const auto mismatch = [&](const std::string& field, const auto& head_v,
                               const auto& model_v) {
         if (head_v != model_v) {

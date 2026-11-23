@@ -136,9 +136,16 @@ std::unique_ptr<EmbeddingModel> EmbeddingModel::load(const std::string& path,
             problem = pt->s;
         }
     }
+    // general.name, else the file name: what a linear head records as
+    // the model it was trained on (i#1160).
+    const auto gname = g->get_string("general.name");
+    std::string general_name =
+        gname ? std::string(*gname)
+              : std::filesystem::path(path).filename().string();
     auto m = std::unique_ptr<EmbeddingModel>(
         new EmbeddingModel(std::move(g), std::move(tok), std::move(enc),
                            std::move(name), pair));
+    m->general_name_ = std::move(general_name);
     m->labels_ = std::move(labels);
     m->problem_type_ = std::move(problem);
     return m;
