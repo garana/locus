@@ -141,7 +141,9 @@ struct WeightPoolT {
         // Once the device is full, a miss goes to the spill cache
         // first: evicting device entries for it would cycle a model
         // whose every weight is read each token (each eviction is the
-        // next miss).
+        // next miss). When the spill cache is at its cap with this
+        // batch's own pinned spills, the miss falls through to
+        // reserve() and evicts device entries instead.
         if (device_full_ && used_ + bytes > budget_ &&
             evict_until(true, spill_used_, spill_cap_, bytes)) {
             Buffer b = create(bytes);
