@@ -410,6 +410,12 @@ namespace locus::backend::vk {
 
 namespace {
 
+/** The memory budget query's sTypes (names past 80 columns inline). */
+constexpr VkStructureType kBudgetSType =
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+constexpr VkStructureType kProps2SType =
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+
 void check(VkResult r, const char* what) {
     if (r != VK_SUCCESS) {
         throw std::runtime_error(std::string("vulkan: ") + what +
@@ -1973,10 +1979,9 @@ struct VulkanContext::Impl {
                 // The budget extension's view of that heap: the
                 // process's usage and what the driver allows.
                 VkPhysicalDeviceMemoryBudgetPropertiesEXT bud{};
-                bud.sType =
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+                bud.sType = kBudgetSType;
                 VkPhysicalDeviceMemoryProperties2 p2{};
-                p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+                p2.sType = kProps2SType;
                 p2.pNext = &bud;
                 vkGetPhysicalDeviceMemoryProperties2(phys, &p2);
                 what += "; heap usage " + mb(bud.heapUsage[buffer_heap]) +
