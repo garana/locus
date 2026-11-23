@@ -481,9 +481,23 @@ TEST_CASE("kolibri1 under a pool budget runs misfitting picks on the CPU",
     if (std::getenv("LOCUS_VK_HOST_EXPERTS") != nullptr) {
         SKIP("LOCUS_VK_HOST_EXPERTS is set");
     }
+    // Puts back the caller's LOCUS_GPU_POOL_MB (later tests read it),
+    // then resets so the pool reads it again.
     struct Restore {
+        std::string old;
+        bool had = false;
+        Restore() {
+            if (const char* e = std::getenv("LOCUS_GPU_POOL_MB")) {
+                old = e;
+                had = true;
+            }
+        }
         ~Restore() {
-            unsetenv("LOCUS_GPU_POOL_MB");
+            if (had) {
+                setenv("LOCUS_GPU_POOL_MB", old.c_str(), 1);
+            } else {
+                unsetenv("LOCUS_GPU_POOL_MB");
+            }
             locus::backend::vulkan_moe_misfit_for_test(false);
             locus::backend::vulkan_reset_state();
         }
