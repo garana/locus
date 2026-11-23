@@ -1110,11 +1110,14 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
         check(Mat{t, w.data(), rows, 8 * 256}, 50);
     }
     // Block-32 weights, 25 blocks a row (the odd tail block runs): Q8_0
-    // takes the SSE4 kernel, Q4_0 and IQ4_NL the nibble-decoding one.
+    // takes the SSE4 kernel, Q4_0 and IQ4_NL the nibble-decoding one,
+    // Q5_0 the one that adds the high bits (i#1077); 1408 columns too
+    // (Qwen1.5-MoE's expert down rows, 44 blocks).
     std::uniform_int_distribution<int> byte_d(0, 255);
     std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
     for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
                                    std::pair{TensorType::kQ4_0, 18u},
+                                   std::pair{TensorType::kQ5_0, 22u},
                                    std::pair{TensorType::kIQ4_NL, 18u}}) {
         std::vector<std::byte> w(std::size_t{rows} * 25 * bytes);
         for (auto& by : w) {
@@ -1125,6 +1128,15 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
             std::memcpy(w.data() + bl * bytes, &d, 2);
         }
         check(Mat{t, w.data(), rows, 800}, 7);
+        std::vector<std::byte> w2(std::size_t{rows} * 44 * bytes);
+        for (auto& by : w2) {
+            by = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w2.size() / bytes; ++bl) {
+            const std::uint16_t d = f32_to_f16(scale_d(rng));
+            std::memcpy(w2.data() + bl * bytes, &d, 2);
+        }
+        check(Mat{t, w2.data(), rows, 1408}, 9);
     }
     // The IQ types with an sse4 dot: random bytes are valid codes, signs
     // and scales; 8 blocks a row, 50 tokens over two tiles.
@@ -2469,7 +2481,7 @@ TEST_CASE("matvec_q8k dots block-32 weights against a Q8_0 activation",
         matvec_q8k(m, x, {&out, 1});
         REQUIRE(out == 129.0f);
     }
-    SECTION("Q8_0, Q4_0 and IQ4_NL track the f32 dot") {
+    SECTION("Q8_0, Q4_0, Q5_0 and IQ4_NL track the f32 dot") {
         std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
         std::vector<float> x(96);  // 3 blocks: the odd tail runs too
         for (auto& v : x) {
@@ -2480,6 +2492,7 @@ TEST_CASE("matvec_q8k dots block-32 weights against a Q8_0 activation",
             std::size_t block;
         };
         for (const C c : {C{TensorType::kQ8_0, 34}, C{TensorType::kQ4_0, 18},
+                          C{TensorType::kQ5_0, 22},
                           C{TensorType::kIQ4_NL, 18}}) {
             INFO("type " << static_cast<int>(c.type));
             std::vector<std::byte> w(7 * 3 * c.block);
