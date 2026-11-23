@@ -423,9 +423,9 @@ read back; attention, the dense layers and the shared experts stay on
 the GPU (i#1174). Uploading the picks each token instead
 (`LOCUS_VK_HOST_EXPERTS=0`) costs PCIe bandwidth for nothing:
 Qwen1.5-MoE on a 2 GB GTX 750 Ti decodes at 0.1 tok/s that way and
-3.9 with the CPU picks. Routed on the host for another reason (no
-batched kernel, a bias the GPU router lacks), the experts fit and
-still run on the GPU.
+3.9 with the CPU picks. Routed on the host for another reason (a pool
+budget, no batched kernel, a bias the GPU router lacks), the fit is
+not checked and the picks upload as before (i#1178).
 
 On a cold spinning disk, GLM-5.2 runs faster end to end than a
 CPU-only llama.cpp (50.7 versus 92 minutes for 16 tokens), because

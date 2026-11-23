@@ -2587,9 +2587,10 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
 
 /** @returns Whether the host-routed decode computes the picked experts
  *  on the CPU (i#1174): gpu_route_ok found that they do not fit the
- *  device, and LOCUS_VK_HOST_EXPERTS is not "0". Experts routed on the
- *  host for another reason (no batched kernel, a bias the GPU router
- *  lacks) fit, and still run on the GPU. */
+ *  device, and LOCUS_VK_HOST_EXPERTS is not "0". gpu_route_ok checks
+ *  the fit last: routed on the host for another reason (a pool budget,
+ *  no batched kernel, a bias the GPU router lacks), the model has no
+ *  verdict and its picks upload as before (i#1178). */
 bool host_experts(const State& s, const model::TransformerModel& m) {
     static const bool off = [] {
         const char* e = std::getenv("LOCUS_VK_HOST_EXPERTS");
