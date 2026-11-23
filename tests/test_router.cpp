@@ -1439,3 +1439,165 @@ TEST_CASE("router: a model list with invalid UTF-8 does not stop it",
     const auto h = c.send(ClientRequest{"GET", "/health", {}, ""});
     REQUIRE(h.ok);
 }
+
+namespace {
+
+/** A fake guard instance (i#1161): POST /v1/guard/{api} rejects a body
+ *  holding "BAD" (400, the guard error), fails on "BROKEN" (500), is
+ *  busy when `busy` (503), else allows; it counts its checks. */
+struct FakeGuard {
+    std::atomic<int> checks{0};
+    std::atomic<bool> busy{false};
+    std::mutex mu;
+    std::string last_target;
+    std::unique_ptr<locus::http::Server> server;
+    int port = 0;
+
+    FakeGuard() {
+        locus::http::ServerConfig c;
+        c.host = "127.0.0.1";
+        c.port = 0;
+        c.worker_threads = 4;
+        server = std::make_unique<locus::http::Server>(
+            c, [this](const locus::http::Request& req,
+                      locus::http::ServerResponse& res,
+                      const locus::http::RequestContext&) {
+                ++checks;
+                {
+                    std::lock_guard lk(mu);
+                    last_target = req.path;
+                }
+                if (busy) {
+                    res.status = 503;
+                    res.set_header("Retry-After", "3");
+                    return;
+                }
+                if (req.body.find("BAD") != std::string::npos) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":"content_filter","guard":"g"}})",
+                        "application/json");
+                } else if (req.body.find("BROKEN") != std::string::npos) {
+                    res.status = 500;
+                    res.set_content(R"({"error":{"type":"server_error"}})",
+                                    "application/json");
+                } else {
+                    res.set_content(R"({"allow":true})", "application/json");
+                }
+            });
+        port = server->start();
+        REQUIRE(port > 0);
+    }
+    std::string addr() const { return "127.0.0.1:" + std::to_string(port); }
+};
+
+json chat_body(const std::string& text) {
+    return {{"messages", json::array({{{"role", "user"}, {"content", text}}})}};
+}
+
+}  // namespace
+
+TEST_CASE("router: --guard checks text requests before routing them",
+          "[router][guard]") {
+    FakeInstance text("text", {"text"}, "m");
+    FakeGuard guard;
+    RouterConfig cfg;
+    cfg.guards = {guard.addr()};
+    RouterFixture rf({text.addr()}, cfg);
+
+    // Allowed: forwarded to the chat instance.
+    auto ok = rf.post("/v1/chat/completions", chat_body("hello"));
+    REQUIRE(ok.ok);
+    CHECK(ok.head.status == 200);
+    CHECK(ok.body.find("text /v1/chat/completions") != std::string::npos);
+    {
+        std::lock_guard lk(guard.mu);
+        CHECK(guard.last_target == "/v1/guard/chat/completions");
+    }
+    // Flagged: the guard's 400 is relayed, the chat instance not asked.
+    auto bad = rf.post("/v1/messages", chat_body("say BAD things"));
+    REQUIRE(bad.ok);
+    CHECK(bad.head.status == 400);
+    CHECK(bad.body.find("content_filter") != std::string::npos);
+    CHECK(bad.body.find("text /v1/messages") == std::string::npos);
+    // A failed guard's 500 is relayed too (fail closed).
+    auto broken = rf.post("/v1/completions", json{{"prompt", "BROKEN"}});
+    REQUIRE(broken.ok);
+    CHECK(broken.head.status == 500);
+    // Not a guarded endpoint: no check.
+    const int before = guard.checks.load();
+    auto emb = rf.post("/v1/embeddings", json{{"input", "BAD"}});
+    REQUIRE(emb.ok);
+    CHECK(guard.checks.load() == before);
+
+    // The router's metrics count per guard instance.
+    Client c("127.0.0.1", rf.port);
+    const auto m = c.send(ClientRequest{"GET", "/metrics", {}, ""});
+    REQUIRE(m.ok);
+    const std::string g = "{guard=\"" + guard.addr() + "\"} ";
+    CHECK(m.body.find("locus_router_guard_checks_total" + g + "3") !=
+          std::string::npos);
+    CHECK(m.body.find("locus_router_guard_rejects_total" + g + "1") !=
+          std::string::npos);
+    CHECK(m.body.find("locus_router_guard_failures_total" + g + "1") !=
+          std::string::npos);
+}
+
+TEST_CASE("router: a busy or down guard passes to the next, none is a 503",
+          "[router][guard]") {
+    FakeInstance text("text", {"text"}, "m");
+    FakeGuard a, b;
+    std::string dead;
+    {
+        FakeGuard gone;
+        dead = gone.addr();
+    }
+    RouterConfig cfg;
+    cfg.guards = {dead, a.addr(), b.addr()};
+    RouterFixture rf({text.addr()}, cfg);
+    a.busy = true;  // a answers 503: the request moves on to b
+    auto ok = rf.post("/v1/chat/completions", chat_body("hello"));
+    REQUIRE(ok.ok);
+    CHECK(ok.head.status == 200);
+    CHECK(b.checks.load() >= 1);
+    b.busy = true;
+    auto none = rf.post("/v1/chat/completions", chat_body("hello"));
+    REQUIRE(none.ok);
+    CHECK(none.head.status == 503);
+    CHECK(none.body.find("no guard instance answered") != std::string::npos);
+    CHECK(none.body.find("text /v1/chat") == std::string::npos);
+}
+
+TEST_CASE("router: a session keeps its guard instance", "[router][guard]") {
+    FakeInstance text("text", {"text"}, "m");
+    FakeGuard a, b;
+    RouterConfig cfg;
+    cfg.guards = {a.addr(), b.addr()};
+    RouterFixture rf({text.addr()}, cfg);
+    for (int i = 0; i < 6; ++i) {
+        rf.post("/v1/chat/completions", chat_body("hello"),
+                {{"X-Session-Id", "one-session"}});
+    }
+    // All six went to the same guard.
+    CHECK(((a.checks.load() == 6 && b.checks.load() == 0) ||
+           (a.checks.load() == 0 && b.checks.load() == 6)));
+}
+
+TEST_CASE("router: --guard parses and refuses a bad entry", "[router][guard]") {
+    RouterConfig cfg;
+    bool help = false;
+    std::vector<const char*> argv{"locus-router", "--guard",
+                                  "127.0.0.1:9001,srv:_g._tcp.example",
+                                  "--guard", "127.0.0.1:9002",
+                                  "127.0.0.1:8001"};
+    CHECK(locus_tools::parse_router_args(static_cast<int>(argv.size()),
+                                         const_cast<char**>(argv.data()), 1,
+                                         cfg, help) == "");
+    CHECK(cfg.guards == std::vector<std::string>{"127.0.0.1:9001",
+                                                 "srv:_g._tcp.example",
+                                                 "127.0.0.1:9002"});
+    RouterConfig bad;
+    bad.instances = {"127.0.0.1:8001"};
+    bad.guards = {"not-an-address"};
+    CHECK_THROWS_AS(Router(bad), std::invalid_argument);
+}

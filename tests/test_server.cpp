@@ -1370,6 +1370,88 @@ TEST_CASE("several guards run in order and any one rejects",
                     std::invalid_argument);
 }
 
+// i#1161: a guard instance for locus-router: `guard` in locus_kinds and
+// POST /v1/guard/{api} with the client's body.
+TEST_CASE("a guard instance answers /v1/guard for each API",
+          "[server][e2e][guard]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::server::OpenAiServer::Options opt;
+    opt.extra_guards = {std::make_shared<WordGuard>("harm", "BAD", "S1")};
+    TestServer ts(model, tok, opt);
+    httplib::Client client("127.0.0.1", ts.port);
+    const auto models = client.Get("/v1/models");
+    REQUIRE(models);
+    const auto kinds = json::parse(models->body)["locus_kinds"];
+    CHECK(std::find(kinds.begin(), kinds.end(), "guard") != kinds.end());
+
+    const auto chat = [](const char* text) {
+        return json{{"messages", json::array({{{"role", "user"},
+                                               {"content", text}}})},
+                    {"max_tokens", 2}};
+    };
+    // Allowed: 200 {"allow": true}, and no completion runs.
+    auto ok = client.Post("/v1/guard/chat/completions",
+                          chat("hello").dump(), "application/json");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(json::parse(ok->body) == json{{"allow", true}});
+    // Flagged: exactly what /v1/chat/completions itself answers.
+    auto flagged = client.Post("/v1/guard/chat/completions",
+                               chat("say BAD").dump(), "application/json");
+    auto direct = client.Post("/v1/chat/completions", chat("say BAD").dump(),
+                              "application/json");
+    REQUIRE(flagged);
+    REQUIRE(direct);
+    CHECK(flagged->status == 400);
+    CHECK(flagged->status == direct->status);
+    CHECK(json::parse(flagged->body) == json::parse(direct->body));
+    // Each API's own shape and parsing.
+    auto msg = client.Post("/v1/guard/messages", chat("BAD").dump(),
+                           "application/json");
+    REQUIRE(msg);
+    CHECK(msg->status == 400);
+    CHECK(json::parse(msg->body)["type"] == "error");
+    auto comp = client.Post("/v1/guard/completions",
+                            json{{"prompt", "BAD"}}.dump(), "application/json");
+    REQUIRE(comp);
+    CHECK(comp->status == 400);
+    auto resp = client.Post("/v1/guard/responses",
+                            json{{"input", "hello"}}.dump(), "application/json");
+    REQUIRE(resp);
+    CHECK(resp->status == 200);
+    // A body the endpoint would refuse is a 400 here too.
+    auto junk = client.Post("/v1/guard/chat/completions", "{}",
+                            "application/json");
+    REQUIRE(junk);
+    CHECK(junk->status == 400);
+}
+
+TEST_CASE("an instance without guards lists no guard kind",
+          "[server][e2e][guard]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    TestServer ts(model, tok);
+    httplib::Client client("127.0.0.1", ts.port);
+    const auto models = client.Get("/v1/models");
+    REQUIRE(models);
+    const auto kinds = json::parse(models->body)["locus_kinds"];
+    CHECK(std::find(kinds.begin(), kinds.end(), "guard") == kinds.end());
+    auto r = client.Post("/v1/guard/chat/completions",
+                         R"({"messages":[{"role":"user","content":"x"}]})",
+                         "application/json");
+    REQUIRE(r);
+    CHECK(r->status == 404);
+}
+
 TEST_CASE("a prompt-guard --guard rejects an injected tool result",
           "[server][e2e][guard]") {
     const std::string pg = std::string(LOCUS_SOURCE_DIR) +

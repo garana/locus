@@ -100,7 +100,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   as host:port, found by DNS SRV, by mDNS / DNS-SD or by scanning an
   address range, or registering themselves with a key (`locus-server
   --register`), each request sent to an instance that serves its kind
-  and model; experimental, #388);
+  and model; `--guard HOST:PORT` checks each text request with a
+  guard instance first; experimental, #388);
   `locus-auth-helper` (a reference auth helper,
   see docs/CLIENTS.md); `locus-prefix-helper` (a reference prefix
   cache helper that keeps the blobs in a directory, see

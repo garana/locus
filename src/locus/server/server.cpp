@@ -2129,6 +2129,11 @@ OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
         if (path == "/v1/responses") {
             return Route::kResponses;
         }
+        if (path == "/v1/guard/chat/completions" ||
+            path == "/v1/guard/completions" || path == "/v1/guard/messages" ||
+            path == "/v1/guard/responses") {
+            return Route::kGuard;
+        }
         if (path == "/v1/embeddings") {
             return Route::kEmbeddings;
         }
@@ -2282,6 +2287,8 @@ void OpenAiServer::install_routes() {
             if (snac_) kinds.push_back("speech");
             if (rerank_) kinds.push_back("rerank");
             if (classifier_) kinds.push_back("classify");
+            // POST /v1/guard/{api} answers (i#1161).
+            if (!guards_.empty()) kinds.push_back("guard");
             res.set_content(
                 json{{"object", "list"},
                      {"data", data},
@@ -4858,6 +4865,76 @@ void OpenAiServer::install_routes() {
         res.set_content(std::move(mp4), "video/mp4");
     };
 
+    // POST /v1/guard/{api} (i#1161): the verdict of this instance's
+    // guards on that API's request body, for a locus-router that checks
+    // requests before routing them. The body is the client's, parsed
+    // as its own endpoint parses it, so the guards judge the same
+    // turns. 200 {"allow": true}, or exactly the 400 / 500 that
+    // endpoint gives a flagged or failed request, which the router
+    // relays as is.
+    auto handle_guard = [this](const http::Request& req,
+                               http::ServerResponse& res,
+                               const http::RequestContext& ctx) {
+        auth_event("create", "guard", ctx.identity);
+        constexpr std::string_view kPrefix = "/v1/guard/";
+        const std::string api = req.path.substr(kPrefix.size());
+        const bool anthropic = api == "messages";
+        const auto fail = [&](int status, const std::string& msg) {
+            res.status = status;
+            const json body =
+                anthropic ? json{{"type", "error"},
+                                 {"error",
+                                  {{"type", "invalid_request_error"},
+                                   {"message", msg}}}}
+                          : make_error(msg);
+            res.set_content(body.dump(-1, ' ', false, kLossy),
+                            "application/json");
+        };
+        if (guards_.empty()) {
+            fail(404, "this instance runs no guard");
+            return;
+        }
+        std::vector<chat::Message> turns;
+        try {
+            const json body = http::parse_json(req.body);
+            if (api == "completions") {
+                if (!body.contains("prompt") || !body["prompt"].is_string()) {
+                    throw std::invalid_argument("prompt must be a string");
+                }
+                turns = {{"user", body["prompt"].get<std::string>()}};
+            } else if (api == "responses") {
+                turns = parse_responses_request(body).messages;
+            } else {
+                if (!body.contains("messages") ||
+                    !body["messages"].is_array() ||
+                    body["messages"].empty()) {
+                    throw std::invalid_argument(
+                        "messages must be a non-empty array");
+                }
+                const auto vision = parse_vision_chat(
+                    body, anthropic, opt_.max_tokens_cap, opt_.max_body_bytes,
+                    qwen_vision_ ? "" : "\n");
+                if (vision) {
+                    turns = vision_turns(*vision);
+                } else if (anthropic) {
+                    bool tool_history = false;
+                    turns = parse_anthropic_messages(body, &tool_history);
+                } else {
+                    bool tool_history = false;
+                    turns = parse_messages(body["messages"], &tool_history);
+                }
+            }
+        } catch (const std::exception& e) {
+            fail(400, e.what());
+            return;
+        }
+        if (const auto flagged = guard_flags(turns)) {
+            set_guard_error(res, flagged->first, flagged->second, anthropic);
+            return;
+        }
+        res.set_content(R"({"allow":true})", "application/json");
+    };
+
     // One dispatch handler over all routes (route_of is the single home
     // for routing, shared with the auth head stage below).
     route_handler_ = [this, handle_health, handle_models,
@@ -4865,7 +4942,7 @@ void OpenAiServer::install_routes() {
                       handle_messages, handle_responses, handle_embeddings,
                       handle_rerank, handle_classify, handle_audio,
                       handle_images, handle_edits, handle_videos,
-                      handle_video_by_id, handle_video_content](
+                      handle_video_by_id, handle_video_content, handle_guard](
                          const http::Request& req, http::ServerResponse& res,
                          const http::RequestContext& ctx) {
         // Which models answer (i#1107). The embeddings and image handlers
@@ -4903,6 +4980,7 @@ void OpenAiServer::install_routes() {
             case Route::kChat:        handle(req, res, ctx, true); break;
             case Route::kMessages:    handle_messages(req, res, ctx); break;
             case Route::kResponses:   handle_responses(req, res, ctx); break;
+            case Route::kGuard:       handle_guard(req, res, ctx); break;
             case Route::kEmbeddings:  handle_embeddings(req, res, ctx); break;
             case Route::kRerank:      handle_rerank(req, res, ctx); break;
             case Route::kClassify:    handle_classify(req, res, ctx); break;

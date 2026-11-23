@@ -207,6 +207,19 @@ progress hook names, the replies that call back and the due keepalives
 of every stream in turn.
 `http::Server` (a thread a connection) stays the default for now.
 
+Guards behind the router (i#1161): `--guard` names guard instances
+(locus-servers with guards; host:port or `srv:NAME`, never discovered,
+since a guard decides what passes). Each chat, completions, messages
+or responses request (text or image-to-text) then goes first to one of
+them, `POST /v1/guard/{api}` with the client's body, in rendezvous
+order by the session key (a conversation keeps its guard's prefix
+cache), the next after a connect failure, a busy 503 or any reply that
+is not a verdict. The guard instance parses the body as its own
+endpoint does and answers 200 `{"allow": true}`, or that endpoint's
+own 400 (flagged) or 500 (failed guard), which the router relays and
+does not forward. None answering is a 503: the check fails closed. A
+check runs on the guard instance's engine worker, not the chat one,
+so a chat instance's streams do not wait for it.
 `locus-router` (`router::Router`) proxies each request to one of
 several instances by kind: text, image-to-text (a chat, messages or
 responses body with an image part), image, video, speech, rerank or
