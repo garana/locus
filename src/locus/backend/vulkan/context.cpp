@@ -410,6 +410,12 @@ namespace locus::backend::vk {
 
 namespace {
 
+/** The memory budget query's sTypes (names past 80 columns inline). */
+constexpr VkStructureType kBudgetSType =
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+constexpr VkStructureType kProps2SType =
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+
 void check(VkResult r, const char* what) {
     if (r != VK_SUCCESS) {
         throw std::runtime_error(std::string("vulkan: ") + what +
@@ -1955,8 +1961,35 @@ struct VulkanContext::Impl {
         // Into a local: a failed call leaves its output undefined, and
         // make_buffer's cleanup reads b.mem.
         VkDeviceMemory mem = VK_NULL_HANDLE;
-        check(vkAllocateMemory(device, &mai, nullptr, &mem),
-              "allocate memory");
+        const VkResult got = vkAllocateMemory(device, &mai, nullptr, &mem);
+        if (got != VK_SUCCESS) {
+            // Which allocation, from which heap, with how much of this
+            // context's already out (i#1164: a full suite failed here
+            // with the device-local budget far from spent).
+            const auto mb = [](VkDeviceSize n) {
+                return std::to_string(n >> 20) + " MB";
+            };
+            std::string what =
+                "allocate memory (" + mb(req.size) + " host-visible, type " +
+                std::to_string(type) + ", heap " +
+                std::to_string(buffer_heap) + " of " +
+                mb(props.memoryHeaps[buffer_heap].size) +
+                "; this context has " + mb(allocated);
+            if (has_budget) {
+                // The budget extension's view of that heap: the
+                // process's usage and what the driver allows.
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT bud{};
+                bud.sType = kBudgetSType;
+                VkPhysicalDeviceMemoryProperties2 p2{};
+                p2.sType = kProps2SType;
+                p2.pNext = &bud;
+                vkGetPhysicalDeviceMemoryProperties2(phys, &p2);
+                what += "; heap usage " + mb(bud.heapUsage[buffer_heap]) +
+                        " of budget " + mb(bud.heapBudget[buffer_heap]);
+            }
+            what += ")";
+            check(got, what.c_str());
+        }
         b.mem = mem;
         b.bytes = req.size;
         allocated += req.size;
