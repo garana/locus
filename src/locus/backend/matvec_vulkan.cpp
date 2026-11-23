@@ -2507,6 +2507,12 @@ bool batch_declined(const char* why) {
     return false;
 }
 
+/** @returns Whether m's routed experts fit the device's free memory
+ *  (vk::moe_experts_fit), settled at the first call for m and kept
+ *  (s.moe_gpu_fits); a misfit prints why the MoE routes on the host.
+ *  gpu_route_ok's last check, and host_experts'. */
+bool experts_fit(State& s, const model::TransformerModel& m);
+
 bool gpu_route_ok(State& s, const model::TransformerModel& m,
                   const model::TransformerModel::Layer& lay) {
     const auto& hp = m.hparams();
@@ -2543,6 +2549,11 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
             return false;
         }
     }
+    return experts_fit(s, m);
+}
+
+bool experts_fit(State& s, const model::TransformerModel& m) {
+    const auto& hp = m.hparams();
     auto fit = s.moe_gpu_fits.find(&m);
     if (fit == s.moe_gpu_fits.end()) {
         // Experts imported in place (#317: every type but Q8_0's
@@ -2586,21 +2597,16 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
 }
 
 /** @returns Whether the host-routed decode computes the picked experts
- *  on the CPU (i#1174): gpu_route_ok found that they do not fit the
- *  device, and LOCUS_VK_HOST_EXPERTS is not "0". gpu_route_ok checks
- *  the fit last: routed on the host for another reason (a pool budget,
- *  no batched kernel, a bias the GPU router lacks), the model has no
- *  verdict and its picks upload as before (i#1178). */
-bool host_experts(const State& s, const model::TransformerModel& m) {
+ *  on the CPU (i#1174): they do not fit the device (experts_fit, which
+ *  settles the verdict here when gpu_route_ok returned before reaching
+ *  it: a pool budget, no batched kernel, a bias the GPU router lacks,
+ *  i#1178), and LOCUS_VK_HOST_EXPERTS is not "0". */
+bool host_experts(State& s, const model::TransformerModel& m) {
     static const bool off = [] {
         const char* e = std::getenv("LOCUS_VK_HOST_EXPERTS");
         return e != nullptr && std::string_view(e) == "0";
     }();
-    if (off) {
-        return false;
-    }
-    const auto fit = s.moe_gpu_fits.find(&m);
-    return fit != s.moe_gpu_fits.end() && !fit->second;
+    return !off && !experts_fit(s, m);
 }
 
 /** @returns The CPU backend host_experts' picks run on: the best CPU
