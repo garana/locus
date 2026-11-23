@@ -239,7 +239,11 @@ std::vector<std::uint8_t> DiskPrefixStore::header(
     put(h, key_.model_size);
     put(h, key_.overrides);
     put(h, static_cast<std::uint32_t>(key_.device_attention));
-    put(h, static_cast<std::uint32_t>(key_.experts_on_gpu));
+    // The experts' route: 0 host with GPU picks, 1 GPU, 2 host with CPU
+    // picks (DiskKey::experts_on_host_cpu).
+    put(h, std::uint32_t{key_.experts_on_gpu        ? 1u
+                         : key_.experts_on_host_cpu ? 2u
+                                                    : 0u});
     // Keyed files end with a tag, and the header names the key by a
     // hash of it (0: unkeyed), so stores with no key or another key
     // name their files apart instead of removing each other's.
@@ -666,6 +670,13 @@ void DiskPrefixStore::set_device_attention(bool on) {
 void DiskPrefixStore::set_experts_on_gpu(bool on) {
     std::lock_guard lock(mu_);
     key_.experts_on_gpu = on;
+    const std::vector<std::uint8_t> k = header({}, 0);
+    key_seed_ = checksum(k.data(), k.size());
+}
+
+void DiskPrefixStore::set_experts_on_host_cpu(bool on) {
+    std::lock_guard lock(mu_);
+    key_.experts_on_host_cpu = on;
     const std::vector<std::uint8_t> k = header({}, 0);
     key_seed_ = checksum(k.data(), k.size());
 }

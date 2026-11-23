@@ -199,6 +199,34 @@ TEST_CASE("DiskPrefixStore: the expert route is part of the match",
     REQUIRE(s.find(kPrompt) == 0);  // the other route's file
 }
 
+// i#1179: routed on the host, CPU picks (i#1174) and GPU picks give other
+// K/V bits, so they never share a file; a GPU-picks store keeps the
+// header value (0) every binary before i#1174 wrote, so its files hit.
+TEST_CASE("DiskPrefixStore: host-routed CPU picks are part of the match",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-cpu-picks")};
+    const auto in = blocks(2, 6);
+    DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+    const fs::path gpu_picks = s.path_for(kPrompt, 2);
+    REQUIRE(s.write(kPrompt, 2, srcs(in)));  // as an older binary would
+    s.set_experts_on_host_cpu(true);
+    REQUIRE(s.key().experts_on_host_cpu);
+    const fs::path cpu_picks = s.path_for(kPrompt, 2);
+    REQUIRE(cpu_picks != gpu_picks);
+    REQUIRE(s.find(kPrompt) == 0);  // the GPU picks' file is not read
+    REQUIRE(s.write(kPrompt, 2, srcs(in)));
+    REQUIRE(s.find(kPrompt) == 2);
+    // The GPU route is a third key.
+    s.set_experts_on_host_cpu(false);
+    s.set_experts_on_gpu(true);
+    REQUIRE(s.path_for(kPrompt, 2) != cpu_picks);
+    REQUIRE(s.path_for(kPrompt, 2) != gpu_picks);
+    // Back to GPU picks: the same name and file as before.
+    s.set_experts_on_gpu(false);
+    REQUIRE(s.path_for(kPrompt, 2) == gpu_picks);
+    REQUIRE(s.find(kPrompt) == 2);
+}
+
 TEST_CASE("DiskPrefixStore: a file under another file's name is a miss",
           "[disk_prefix]") {
     // A digest collision, or a file of another key under this key's

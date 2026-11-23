@@ -48,6 +48,9 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
         // Vulkan routes MoE experts on the GPU or the host by the free
         // device memory; settled now, with the KV pool allocated.
         cfg_.disk_prefix->set_experts_on_gpu(m.experts_on_gpu());
+        // Routed on the host, the picks run on the CPU or the GPU
+        // (i#1174), with other bits again (i#1179).
+        cfg_.disk_prefix->set_experts_on_host_cpu(m.experts_on_host_cpu());
         // The MoE hybrid's hot zone follows the requests served before,
         // so where an expert ran (GPU or CPU), and so the K/V bits,
         // depend on history no key can hold (i#664). Settled now, after

@@ -41,6 +41,17 @@ bool vulkan_forward_supported(const model::TransformerModel& m);
 bool vulkan_moe_gpu_route(const model::TransformerModel& m);
 
 /**
+ * Settles, as vulkan_moe_gpu_route does, whether some MoE layer of m
+ * routes on the host and runs its picks on the CPU (i#1174: the
+ * experts do not fit the device), rather than uploading them for the
+ * GPU. The two give other K/V bits, so the disk prefix key holds it
+ * (i#1179).
+ * @returns true when such a layer exists; false for a dense model or
+ *     without a usable device.
+ */
+bool vulkan_moe_host_cpu_picks(const model::TransformerModel& m);
+
+/**
  * Runs one full token forward on the GPU: all matmuls (F32/Q8_0
  * shaders), rmsnorm, RoPE, SwiGLU, and paged attention reading
  * K/V straight from the GPU-mapped cache pool, recorded as one
