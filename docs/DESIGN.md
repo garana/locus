@@ -213,9 +213,15 @@ since a guard decides what passes). Each chat, completions, messages
 or responses request (text or image-to-text) then goes first to one of
 them, `POST /v1/guard/{api}` with the client's body, in rendezvous
 order by the session key (a conversation keeps its guard's prefix
-cache), the next after a connect failure, a busy 503 or any reply that
-is not a verdict. The guard instance parses the body as its own
-endpoint does and answers 200 `{"allow": true}`, or that endpoint's
+cache), the next after a connect failure, a busy 503, no reply within
+`--guard-timeout` (60 s; a chat's 30 minutes would hold the request
+behind a hung guard) or any reply that is not a verdict. The guard
+endpoint marks each reply it writes with `X-Locus-Guard: verdict`; the
+router allows only on a marked 200 `{"allow": true}` and relays only a
+marked 400 or 500, so a proxy or another service at a guard's address
+never decides what passes. The guard instance parses the body
+as its own endpoint does and answers 200 `{"allow": true}`, or that
+endpoint's
 own 400 (flagged) or 500 (failed guard), which the router relays and
 does not forward. None answering is a 503: the check fails closed. A
 check runs on the guard instance's engine worker, not the chat one,

@@ -84,6 +84,8 @@ inline constexpr const char* kRouterUsage =
     "                      and none answering is a 503. Name them here,\n"
     "                      never by discovery: a guard decides what\n"
     "                      passes\n"
+    "  --guard-timeout S   longest silence from a guard instance before\n"
+    "                      the next one is tried (default 60; 0 = none)\n"
     "  -h, --help          show this help and exit\n";
 
 /**
@@ -163,6 +165,12 @@ inline std::string parse_router_args(int argc, char** argv, int first,
             } catch (const std::exception& e) {
                 return e.what();
             }
+        } else if (a == "--guard-timeout" && i + 1 < argc) {
+            int n = 0;
+            if (!parse_nonneg_int(argv[++i], n) || n > 86400) {
+                return std::string("bad --guard-timeout: ") + argv[i];
+            }
+            cfg.guard_read_timeout_ms = n * 1000;
         } else if (a == "--guard" && i + 1 < argc) {
             // Comma-separated host:port / srv:NAME entries; repeatable.
             const std::string list = argv[++i];

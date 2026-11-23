@@ -1448,6 +1448,10 @@ namespace {
 struct FakeGuard {
     std::atomic<int> checks{0};
     std::atomic<bool> busy{false};
+    /** Answer 200 "ok" as text, as a service that is not a guard. */
+    std::atomic<bool> not_a_guard{false};
+    /** Leave out X-Locus-Guard: the replies of another service. */
+    std::atomic<bool> unmarked{false};
     std::mutex mu;
     std::string last_target;
     std::unique_ptr<locus::http::Server> server;
@@ -1471,6 +1475,13 @@ struct FakeGuard {
                     res.status = 503;
                     res.set_header("Retry-After", "3");
                     return;
+                }
+                if (not_a_guard) {
+                    res.set_content("ok", "text/plain");
+                    return;
+                }
+                if (!unmarked) {
+                    res.set_header("X-Locus-Guard", "verdict");
                 }
                 if (req.body.find("BAD") != std::string::npos) {
                     res.status = 400;
@@ -1566,6 +1577,63 @@ TEST_CASE("router: a busy or down guard passes to the next, none is a 503",
     CHECK(none.head.status == 503);
     CHECK(none.body.find("no guard instance answered") != std::string::npos);
     CHECK(none.body.find("text /v1/chat") == std::string::npos);
+}
+
+TEST_CASE("router: a 200 that is not a guard verdict does not allow",
+          "[router][guard]") {
+    FakeInstance text("text", {"text"}, "m");
+    FakeGuard other;
+    other.not_a_guard = true;  // 200 "ok", text/plain
+    RouterConfig cfg;
+    cfg.guards = {other.addr()};
+    RouterFixture rf({text.addr()}, cfg);
+    auto r = rf.post("/v1/chat/completions", chat_body("hello"));
+    REQUIRE(r.ok);
+    CHECK(r.head.status == 503);
+    CHECK(r.body.find("not a guard verdict") != std::string::npos);
+    CHECK(r.body.find("text /v1/chat") == std::string::npos);
+}
+
+TEST_CASE("router: unmarked replies fall through to the next guard",
+          "[router][guard]") {
+    FakeInstance text("text", {"text"}, "m");
+    FakeGuard rogue, real;
+    rogue.unmarked = true;  // a JSON allow, 400 and 500, all unmarked
+    RouterConfig cfg;
+    cfg.guards = {rogue.addr(), real.addr()};
+    RouterFixture rf({text.addr()}, cfg);
+    for (const char* text_in : {"hello", "BAD", "BROKEN"}) {
+        const int real_before = real.checks.load();
+        const int rogue_before = rogue.checks.load();
+        auto r = rf.post("/v1/chat/completions", chat_body(text_in));
+        REQUIRE(r.ok);
+        // The real guard decides every time, whichever is asked first.
+        CHECK(real.checks.load() == real_before + 1);
+        CHECK(rogue.checks.load() <= rogue_before + 1);
+        const int want = std::string(text_in) == "hello" ? 200
+                         : std::string(text_in) == "BAD" ? 400
+                                                         : 500;
+        CHECK(r.head.status == want);
+    }
+    // With only the rogue: none answers, 503.
+    RouterConfig only;
+    only.guards = {rogue.addr()};
+    RouterFixture rf2({text.addr()}, only);
+    auto r = rf2.post("/v1/chat/completions", chat_body("hello"));
+    REQUIRE(r.ok);
+    CHECK(r.head.status == 503);
+}
+
+TEST_CASE("router: --guard-timeout parses", "[router][guard]") {
+    RouterConfig cfg;
+    bool help = false;
+    std::vector<const char*> argv{"locus-router", "--guard-timeout", "5",
+                                  "127.0.0.1:8001"};
+    CHECK(locus_tools::parse_router_args(static_cast<int>(argv.size()),
+                                         const_cast<char**>(argv.data()), 1,
+                                         cfg, help) == "");
+    CHECK(cfg.guard_read_timeout_ms == 5000);
+    CHECK(RouterConfig{}.guard_read_timeout_ms == 60000);
 }
 
 TEST_CASE("router: a session keeps its guard instance", "[router][guard]") {

@@ -1429,6 +1429,12 @@ TEST_CASE("a guard instance answers /v1/guard for each API",
                             "application/json");
     REQUIRE(junk);
     CHECK(junk->status == 400);
+    // Every reply is marked as the guard endpoint's own.
+    for (const auto* r : {&ok, &flagged, &msg, &comp, &resp, &junk}) {
+        CHECK((*r)->get_header_value("X-Locus-Guard") == "verdict");
+    }
+    // The chat endpoint's own reply is not.
+    CHECK(direct->get_header_value("X-Locus-Guard").empty());
 }
 
 TEST_CASE("an instance without guards lists no guard kind",

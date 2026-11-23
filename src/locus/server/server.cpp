@@ -4894,6 +4894,11 @@ void OpenAiServer::install_routes() {
             fail(404, "this instance runs no guard");
             return;
         }
+        // Marks every reply from here (allow, flagged, failed guard, a
+        // bad body) as this endpoint's: the router trusts only marked
+        // replies, so a proxy or other service at a guard's address
+        // never decides what passes.
+        res.set_header("X-Locus-Guard", "verdict");
         std::vector<chat::Message> turns;
         try {
             const json body = http::parse_json(req.body);

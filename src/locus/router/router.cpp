@@ -1226,7 +1226,7 @@ bool Router::check_guard(const http::Request& req, const Route& rt,
         in.port = t.second;
         up.headers = upstream_headers(req, in);
         http::Client client(t.first, t.second, cfg_.upstream);
-        client.set_read_timeout_ms(cfg_.text_read_timeout_ms);
+        client.set_read_timeout_ms(cfg_.guard_read_timeout_ms);
         const auto head = client.begin(up);
         std::string body, err;
         if (!head.ok || !client.read_body(
@@ -1242,9 +1242,26 @@ bool Router::check_guard(const http::Request& req, const Route& rt,
         }
         took();
         const int status = head.head.status;
-        if (status == 200) {
-            ++st.checks;
-            return true;  // allowed
+        // Only the guard endpoint's own replies count: each carries
+        // X-Locus-Guard: verdict. Anything else at that address (a
+        // proxy's page, another service) is not a verdict, so it never
+        // allows or rejects: the next guard is tried (fail closed).
+        const bool marked =
+            head.head.get_header_value("X-Locus-Guard") == "verdict";
+        if (marked && status == 200) {
+            // Allow only on a JSON {"allow": true}.
+            const auto v = json::parse(body, nullptr, false);
+            if (v.is_object() && v.contains("allow") &&
+                v["allow"].is_boolean() && v["allow"].get<bool>()) {
+                ++st.checks;
+                return true;  // allowed
+            }
+        }
+        if (!marked || status == 200) {
+            ++st.failures;
+            last = key + ": HTTP " + std::to_string(status) +
+                   " that is not a guard verdict";
+            continue;
         }
         if (status == 400 || status == 500) {
             // The guard's own rejection (flagged: 400; failed: 500), in
