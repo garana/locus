@@ -759,7 +759,11 @@ guarding the default path.
   sequence stays the verified key, so a collision never returns a
   wrong prefix. A disk tier (`--prefix-cache-dir`, i#416) keeps one
   file per prefix with the full key (the model's GGUF header, size and
-  mtime, the backend and device, the KV geometry, RoPE settings and
+  mtime, the backend and device, a digest of the sources that compute
+  KV (cmake/compute_digest.cmake over backend/, model/ and kv/, made
+  at build time: another build's kernels may sum in another order, so
+  an upgrade with changed ones misses; i#1180), the KV geometry, RoPE
+  settings and
   the numeric modes that change KV bits, and on Vulkan where the MoE
   experts run: routed on the GPU, or on the host with the picks on the
   GPU or on the CPU (i#1179), settled once the KV pool exists; a model with

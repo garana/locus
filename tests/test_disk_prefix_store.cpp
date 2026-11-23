@@ -169,6 +169,34 @@ TEST_CASE("DiskPrefixStore: every key field is part of the match",
     REQUIRE(wide.find(kPrompt) == 0);
 }
 
+// i#1180: the backend field carries a digest of the sources that
+// computed the KV, so another build's entries (and those of a binary
+// from before the digest, the plain name) miss, and the same build's hit.
+TEST_CASE("DiskPrefixStore: another build's kernels are a miss",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-digest")};
+    const auto in = blocks(2, 3);
+    DiskKey old = key();
+    old.backend = "metal";  // before i#1180
+    DiskKey now = key();
+    now.backend = "metal:532d9ddc";
+    DiskKey other = now;
+    other.backend = "metal:8cc17d54";
+    {
+        DiskPrefixStore s(g.dir, old, kBlockBytes, 1 << 20);
+        REQUIRE(s.write(kPrompt, 2, srcs(in)));
+    }
+    {
+        DiskPrefixStore s(g.dir, now, kBlockBytes, 1 << 20);
+        REQUIRE(s.find(kPrompt) == 0);
+        REQUIRE(s.write(kPrompt, 2, srcs(in)));
+    }
+    DiskPrefixStore same(g.dir, now, kBlockBytes, 1 << 20);
+    REQUIRE(same.find(kPrompt) == 2);
+    DiskPrefixStore later(g.dir, other, kBlockBytes, 1 << 20);
+    REQUIRE(later.find(kPrompt) == 0);
+}
+
 TEST_CASE("DiskPrefixStore: device attention is part of the match",
           "[disk_prefix]") {
     DirGuard g{temp_dir("locus-dps-devattn")};

@@ -136,7 +136,14 @@ TEST_CASE("the disk prefix key follows the model file and its settings",
     const auto k = locus::engine::disk_key_for(g, model_path(), model,
                                                locus::kv::KvType::kF32, bb);
     REQUIRE(k.model_size == fs::file_size(model_path()));
-    REQUIRE(k.backend == model.active_backend().name);
+    // The backend, then 8 hex digits of the sources that compute KV
+    // (i#1180).
+    const std::string name(model.active_backend().name);
+    REQUIRE(k.backend.size() == name.size() + 9);
+    REQUIRE(k.backend.compare(0, name.size() + 1, name + ":") == 0);
+    REQUIRE(k.backend.find_first_not_of("0123456789abcdef",
+                                        name.size() + 1) ==
+            std::string::npos);
     REQUIRE(k.block_tokens > 0);
     REQUIRE(bb > 0);
     // The same file gives the same key; another KV type another one.

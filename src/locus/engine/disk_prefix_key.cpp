@@ -11,6 +11,7 @@
 #include <string_view>
 
 #include "locus/backend/variants.hpp"
+#include "locus/engine/compute_digest.hpp"
 
 namespace locus::engine {
 
@@ -50,7 +51,10 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
         h = fnv(fnv(h, head.data(), head.size()), f.file_bytes());
     });
     k.model_hash = h;
-    k.backend = m.active_backend().name;
+    // The backend, and a digest of the sources that computed the KV:
+    // another build's kernels or forward may sum in another order
+    // (i#1180), and an entry without one (an older binary's) misses.
+    k.backend = std::string(m.active_backend().name) + ":" + kComputeDigest;
 
     const auto& hp = m.hparams();
     std::uint64_t o = kFnvOffset;

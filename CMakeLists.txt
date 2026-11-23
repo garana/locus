@@ -258,6 +258,26 @@ else()
     target_sources(locus PRIVATE src/locus/backend/metal/context_stub.cpp)
 endif()
 
+# The disk prefix key's digest of the sources that compute KV
+# (i#1180), made at build time so an edit to any of them changes it.
+file(GLOB_RECURSE LOCUS_COMPUTE_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_SOURCE_DIR}/src/locus/backend/*
+     ${CMAKE_SOURCE_DIR}/src/locus/model/*
+     ${CMAKE_SOURCE_DIR}/src/locus/kv/*)
+set(LOCUS_COMPUTE_DIGEST
+    ${CMAKE_BINARY_DIR}/generated/locus/engine/compute_digest.hpp)
+add_custom_command(
+    OUTPUT ${LOCUS_COMPUTE_DIGEST}
+    COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+            -DOUT=${LOCUS_COMPUTE_DIGEST}
+            -P ${CMAKE_SOURCE_DIR}/cmake/compute_digest.cmake
+    DEPENDS ${LOCUS_COMPUTE_SOURCES}
+            ${CMAKE_SOURCE_DIR}/cmake/compute_digest.cmake
+    COMMENT "Digest of the sources that compute KV")
+add_custom_target(locus_compute_digest DEPENDS ${LOCUS_COMPUTE_DIGEST})
+add_dependencies(locus locus_compute_digest)
+target_include_directories(locus PRIVATE ${CMAKE_BINARY_DIR}/generated)
+
 # ----------------------------------------------------------------
 # Vectorized CPU support: probe which SIMD flags the compiler
 # accepts; each kernel variant is its own source file built with
