@@ -145,9 +145,28 @@ int main(int argc, char** argv) {
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
         auto model = locus::model::TransformerModel::load(g);
-        if (!backend.empty()) {
-            model.use_backend(locus::backend::resolve_backend(backend));
+        // As locus-server picks its backend (i#867): an explicit
+        // --backend or LOCUS_BACKEND is resolve_backend's. The default:
+        // this tool runs expert matvecs, never metal_forward, and its
+        // clients route experts to another host, which metal_forward
+        // declines, so they run on Vulkan; the experts take Vulkan too,
+        // where usable, not Metal's per-op matvecs.
+        std::string why;
+        const locus::backend::Backend* be =
+            &model.use_backend_for(backend, locus::kv::KvType::kF32, &why);
+        if (locus::backend::backend_defaulted(backend) &&
+            be->name == "metal") {
+            const auto* vk = locus::backend::find_backend("vulkan");
+            if (vk != nullptr && vk->available && vk->selectable) {
+                model.use_backend(*vk);
+                be = vk;
+                why = "default; expert matvecs, not metal_forward, and "
+                      "the clients' forward is not metal_forward's (its "
+                      "experts are on another host)";
+            }
         }
+        std::fprintf(stderr, "locus-experts: backend: %s (%s)\n",
+                     std::string(be->name).c_str(), why.c_str());
         if (model.hparams().n_expert == 0 || hi > model.hparams().n_expert) {
             std::fprintf(stderr, "--experts %u:%u: the model has %u\n", lo,
                          hi, model.hparams().n_expert);
