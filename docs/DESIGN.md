@@ -766,9 +766,10 @@ guarding the default path.
   in another order, so an upgrade or a rebuild with other flags
   misses; i#1180), the KV geometry, RoPE settings and
   the numeric modes that change KV bits (the LOCUS_* switches that
-  pick other kernels among them, LOCUS_CPU_FAST too; not the prefill's
-  chunking, which on the GPUs moves KV's last bits and depends on the
-  other prompts in the step, #1189), and on Vulkan where the MoE
+  pick other kernels among them, LOCUS_CPU_FAST too; not yet the
+  prefill budget or where a prefill resumed after a prefix hit, which
+  set a prompt's chunks and on the GPUs move KV's last bits, #1189),
+  and on Vulkan where the MoE
   experts run: routed on the GPU, or on the host with the picks on the
   GPU or on the CPU (i#1179), settled once the KV pool exists; a model with
   the MoE hybrid on is refused, since its hot set follows the requests
