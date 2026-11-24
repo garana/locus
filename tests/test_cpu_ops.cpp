@@ -1291,7 +1291,8 @@ TEST_CASE("matvec_batch_cuda Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL/IQ4_XS "
         SKIP("no CUDA device or non-CUDA build");
     }
     cuda_pool_reset();  // drop any stale pages from prior test cases
-    // 9 rows: two full 4-row (one warp per row) blocks and a partial one.
+    // 9 rows: two full 4-row (one warp per row) blocks and a partial one;
+    // for the Q4_K, Q6_K and Q8_0 tiles (16 rows a block), one partial.
     // 1280 columns: the 40 blocks of Q8_0 and IQ4_NL are one full
     // 32-block pass and a partial one.
     constexpr std::uint32_t rows = 9, nblk = 5, cols = nblk * 256;
