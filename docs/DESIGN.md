@@ -163,9 +163,13 @@ queued after each step, for `take()` to collect without the engine
 mutex, and a progress hook to wake whoever drives it.
 Chat messages are formatted by `chat::ChatTemplate`: the GGUF's
 Jinja source is fingerprinted to a known family (llama3, chatml,
-llama2, zephyr, deepseek, deepseek2, deepseek-coder) and rendered by
-a hardcoded formatter; an unknown template falls back
-to plain concatenation. Endpoints that run the model on their own
+llama2 and its -sys, -sys-bos and -sys-strip variants, zephyr,
+deepseek, deepseek2, deepseek-coder; llama.cpp's names and rules) and
+rendered by a hardcoded formatter, string for string as llama.cpp's
+`llm_chat_apply_template`; an unknown template falls back
+to plain concatenation. `locus-server --chat-template NAME` picks a
+family for a GGUF that has no template (older Llama 2 conversions,
+#1152). Endpoints that run the model on their own
 thread (images, vision chat, audio) share the GPU backend through one
 process-wide lock (#268). `http::Client` is the first-party client
 for locus's own upstream calls (the router of #388): a pure response
