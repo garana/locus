@@ -140,8 +140,8 @@ for larger ones.
 | decode, Llama 3.2 1B Q8_0        | 11.6          | 11.9          | 25.8             | 36.2           | #412, #411  |
 | prefill 512, Qwen2.5-0.5B Q8_0   | 86.7          | 115.3         | 196.7            | 1195.6         | #412, #1196 |
 | decode, Qwen2.5-0.5B Q8_0        | 25.9          | 27.9          | 53.1             | 80.9           | #412, #1196 |
-| prefill 512, Orpheus 3B Q4_K_M   | 12.4          | 15.9          | 19.3             | does not load  | #412, #1196 |
-| decode, Orpheus 3B Q4_K_M        | 6.5           | 7.0           | 1.5              | does not load  | #412, #1196 |
+| prefill 512, Orpheus 3B Q4_K_M   | 12.4          | 15.9          | 24.0             | does not load  | #412, #1196 |
+| decode, Orpheus 3B Q4_K_M        | 6.5           | 7.0           | 1.6              | does not load  | #412, #1196 |
 | prefill 512, Qwen1.5-MoE Q4_K_M  | 14.2          | 20.1          | does not fit     | not run        | #412        |
 | decode, Qwen1.5-MoE Q4_K_M       | 8.1           | 9.1           | does not fit     | not run        | #412        |
 | LTX-Video 2B, one DiT step       | 75.3 s        | PyTorch 85 s  | not run          | not run        | #982        |
@@ -158,9 +158,12 @@ for larger ones.
 - On CUDA, prefill is at 0.16x to 0.25x of llama.cpp (#1200). Decode
   is at 0.88x on Q4_K_M, 0.71x on Q8_0 (#1197) and 0.66x on Qwen2.5.
   The Qwen2.5 and Orpheus CUDA rows are of #1196 (Qwen2 on the
-  one-submit forward; Orpheus's two runs, not three).
+  one-submit forward).
 - Orpheus (1.94 GB of weights) does not fit the 2 GB card: llama.cpp
-  fails to load it, and locus pages its weights (slower than the CPU).
+  fails to load it, and locus runs it per op, paging its weights
+  (slower than the CPU). The one-submit forward declines a model whose
+  weights exceed 90% of the weight pool, as paging through it on every
+  step is slower still (Orpheus prefill 19.3, decode 1.5).
 - `LOCUS_CPU_FAST=1` gained 1 to 7% on the dense rows (#1059), near the
   noise: the default stays, as it reproduces the goldens. On the DiT
   step it cuts the self attention (12.2 to 10.4 s, #1062) but not the

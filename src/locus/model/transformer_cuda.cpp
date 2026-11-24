@@ -130,6 +130,14 @@ bool TransformerModel::cuda_forward_supported() const {
             return false;
         }
     }
+    // Weights the pool cannot keep resident page through it on every
+    // step, and the per-op path is faster then (Orpheus 3B Q4_K_M on a
+    // 2 GB card, i#1196): decline, with the MoE hybrid's margin.
+    const backend::Ops& op = backend_->ops;
+    if (op.pool_budget != nullptr &&
+        weight_bytes_ > op.pool_budget() / 10 * 9) {
+        return false;
+    }
     return true;
 }
 
