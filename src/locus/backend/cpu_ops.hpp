@@ -266,6 +266,16 @@ void rope_neox_yarn(std::span<float> x, std::uint32_t n_heads,
                     float freq_base, const Yarn& yarn);
 
 /**
+ * The (cos, sin) pairs rope_neox_yarn rotates by at pos, computed the
+ * same way: pair i (x[i], x[i + head_dim/2]) at cs[2i], cs[2i + 1], for
+ * a device NEOX RoPE that must give the host's bits (i#1196).
+ *
+ * @param cs Output, head_dim floats.
+ */
+void rope_neox_table(std::uint32_t head_dim, std::uint32_t pos,
+                     float freq_base, const Yarn& yarn, std::span<float> cs);
+
+/**
  * M-RoPE (Qwen2-VL), NEOX pairs: pair i turns by pos[s] *
  * freq_base^(-2i / head_dim), where s is the section i falls in (the
  * first sections[0] pairs take pos[0], the next sections[1] pos[1],

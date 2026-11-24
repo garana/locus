@@ -2005,6 +2005,21 @@ void rope_neox_yarn(std::span<float> x, std::uint32_t n_heads,
     }
 }
 
+void rope_neox_table(std::uint32_t head_dim, std::uint32_t pos,
+                     float freq_base, const Yarn& yarn,
+                     std::span<float> cs) {
+    assert(cs.size() >= head_dim);
+    float corr_lo, corr_hi;
+    yarn_corr_range_impl(head_dim, freq_base, yarn, corr_lo, corr_hi);
+    for (std::uint32_t i = 0; i < head_dim / 2; ++i) {
+        // rope_neox_yarn's theta, cos and sin, term for term.
+        const float theta = yarn_theta(i, head_dim, pos, freq_base, yarn,
+                                       corr_lo, corr_hi);
+        cs[2 * i] = std::cos(theta) * yarn.mscale;
+        cs[2 * i + 1] = std::sin(theta) * yarn.mscale;
+    }
+}
+
 void rope_mrope(std::span<float> x, std::uint32_t n_heads,
                 std::uint32_t head_dim, const std::uint32_t* pos,
                 const std::uint32_t* sections, float freq_base) {
