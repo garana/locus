@@ -704,16 +704,20 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   Each sequence takes its own RoPE position, K / V rows (written
   straight into its blocks when alone, else copied by `kv_scatter`)
   and attention. A column's sum runs in the same order whatever the
-  column count. Batch-invariant mode
-  (`TransformerModel::metal_batch_invariant`) sends a lone sequence
-  through `metal_forward_multi` too, as `forward()`, a whole-model
-  `forward_layers` and `forward_batch`'s chunks too short for the
-  prefill, and keeps every matrix on one kernel at any count (Q6_K on
-  its matvec), so a request's logits are bit-identical alone and
-  batched; the disk prefix key records it. It is the default for a
-  model with no Q4_K or Q6_K weights, at about 2% of a lone sequence
-  (`metal_forward` puts RoPE in its matvecs' epilogue and folds the F32
-  norm). For a K-quant model, as on Vulkan, the default takes the
+  column count, and the Q8_0 kernel gives a column `mv_q8_0`'s own
+  arithmetic (the same lanes, block order and `half_simd_sum`, the
+  folded norm's scale applied before the sum as `mv_q8_0_pn` does), so
+  its bits are a matvec's and a lone row runs the matvec itself.
+  Batch-invariant mode (`TransformerModel::metal_batch_invariant`)
+  sends a lone sequence through `metal_forward_multi` too, as
+  `forward()`, a whole-model `forward_layers` and `forward_batch`'s
+  chunks too short for the prefill, and keeps every matrix on one
+  kernel at any count (Q6_K on its matvec), so a request's logits are
+  bit-identical alone and batched; the disk prefix key records it. It
+  is the default for a model with no Q4_K or Q6_K weights, at no cost
+  measurable to a lone sequence on the M4 Max (`metal_forward`'s RoPE
+  epilogue and F32 fold against `metal_forward_multi`'s direct K / V
+  write). For a K-quant model, as on Vulkan, the default takes the
   fastest kernels instead: `metal_forward` alone, Q6_K's columns
   kernel from 4. `LOCUS_METAL_BATCH_INVARIANT=1` / `0` (or
   `backend::metal::set_batch_invariant`) sets it for any model. Llama
@@ -721,12 +725,12 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
 
 | model  | sequences | one forward a sequence | default        | invariant set |
 |--------|-----------|------------------------|----------------|---------------|
-| Q8_0   | 1         | 224.3                  | 217.8 (inv.)   | 217.8         |
-| Q8_0   | 4         | 224.5                  | 691.8 (inv.)   | 691.8         |
-| Q8_0   | 8         | 224.8                  | 784.7 (inv.)   | 784.7         |
-| Q4_K_M | 1         | 301.8                  | 301.6          | 296.2         |
-| Q4_K_M | 4         | 301.4                  | 475.3          | 449.4         |
-| Q4_K_M | 8         | 301.6                  | 548.9          | 494.2         |
+| Q8_0   | 1         | 223.6                  | 224.8 (inv.)   | 224.8         |
+| Q8_0   | 4         | 223.8                  | 689.2 (inv.)   | 689.2         |
+| Q8_0   | 8         | 224.1                  | 780.5 (inv.)   | 780.5         |
+| Q4_K_M | 1         | 300.0                  | 301.2          | 296.2         |
+| Q4_K_M | 4         | 300.7                  | 472.3          | 449.4         |
+| Q4_K_M | 8         | 300.4                  | 547.2          | 494.2         |
 
 - Prompt ingestion is batched by default (`--no-batch-prefill` turns
   it off). Vulkan has its own chunked prefill, `vulkan_forward_batch`

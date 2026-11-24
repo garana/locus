@@ -1777,13 +1777,17 @@ TEST_CASE("metal matvec over columns matches a matvec a column",
                     for (std::uint32_t c = 0; c < 8; ++c) {
                         for (std::uint32_t r = 0; r < os; ++r) {
                             const std::size_t i = std::size_t{c} * os + r;
-                            if (c < n && r < rows) {
-                                // K-quants: w = dl q - ml per weight
-                                // here, dl (q . x) - ml sum(x) in the
-                                // matvec, so a little more rounding.
+                            if (c < n && r < rows && !kq) {
+                                // Q8_0: mv_q8_0's own arithmetic a
+                                // column, so its bits (one column can
+                                // then run mv_q8_0 itself).
+                                REQUIRE(a[i] == b[i]);
+                            } else if (c < n && r < rows) {
+                                // Q6_K: w = d s q per weight here,
+                                // its matvec's order otherwise, so a
+                                // little more rounding.
                                 REQUIRE(a[i] == Catch::Approx(b[i])
-                                                    .margin(kq ? 5e-4
-                                                               : 1e-4)
+                                                    .margin(5e-4)
                                                     .epsilon(1e-5));
                             } else {
                                 // Other columns and the stride's padding
@@ -1794,6 +1798,40 @@ TEST_CASE("metal matvec over columns matches a matvec a column",
                     }
                     ctx.free(o1);
                     ctx.free(o2);
+                }
+                if (ty == TensorType::kQ8_0) {
+                    // With the RMSNorm folded in: column 0 against
+                    // mv_q8_0_pn, bit for bit (the fused matvec reads x
+                    // from offset 0 only).
+                    CAPTURE(rows, cols, n);
+                    std::vector<float> g(cols);
+                    for (auto& v : g) v = dist(rng);
+                    Context::Buffer gb =
+                        ctx.upload(std::as_bytes(std::span(g)));
+                    Context::Buffer o1 =
+                        ctx.upload(std::as_bytes(std::span(init)));
+                    Context::Buffer o2 =
+                        ctx.upload(std::as_bytes(std::span(init)));
+                    {
+                        std::lock_guard lk(mb::device_mutex());
+                        REQUIRE(mb::record_matvec_cols(
+                            ctx, ty, rows, cols, wb, 0, xb, 0, xs, o1, 0, os,
+                            n, false, &gb, 1e-5f, true));
+                        mb::MvFuse f;
+                        f.norm_w = &gb;
+                        f.eps = 1e-5f;
+                        REQUIRE(mb::record_matvec_fused(ctx, ty, rows, cols,
+                                                        wb, 0, xb, 0, o2, 0,
+                                                        f));
+                    }
+                    const auto* a = static_cast<const float*>(o1.data);
+                    const auto* b = static_cast<const float*>(o2.data);
+                    for (std::uint32_t r = 0; r < rows; ++r) {
+                        REQUIRE(a[r] == b[r]);
+                    }
+                    ctx.free(o1);
+                    ctx.free(o2);
+                    ctx.free(gb);
                 }
             }
             ctx.free(wb);

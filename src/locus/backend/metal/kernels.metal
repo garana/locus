@@ -300,10 +300,11 @@ inline void mv_q8_0_cols_impl(device const uchar* w, device const float* xb,
     for (uint i = 0; i < kMvColRpl; ++i) {
         const uint r = r0 + i * kMvRows;
         for (uint c = 0; c < N; ++c) {
-            float t = half_simd_sum(acc[i][c]);
-            if (PN) {
-                t *= inv[c];
-            }
+            // Scaled a lane before the sum, as mv_q8_0_pn: a column then
+            // gets the bits a matvec of it gives, so one column can run
+            // mv_q8_0 itself.
+            const float t = half_simd_sum(PN ? acc[i][c] * inv[c]
+                                             : acc[i][c]);
             if (lane == 0 && r < p.rows && c < p.n_slots) {
                 device float* o = out + p.out_off +
                                   ulong(c) * p.out_slot_stride + r;

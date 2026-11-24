@@ -1269,6 +1269,32 @@ bool TransformerModel::metal_forward_multi(
                             std::uint32_t out_stride, bool acc,
                             const Context::Buffer* norm = nullptr) {
             const auto wb = r.w(wt);
+            if (n == 1) {
+                // One row: the matvec itself. The Q8_0 columns kernel
+                // gives a column mv_q8_0's (and mv_q8_0_pn's) bits, so
+                // this is the bits a batched step gives the row, at the
+                // matvec's speed (the columns kernel's one column ran
+                // a lone Q8_0 decode at half speed on an M2 Pro).
+                if (norm == nullptr) {
+                    metal::record_matvec(ctx, wt.type, wt.rows, wt.cols,
+                                         *wb.buf, wb.off, in, 0, out,
+                                         out_off, acc);
+                    return;
+                }
+                // A folded norm feeds q / k / v and gate / up, which
+                // never accumulate (the fused matvec stores).
+                metal::MvFuse nf;
+                nf.norm_w = norm;
+                nf.eps = hp_.rms_eps;
+                if (acc ||
+                    !metal::record_matvec_fused(ctx, wt.type, wt.rows,
+                                                wt.cols, *wb.buf, wb.off, in,
+                                                0, out, out_off, nf)) {
+                    throw std::logic_error(
+                        "metal multi decode: a matvec not recorded");
+                }
+                return;
+            }
             if (metal::record_matvec_cols(ctx, wt.type, wt.rows, wt.cols,
                                           *wb.buf, wb.off, in, 0, in_stride,
                                           out, out_off, out_stride, n, acc,

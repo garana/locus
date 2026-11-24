@@ -72,19 +72,19 @@ client, tok/s in all:
 
 | model  | clients | Metal before #1184 | Metal, invariant | Metal, not invariant | Vulkan |
 |--------|---------|--------------------|------------------|----------------------|--------|
-| Q8_0   | 1       | 214.8              | 208.0            | 213.9                | 208.0  |
-| Q8_0   | 4       | 207.8              | 503.7            | 517.5                | 434.3  |
-| Q8_0   | 8       | 203.7              | 530.7            | 545.5                | 431.1  |
+| Q8_0   | 1       | 213.0              | 212.3            | 213.0                | 208.0  |
+| Q8_0   | 4       | 206.2              | 500.8            | 512.5                | 434.3  |
+| Q8_0   | 8       | 201.9              | 527.9            | 540.1                | 431.1  |
 | Q4_K_M | 1       | 279.8              | 276.2            | 280.1                | 285.4  |
 | Q4_K_M | 4       | 273.2              | 372.6            | 397.4                | 403.5  |
 | Q4_K_M | 8       | 265.2              | 392.8            | 430.8                | 414.8  |
 
 Batch-invariant mode (a request decodes to the same bits alone or
-batched) is the default for Q8_0 and costs a lone request about 2%;
-`LOCUS_METAL_BATCH_INVARIANT=0` takes it back for a single-user
-server. A Q4_K or Q6_K model runs the fastest kernels by default
-instead, as on Vulkan, and `LOCUS_METAL_BATCH_INVARIANT=1` makes it
-invariant at the cost above.
+batched) is the default for Q8_0, at no cost to a lone request and
+about 2% with several; `LOCUS_METAL_BATCH_INVARIANT=0` turns it off. A
+Q4_K or Q6_K model runs the fastest kernels by default instead, as on
+Vulkan, and `LOCUS_METAL_BATCH_INVARIANT=1` makes it invariant at the
+cost above.
 
 | workload, model                    | locus Metal | locus Vulkan | llama.cpp Metal | source |
 |------------------------------------|-------------|--------------|-----------------|--------|
