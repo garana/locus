@@ -1794,8 +1794,24 @@ inline void attn_mma(thread const S& src, uint g, uint sg,
     // Positions [0, last) are seen by some query of the block.
     const uint last = src.kv_end(min(t0 + kQ, n_q));
     const uint mine_end = src.kv_end(min(q0 + 8, n_q));  // this sg's
+    // K and V of a chunk in one staging pass when both fit the buffer
+    // (head width up to 64): one barrier pair a chunk, not two (i#1074).
+    const bool both = 2 * hd <= 128;
+    threadgroup float* vs = both ? kv + hd * kFaC : kv;
     for (uint c = 0; c < last; c += kFaC) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (both) {
+            for (uint r = sg; r < kFaC; r += NSG) {
+                const uint j = c + r;
+                const ulong at = j < last ? src.v_at(j, h) : 0;
+                for (uint i = lane * 4; i < hd; i += 128) {
+                    *(threadgroup float4*)(vs + r * hd + i) =
+                        j < last ? float4(*(device const packed_float4*)(
+                                       src.vbuf() + at + i))
+                                 : float4(0.0f);
+                }
+            }
+        }
         // K transposed (hd x 32): lane j takes position c + j, the
         // simdgroups its dims, so the writes are contiguous.
         {
@@ -1865,31 +1881,37 @@ inline void attn_mma(thread const S& src, uint g, uint sg,
             const float sc = m == -INFINITY ? 0.0f : exp(m - mn);
             l = l * sc + sum;
             m = mn;
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane % 4 == 0) {
-                dg[my_r * 9] = sc;
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            simdgroup_float8x8 dm;
-            simdgroup_load(dm, dg, 8);
-            for (uint k = 0; k < nd; ++k) {
-                simdgroup_float8x8 t;
-                simdgroup_multiply(t, dm, om[k]);
-                om[k] = t;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint r = sg; r < kFaC; r += NSG) {
-            const uint j = c + r;
-            const ulong at = j < last ? src.v_at(j, h) : 0;
-            for (uint i = lane * 4; i < hd; i += 128) {
-                *(threadgroup float4*)(kv + r * hd + i) =
-                    j < last ? float4(*(device const packed_float4*)(
-                                   src.vbuf() + at + i))
-                             : float4(0.0f);
+            // O by diag(sc), unless every row's scale is 1 (its max held):
+            // then the product is O itself, bit for bit, and is skipped.
+            if (!simd_all(sc == 1.0f)) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                if (lane % 4 == 0) {
+                    dg[my_r * 9] = sc;
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_float8x8 dm;
+                simdgroup_load(dm, dg, 8);
+                for (uint k = 0; k < nd; ++k) {
+                    simdgroup_float8x8 t;
+                    simdgroup_multiply(t, dm, om[k]);
+                    om[k] = t;
+                }
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!both) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint r = sg; r < kFaC; r += NSG) {
+                const uint j = c + r;
+                const ulong at = j < last ? src.v_at(j, h) : 0;
+                for (uint i = lane * 4; i < hd; i += 128) {
+                    *(threadgroup float4*)(vs + r * hd + i) =
+                        j < last ? float4(*(device const packed_float4*)(
+                                       src.vbuf() + at + i))
+                                 : float4(0.0f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
         if (act) {
             // O += P V.
             simdgroup_float8x8 pm[kFaC / 8];
@@ -1899,7 +1921,7 @@ inline void attn_mma(thread const S& src, uint g, uint sg,
             for (uint n = 0; n < nd; ++n) {
                 for (uint kb = 0; kb < kFaC / 8; ++kb) {
                     simdgroup_float8x8 vb;
-                    simdgroup_load(vb, kv + kb * 8 * hd + n * 8, hd);
+                    simdgroup_load(vb, vs + kb * 8 * hd + n * 8, hd);
                     simdgroup_multiply_accumulate(om[n], pm[kb], vb, om[n]);
                 }
             }
