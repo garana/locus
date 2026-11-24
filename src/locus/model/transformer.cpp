@@ -14,6 +14,7 @@
 #include <string_view>
 
 #include "locus/backend/accelerate.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/arch.hpp"
@@ -1196,6 +1197,26 @@ void TransformerModel::forward_layers(tok::TokenId token,
             return;
         }
     }
+    if (first && last && backend_->name == "metal" && !embed_in &&
+        metal_batch_invariant()) {
+        // Batch-invariant mode (i#1184): a lone token through the
+        // batched decode's forward, so its logits and K / V have a
+        // batched step's bits. The whole head; rows outside the range
+        // are then -inf, as metal_forward leaves them.
+        kv::PagedKvCache::Seq* const one_seq[] = {&seq};
+        const tok::TokenId one_tok[] = {token};
+        if (metal_forward_multi(one_tok, one_seq, cache,
+                                out.first(hp_.n_vocab))) {
+            if (rows.end != 0) {
+                const float ninf = -std::numeric_limits<float>::infinity();
+                std::fill(out.begin(), out.begin() + rows.begin, ninf);
+                std::fill(out.begin() + rows.end,
+                          out.begin() + hp_.n_vocab, ninf);
+            }
+            lap.lap(kNoLayer, Stage::kDevice);
+            return;  // metal_forward_multi advanced seq
+        }
+    }
     if (first && last && backend_->name == "metal") {
         // Plain llama on Metal, the whole model, one command batch
         // (i#866).
@@ -1807,12 +1828,31 @@ void TransformerModel::forward_batch_decode(
             "forward_batch_decode: unsupported backend");
     }
     if (metal_forward_supported()) {
-        // Metal (i#866): one GPU forward a sequence, so a batched step
-        // gives each sequence the per-token forward's bits.
+        // Metal: groups of up to kMultiMax sequences through one forward
+        // that reads each matrix once for all of them (i#1184), in even
+        // groups (9 as 5 + 4); a model it does not take runs one GPU
+        // forward a sequence (i#866). In the batch-invariant mode (a
+        // Q8_0 model's default) a lone sequence takes the same forward,
+        // so a sequence's logits match alone and in a batch; with it
+        // off (a K-quant model's default) a lone sequence takes
+        // metal_forward, and they differ in the last bits, as Vulkan.
         const std::uint32_t V = hp_.n_vocab;
-        for (std::uint32_t t = 0; t < n; ++t) {
-            forward_layers(toks[t], {}, 0, hp_.n_layers, cache, *seqs[t], ws,
-                           logits.subspan(std::size_t{t} * V, V), {});
+        const std::uint32_t n_groups = (n + kMultiMax - 1) / kMultiMax;
+        const std::uint32_t group = (n + n_groups - 1) / n_groups;
+        for (std::uint32_t g = 0; g < n; g += group) {
+            const std::uint32_t m = std::min(group, n - g);
+            if ((m >= 2 || metal_batch_invariant()) &&
+                metal_forward_multi(toks.subspan(g, m), seqs.subspan(g, m),
+                                    cache,
+                                    logits.subspan(std::size_t{g} * V,
+                                                   std::size_t{m} * V))) {
+                continue;
+            }
+            for (std::uint32_t t = g; t < g + m; ++t) {
+                forward_layers(toks[t], {}, 0, hp_.n_layers, cache,
+                               *seqs[t], ws,
+                               logits.subspan(std::size_t{t} * V, V), {});
+            }
         }
         return;
     }
@@ -1972,12 +2012,9 @@ void TransformerModel::forward_batch_layers(
         }
     }
     if (first && last && metal_forward_supported()) {
-        // Metal (i#866): the whole model, one GPU forward a sequence,
-        // as forward_batch_decode.
-        for (std::uint32_t t = 0; t < n; ++t) {
-            forward_layers(toks[t], {}, 0, hp_.n_layers, cache, *seqs[t], ws,
-                           out.subspan(std::size_t{t} * V, V), {});
-        }
+        // Metal: the whole model as forward_batch_decode (its groups
+        // through metal_forward_multi, i#1184), so the bits agree.
+        forward_batch_decode(toks, cache, seqs, ws, out);
         return;
     }
     if (first && last && backend_->name == "cuda") {

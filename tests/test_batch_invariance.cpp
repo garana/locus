@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
@@ -133,10 +134,19 @@ TEST_CASE("a request decodes the same alone or batched: Q8_0 and Q4_K_M",
     // The scalar backend takes hours on these; stories260K covers it.
     // On Vulkan a model is batch-invariant in batch-invariant mode
     // (#432; the default on Apple, V3D and NVIDIA GPUs, and there not
-    // for a lone K-quant sequence), which these legs set.
+    // for a lone K-quant sequence), which these legs set; on Metal
+    // likewise (i#1184).
+    // So on Metal (i#1184): by default a K-quant model's lone sequence
+    // takes the faster metal_forward, as on Vulkan.
     struct Mode {
-        Mode() { locus::backend::vulkan_set_batch_invariant(true); }
-        ~Mode() { locus::backend::vulkan_reset_batch_invariant(); }
+        Mode() {
+            locus::backend::vulkan_set_batch_invariant(true);
+            locus::backend::metal::set_batch_invariant(true);
+        }
+        ~Mode() {
+            locus::backend::vulkan_reset_batch_invariant();
+            locus::backend::metal::reset_batch_invariant();
+        }
     };
     DYNAMIC_SECTION("llama-3.2-1b-q8_0.gguf") {
         const Mode mode;

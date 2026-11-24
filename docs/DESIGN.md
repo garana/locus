@@ -686,6 +686,52 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   make 140, 155 and 166 tok/s in all, against 102 one forward per
   sequence (M2 Pro: 46.5, 43.2 and 45.8 against 41.5), and 3 and 4
   sequences 147 -> 154 and 156 -> 162 tok/s with the NT 4 builds.
+  On Metal it runs `metal_forward_multi` on groups of up to 8
+  sequences (#1184; dense models, as `metal_forward` takes them; a MoE
+  model runs one forward per sequence), one command batch for the
+  whole step. Each matrix takes the fastest kernel for its type and
+  the sequence count:
+  - Q8_0: `mv_q8_0_cols{2,4}` reads it once for all the rows (5 to 8
+    columns as two dispatches), with the RMSNorm folded in as a
+    prologue;
+  - Q6_K, from 4 sequences: `mv_q6_k_cols{4,8}`, each block's x for
+    all the columns staged in threadgroup memory (at 2 its kernel
+    loses to 2 matvecs);
+  - Q4_K, and the rest: one matvec a row. No Q4_K columns kernel tried
+    beats N matvecs: on the M4 Max a K-quant decode matvec is bound by
+    its x loads and decode, not its weight bytes (#1191).
+
+  Each sequence takes its own RoPE position, K / V rows (written
+  straight into its blocks when alone, else copied by `kv_scatter`)
+  and attention. A column's sum runs in the same order whatever the
+  column count, and the Q8_0 kernel gives a column `mv_q8_0`'s own
+  arithmetic (the same lanes, block order and `half_simd_sum`, the
+  folded norm's scale applied before the sum as `mv_q8_0_pn` does), so
+  its bits are a matvec's and a lone row runs the matvec itself.
+  Batch-invariant mode (`TransformerModel::metal_batch_invariant`)
+  sends a lone sequence through `metal_forward_multi` too, as
+  `forward()`, a whole-model `forward_layers` and `forward_batch`'s
+  chunks too short for the prefill, and keeps every matrix on one
+  kernel at any count (Q6_K on its matvec), so a request's logits are
+  bit-identical alone and batched; the disk prefix key records it. It
+  is the default for a model with no Q4_K or Q6_K weights, at no cost
+  measurable to a lone sequence on the M4 Max (`metal_forward`'s RoPE
+  epilogue and F32 fold against `metal_forward_multi`'s direct K / V
+  write). For a K-quant model, as on Vulkan, the default takes the
+  fastest kernels instead: `metal_forward` alone, Q6_K's columns
+  kernel from 4. `LOCUS_METAL_BATCH_INVARIANT=1` / `0` (or
+  `backend::metal::set_batch_invariant`) sets it for any model. Llama
+  3.2 1B on an M4 Max, decode tok/s in all:
+
+| model  | sequences | one forward a sequence | default        | invariant set |
+|--------|-----------|------------------------|----------------|---------------|
+| Q8_0   | 1         | 223.6                  | 224.8 (inv.)   | 224.8         |
+| Q8_0   | 4         | 223.8                  | 689.2 (inv.)   | 689.2         |
+| Q8_0   | 8         | 224.1                  | 780.5 (inv.)   | 780.5         |
+| Q4_K_M | 1         | 300.0                  | 301.2          | 296.2         |
+| Q4_K_M | 4         | 300.7                  | 472.3          | 449.4         |
+| Q4_K_M | 8         | 300.4                  | 547.2          | 494.2         |
+
 - Prompt ingestion is batched by default (`--no-batch-prefill` turns
   it off). Vulkan has its own chunked prefill, `vulkan_forward_batch`
   (chunks of up to 512 tokens, 2048 for MoE; token-exact, not

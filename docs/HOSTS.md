@@ -33,13 +33,22 @@ on MoltenVK.
 
 Recommended: `--backend metal` for text, the default since #1042
 (metal for the models its forward takes, else vulkan). Images and
-video take the GPU through Vulkan by themselves. Several concurrent
-clients get more total throughput with `--backend vulkan` until
-#1184: locus-server, Llama 1B Q8_0, 128 tokens streamed, one request
-111.4 tok/s on Metal and 98.7 on Vulkan (a 1820-token prompt's first
-token 1.13 s against 2.44 s), but 4 clients 108.4 tok/s in all on
-Metal against 171.2 on Vulkan, since Metal decodes the sequences one
-at a time.
+video take the GPU through Vulkan by themselves. Concurrent clients
+decode together since #1184; locus-server, Llama 1B, 128 tokens a
+client, tok/s in all:
+
+| model  | clients | Metal before #1184 | Metal, invariant | Metal, not invariant | Vulkan |
+|--------|---------|--------------------|------------------|----------------------|--------|
+| Q8_0   | 1       | 106.4              | 108.5            | 107.3                | 95.8   |
+| Q8_0   | 4       | 103.9              | 149.4            | 152.0                | 166.1  |
+| Q8_0   | 8       | 102.7              | 157.2            | 159.3                | 165.9  |
+| Q4_K_M | 1       | 162.8              | 161.2            | 162.2                | 112.7  |
+| Q4_K_M | 4       | 158.2              | 187.1            | 217.0                | 127.3  |
+| Q4_K_M | 8       | 156.7              | 197.3            | 243.1                | 119.3  |
+
+Q8_0's default is the invariant column, Q4_K_M's the other (as on the
+M4 Max below). Several Q8_0 clients still do 4 to 9% better on
+`--backend vulkan`; Q4_K_M runs 1.4 to 2x Vulkan at every count.
 
 | workload                         | command                        | locus Metal     | locus Vulkan | llama.cpp Metal                 | source       |
 |----------------------------------|--------------------------------|-----------------|--------------|---------------------------------|--------------|
@@ -65,10 +74,26 @@ efficiency), 32 GPU cores; arm64 with neon, dotprod and i8mm; 36 GB;
 macOS.
 
 Recommended: `--backend metal` for text, the default since #1042: it
-leads Vulkan on every prefill and on most decode rows. As on the M2
-Pro, several concurrent clients do better on `--backend vulkan` until
-#1184 (Metal decodes the sequences one at a time). On the decode of Orpheus and
-Qwen3-Coder the two are within 1%.
+leads Vulkan on every prefill and on most decode rows. On the decode
+of Orpheus and Qwen3-Coder the two are within 1%. Concurrent clients
+decode together since #1184; locus-server, Llama 1B, 128 tokens a
+client, tok/s in all:
+
+| model  | clients | Metal before #1184 | Metal, invariant | Metal, not invariant | Vulkan |
+|--------|---------|--------------------|------------------|----------------------|--------|
+| Q8_0   | 1       | 213.0              | 212.3            | 213.0                | 208.0  |
+| Q8_0   | 4       | 206.2              | 500.8            | 512.5                | 434.3  |
+| Q8_0   | 8       | 201.9              | 527.9            | 540.1                | 431.1  |
+| Q4_K_M | 1       | 279.8              | 276.2            | 280.1                | 285.4  |
+| Q4_K_M | 4       | 273.2              | 372.6            | 397.4                | 403.5  |
+| Q4_K_M | 8       | 265.2              | 392.8            | 430.8                | 414.8  |
+
+Batch-invariant mode (a request decodes to the same bits alone or
+batched) is the default for Q8_0, at no cost to a lone request and
+about 2% with several; `LOCUS_METAL_BATCH_INVARIANT=0` turns it off. A
+Q4_K or Q6_K model runs the fastest kernels by default instead, as on
+Vulkan, and `LOCUS_METAL_BATCH_INVARIANT=1` makes it invariant at the
+cost above.
 
 | workload, model                    | locus Metal | locus Vulkan | llama.cpp Metal | source |
 |------------------------------------|-------------|--------------|-----------------|--------|

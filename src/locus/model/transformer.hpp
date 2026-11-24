@@ -327,6 +327,21 @@ class TransformerModel {
     /** @returns How many tokens the Metal forward (i#866) has run in
      *  this process (tests: whether the GPU path was taken). */
     static std::uint64_t metal_forward_tokens();
+    /** @returns How many of those tokens ran several sequences at once
+     *  (i#1184; tests). */
+    static std::uint64_t metal_multi_tokens();
+    /**
+     * @returns Whether Metal decode is batch-invariant for this model
+     *     (i#1184, as Vulkan's #432): a lone sequence takes the batched
+     *     forward too, and every matrix one kernel at any sequence
+     *     count, so a request's logits are bit-identical alone and
+     *     batched. backend::metal::set_batch_invariant or
+     *     LOCUS_METAL_BATCH_INVARIANT sets it; else it is on unless the
+     *     model has Q4_K or Q6_K weights. For those the fastest kernels
+     *     differ with the count (metal_forward alone, Q6_K's columns
+     *     kernel from 4 sequences), as on Vulkan.
+     */
+    bool metal_batch_invariant() const;
 
     /**
      * Settles where the routed experts run (i#654) and returns it. On
@@ -914,6 +929,27 @@ class TransformerModel {
     /** @returns 1 when the Metal forwards pair RoPE NEOX-style (qwen2's
      *  and qwen3moe's attention), else 0. */
     std::uint32_t metal_neox() const;
+
+    /**
+     * One decode token from each of up to kMultiMax sequences through
+     * the Metal forward together (i#1184): every matrix read once for
+     * all of them (a matvec over the rows' columns where its type has
+     * one), each sequence's RoPE, KV write and attention its own.
+     * Dense models only (a MoE row's picks differ per sequence).
+     *
+     * @param toks One token a sequence.
+     * @param seqs The sequences, each with room for one more position;
+     *     each advanced by one on success.
+     * @param logits seqs.size() rows of n_vocab, scaled.
+     * @returns false, with nothing advanced, when it does not apply or
+     *     the device fails: the caller runs a forward a sequence.
+     */
+    bool metal_forward_multi(std::span<const tok::TokenId> toks,
+                             std::span<kv::PagedKvCache::Seq* const> seqs,
+                             kv::PagedKvCache& cache,
+                             std::span<float> logits) const;
+    /** The most sequences metal_forward_multi takes at once. */
+    static constexpr std::uint32_t kMultiMax = 8;
 
     /**
      * metal_forward over a prompt chunk (i#866): the tokens at
