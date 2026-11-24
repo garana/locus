@@ -1151,9 +1151,12 @@ side, `TransformerModel::set_remote_experts` takes a
 `model::RemoteExperts` (`pipeline::ExpertClient` over those
 connections): `moe_ffn` starts the remote picks, computes the local
 ones meanwhile, then adds every pick in pick order, and its readahead
-skips the remote experts. Only the per-token CPU forward uses it; the
-batched and GPU forwards compute every expert locally, which gives the
-same output since each host maps the whole file. `locus-run
+skips the remote experts. The batched CPU forwards (a prefill chunk, a
+multi-sequence decode, a stage's layers) run such a layer's MoE a token
+at a time through `moe_ffn`, so their picks reach the expert hosts too,
+with the same bits (#1185; batched remote calls are #1186). The GPU
+forwards compute every expert locally, which gives the same output
+since each host maps the whole file. `locus-run
 --remote-experts HOST:PORT=LO:HI` (repeatable) connects to each
 `locus-experts` and installs the client. A host lost mid-run ends the
 run: the client's error reaches the caller and nothing retries.

@@ -1751,9 +1751,11 @@ TEST_CASE("a forward with remote experts is one process's bits",
     plain.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
                  weights(kF * kE * 4, 16));
     const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5, 2};
+    // batched: the prompt goes through forward_batch (a batched prefill),
+    // whose MoE sends its remote picks too (i#1185). Returns the calls.
     const auto check = [&](const std::vector<std::byte>& img,
-                           std::size_t window) {
-        INFO("window " << window);
+                           std::size_t window, bool batched) {
+        INFO("window " << window << " batched " << batched);
         const auto want = run(img, toks);
 
         auto g_srv = locus::gguf::GgufFile::parse(img);
@@ -1776,9 +1778,16 @@ TEST_CASE("a forward with remote experts is one process's bits",
         auto ws = model.make_workspace();
         locus::kv::PagedKvCache::Seq seq;
         std::vector<float> got(model.hparams().n_vocab);
-        for (auto t : toks) {
-            REQUIRE(cache.ensure_capacity(seq, 1));
-            model.forward(t, cache, seq, ws, got);
+        if (batched) {
+            REQUIRE(model.supports_batch_prefill());
+            REQUIRE(cache.ensure_capacity(
+                seq, static_cast<std::uint32_t>(toks.size())));
+            model.forward_batch(toks, cache, seq, ws, got);
+        } else {
+            for (auto t : toks) {
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(t, cache, seq, ws, got);
+            }
         }
         cache.release(seq);
         model.set_remote_experts(nullptr);
@@ -1789,11 +1798,15 @@ TEST_CASE("a forward with remote experts is one process's bits",
         REQUIRE(got.size() == want.size());
         REQUIRE(std::memcmp(got.data(), want.data(),
                             got.size() * sizeof(float)) == 0);
+        return client.calls();
     };
     // Window 1 makes start() read a host's reply before its next call
-    // (two picks on the same host); 0 is the default size.
+    // (two picks on the same host); 0 is the default size. A batched
+    // prefill makes the same remote calls as one token at a time.
     for (const std::size_t window : {std::size_t{0}, std::size_t{1}}) {
-        check(plain.build(4, 2), window);
-        check(qwen_image(+8.0f, /*zero_shared=*/false), window);
+        const auto img = plain.build(4, 2);
+        const auto shared = qwen_image(+8.0f, /*zero_shared=*/false);
+        CHECK(check(img, window, true) == check(img, window, false));
+        CHECK(check(shared, window, true) == check(shared, window, false));
     }
 }
