@@ -221,6 +221,34 @@ class RemoteExperts {
      * @throws std::runtime_error when the reply cannot be had.
      */
     virtual void finish(std::span<float> d) = 0;
+
+    /**
+     * Starts n calls of `layer` at once (a batched forward, i#1186):
+     * expert `experts[i]` on hidden state i of `xs` (n x n_embd). Every
+     * single call must be finished first, and `xs` must stay valid
+     * until finish_batch returns. The default starts each one; an
+     * implementation may group them.
+     */
+    virtual void start_batch(std::uint32_t layer,
+                             std::span<const std::uint32_t> experts,
+                             std::span<const float> xs) {
+        const std::size_t E = experts.empty() ? 0 : xs.size() / experts.size();
+        for (std::size_t i = 0; i < experts.size(); ++i) {
+            start(layer, experts[i], xs.subspan(i * E, E));
+        }
+    }
+    /**
+     * Waits for the batch start_batch began and writes output i into row
+     * i of `ds` (n x n_embd), in call order.
+     *
+     * @throws std::runtime_error when a reply cannot be had.
+     */
+    virtual void finish_batch(std::span<float> ds, std::uint32_t n) {
+        const std::size_t E = n == 0 ? 0 : ds.size() / n;
+        for (std::size_t i = 0; i < n; ++i) {
+            finish(ds.subspan(i * E, E));
+        }
+    }
 };
 
 /**
@@ -440,11 +468,25 @@ class TransformerModel {
                        std::span<float> d) const;
 
     /**
-     * Sends the experts `r` names to other hosts from the per-token
-     * moe_ffn, whatever its backend's ops; null computes them all here.
-     * Not owned; it must outlive the forwards that use it. The batched
-     * forward (moe_ffn_batch) and the whole-layer GPU forwards, which do
-     * not call moe_ffn, still compute every expert here, and under the
+     * expert_out over m hidden states at once (an expert host's batched
+     * call, i#1186): the expert's weights are read once for all of them
+     * (matvec_batch for gate and up, silu, down), so on a CPU backend
+     * row i of ds has the bits expert_out gives row i of xs.
+     *
+     * @param xs m hidden states, m x n_embd floats.
+     * @param ds Output, m x n_embd floats.
+     * @throws std::out_of_range for a layer or expert the model lacks.
+     */
+    void expert_out_batch(std::uint32_t layer, std::uint32_t expert,
+                          std::span<const float> xs, std::uint32_t m,
+                          std::span<float> ds) const;
+
+    /**
+     * Sends the experts `r` names to other hosts from moe_ffn (single
+     * calls) and moe_ffn_batch (one batched call per host, i#1186),
+     * whatever their backend's ops; null computes them all here. Not
+     * owned; it must outlive the forwards that use it. The whole-layer
+     * GPU forwards decline a model with remote experts, and under the
      * MoE hybrid a cold pick runs on its CPU here even if `r` names it
      * (each host maps the whole file, so the result is the same).
      */

@@ -1192,16 +1192,34 @@ through `TransformerModel::expert_out`, the step `moe_ffn` takes per
 pick, one connection at a time, and accepts only loopback peers unless
 given `--allow`; with `--key-file` (and locus-run's
 `--remote-experts-key-file`) a peer first passes the stage's key
-handshake, and each side refuses a frame longer than n_embd floats
-from its length prefix (#850). On the token's
+handshake, and each side refuses a frame longer than its largest
+message from the length prefix (#850): n_embd floats for the owner,
+`kMaxExpertBatch` x (n_embd + 1) values, about 34 MB at n_embd 2048,
+for the expert host. On the token's
 side, `TransformerModel::set_remote_experts` takes a
 `model::RemoteExperts` (`pipeline::ExpertClient` over those
 connections): `moe_ffn` starts the remote picks, computes the local
 ones meanwhile, then adds every pick in pick order, and its readahead
-skips the remote experts. The batched CPU forwards (a prefill chunk, a
-multi-sequence decode, a stage's layers) run such a layer's MoE a token
-at a time through `moe_ffn`, so their picks reach the expert hosts too,
-with the same bits (#1185; batched remote calls are #1186). The GPU
+skips the remote experts. The batched forwards (a prefill chunk, a
+multi-sequence decode, a stage's layers) go through `moe_ffn_batch`,
+which sends a layer's remote picks of all its tokens as one
+`kExpertCallBatch` per host (the hidden states, then their expert ids
+as u32; at most `kMaxExpertBatch` = 4096 pairs a call, a larger batch
+in chunks) and computes the local experts meanwhile (#1186). The host
+runs each expert once over its tokens (`expert_out_batch`: one read of
+its weights instead of one per token) and replies with one
+`kExpertOutBatch` in call order. The client keeps one batched call in
+flight per host, since a reply can be tens of MB and the host writes
+it before it reads again. On a CPU expert host the replies keep the
+bits of single calls (matvec_batch matches matvec), so a batched
+prefill gives the logits of a token-at-a-time one; a GPU expert host
+may not. With the MoE hybrid on as well, the batched forwards run the
+MoE a token at a time through `moe_ffn` (#1185); so does a Vulkan main
+host, whose `forward_batch` goes per token when its GPU batch declines
+the model. At connect,
+`locus-run` sends an empty `kExpertCallBatch` (`probe_batch_calls`):
+an older `locus-experts` closes the connection on it, and the client
+reconnects and sends that host single calls. The GPU
 whole-token forwards (Vulkan's, Metal's) never call `moe_ffn`, so they
 decline such a model and it runs per op, its matvecs still on the GPU.
 The remote picks carry the bits of whatever backend each expert host

@@ -1,3 +1,5 @@
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -180,24 +182,43 @@ int main(int argc, char** argv) {
                              argv[0], r.lo, r.hi, hp.n_expert);
                 return 2;
             }
-            const int fd = locus::pipeline::connect_to(r.host, r.port, 5000);
+            const auto open = [&]() -> int {
+                const int fd =
+                    locus::pipeline::connect_to(r.host, r.port, 5000);
+                if (fd < 0) {
+                    std::fprintf(stderr, "%s: cannot reach %s:%d\n", argv[0],
+                                 r.host.c_str(), r.port);
+                    return -1;
+                }
+                if (!expert_key.empty() &&
+                    !locus::pipeline::handshake_connect(
+                        fd, expert_key, locus::pipeline::kHandshakeTimeoutMs)) {
+                    std::fprintf(stderr,
+                                 "%s: %s:%d failed the key handshake (does "
+                                 "it run with the same --key-file?)\n",
+                                 argv[0], r.host.c_str(), r.port);
+                    ::close(fd);
+                    return -1;
+                }
+                return fd;
+            };
+            int fd = open();
             if (fd < 0) {
-                std::fprintf(stderr, "%s: cannot reach %s:%d\n", argv[0],
-                             r.host.c_str(), r.port);
                 return 1;
             }
-            if (!expert_key.empty() &&
-                !locus::pipeline::handshake_connect(
-                    fd, expert_key, locus::pipeline::kHandshakeTimeoutMs)) {
-                std::fprintf(stderr,
-                             "%s: %s:%d failed the key handshake (does it "
-                             "run with the same --key-file?)\n",
-                             argv[0], r.host.c_str(), r.port);
-                return 1;
+            // An older locus-experts closes on the batched-call probe:
+            // reconnect and send it single calls (i#1186).
+            const bool batched = locus::pipeline::probe_batch_calls(fd);
+            if (!batched) {
+                ::close(fd);
+                if ((fd = open()) < 0) {
+                    return 1;
+                }
             }
-            hosts.push_back({r.lo, r.hi, fd});
-            std::fprintf(stderr, "remote experts [%u,%u) on %s:%d\n", r.lo,
-                         r.hi, r.host.c_str(), r.port);
+            hosts.push_back({r.lo, r.hi, fd, batched});
+            std::fprintf(stderr, "remote experts [%u,%u) on %s:%d%s\n", r.lo,
+                         r.hi, r.host.c_str(), r.port,
+                         batched ? "" : " (single calls: an older host)");
         }
         // Declared before the engine, so it outlives every forward.
         std::unique_ptr<locus::pipeline::ExpertClient> experts;

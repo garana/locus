@@ -1777,6 +1777,163 @@ TEST_CASE("an expert server closes on a call longer than n_embd floats",
     REQUIRE(served == 0);
 }
 
+TEST_CASE("an expert server's batched call gives its single calls' bits",
+          "[moe][pipeline]") {
+    namespace pl = locus::pipeline;
+    auto g = locus::gguf::GgufFile::parse(qwen_image(+8.0f, false));
+    auto model = TransformerModel::load(g);
+    const std::uint32_t E = model.hparams().n_embd;
+    // Repeated experts, out of order: the host groups them and must put
+    // each output back in its call's row.
+    const std::vector<std::uint32_t> ids = {3, 1, 3, 0, 2, 1, 3};
+    std::vector<float> xs(ids.size() * E);
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (float& v : xs) {
+        v = dist(rng);
+    }
+    int sv[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    std::uint64_t served = 0;
+    std::thread server([&] {
+        served = pl::serve_expert_calls(model, sv[1], 0, 4);
+        ::close(sv[1]);
+    });
+    // The connect-time probe: an empty batch gets an empty reply.
+    REQUIRE(pl::probe_batch_calls(sv[0]));
+    REQUIRE(pl::write_message(sv[0],
+                              pl::make_expert_call_batch(9, 0, ids, xs)));
+    pl::Message out;
+    REQUIRE(pl::read_message(sv[0], out) == pl::ReadResult::kOk);
+    ::close(sv[0]);
+    server.join();
+    CHECK(served == ids.size());
+    REQUIRE(out.type == pl::MsgType::kExpertOutBatch);
+    CHECK(out.request_id == 9);
+    CHECK(out.position == 0);
+    REQUIRE(out.token == static_cast<int>(ids.size()));
+    REQUIRE(out.data.size() == xs.size());
+    auto ws = model.make_workspace();
+    std::vector<float> d(E);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        INFO("pair " << i << " expert " << ids[i]);
+        model.expert_out(0, ids[i], {xs.data() + i * E, E}, d, ws);
+        CHECK(std::memcmp(d.data(), out.data.data() + i * E,
+                          E * sizeof(float)) == 0);
+    }
+}
+
+TEST_CASE("expert_out_batch gives expert_out's bits on Qwen1.5-MoE",
+          "[moe][pipeline][qwen]") {
+    // The real quant types (Q4_K gate and up, Q8_0 down, 1408 wide), in
+    // both activation modes: a batched call's reply must be the bits of
+    // single calls, so an expert host on either keeps the owner's sum.
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/Qwen1.5-MoE-A2.7B.Q4_K_M.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("Qwen-MoE model not present (9.5GB, gitignored)");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = TransformerModel::load(g);
+    const std::uint32_t E = model.hparams().n_embd;
+    constexpr std::uint32_t m = 5;
+    std::vector<float> xs(std::size_t{m} * E);
+    std::mt19937 rng(31);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (float& v : xs) {
+        v = dist(rng);
+    }
+    auto ws = model.make_workspace();
+    std::vector<float> ds(xs.size()), d(E);
+    for (const bool q8 : {true, false}) {
+        model.use_q8k_activations(q8);
+        for (const std::uint32_t layer : {0u, 13u}) {
+            for (const std::uint32_t e : {0u, 41u}) {
+                model.expert_out_batch(layer, e, xs, m, ds);
+                for (std::uint32_t q = 0; q < m; ++q) {
+                    INFO("q8 " << q8 << " layer " << layer << " expert " << e
+                               << " row " << q);
+                    model.expert_out(layer, e, {xs.data() + q * E, E}, d, ws);
+                    CHECK(std::memcmp(d.data(), ds.data() + q * E,
+                                      E * sizeof(float)) == 0);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("an expert server closes on a bad batched call",
+          "[moe][pipeline]") {
+    namespace pl = locus::pipeline;
+    auto g = locus::gguf::GgufFile::parse(qwen_image(+8.0f, false));
+    auto model = TransformerModel::load(g);
+    const std::uint32_t E = model.hparams().n_embd;
+    // Serves experts [0, 2) only; each call must close with no reply.
+    const auto closes = [&](const pl::Message& m) {
+        int sv[2];
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        std::uint64_t served = 1;
+        std::thread server([&] {
+            served = pl::serve_expert_calls(model, sv[1], 0, 2);
+            ::close(sv[1]);
+        });
+        // The write may fail once the host has closed (an oversized
+        // frame is refused from its length prefix).
+        (void)pl::write_message(sv[0], m);
+        pl::Message out;
+        CHECK(pl::read_message(sv[0], out) != pl::ReadResult::kOk);
+        server.join();
+        ::close(sv[0]);
+        CHECK(served == 0);
+    };
+    const std::vector<std::uint32_t> in_range = {0, 1};
+    const std::vector<std::uint32_t> out_of_range = {0, 2};
+    SECTION("an expert outside the host's range") {
+        closes(pl::make_expert_call_batch(
+            1, 0, out_of_range, std::vector<float>(2 * E, 0.5f)));
+    }
+    SECTION("hidden states that are not n x n_embd floats") {
+        closes(pl::make_expert_call_batch(
+            1, 0, in_range, std::vector<float>(2 * E - 1, 0.5f)));
+    }
+    SECTION("more than kMaxExpertBatch pairs") {
+        const std::vector<std::uint32_t> many(pl::kMaxExpertBatch + 1, 0);
+        closes(pl::make_expert_call_batch(
+            1, 0, many, std::vector<float>(many.size() * E, 0.5f)));
+    }
+    SECTION("a layer without experts") {
+        closes(pl::make_expert_call_batch(
+            1, 99, in_range, std::vector<float>(2 * E, 0.5f)));
+    }
+}
+
+TEST_CASE("pipeline messages carry a batched call's ids as u32",
+          "[pipeline]") {
+    namespace pl = locus::pipeline;
+    // Ids below 2^23 are subnormal as floats; they must come back as
+    // they went, whatever the float mode.
+    const std::vector<std::uint32_t> ids = {0, 1, 5, 0x7fffffu, 0xffffffffu};
+    const std::vector<float> xs(ids.size() * 2, 1.5f);
+    std::string buf;
+    pl::encode(pl::make_expert_call_batch(4, 3, ids, xs), buf);
+    pl::Message m;
+    std::string err;
+    REQUIRE(pl::decode(buf, m, err) == pl::Decode::kComplete);
+    CHECK(m.type == pl::MsgType::kExpertCallBatch);
+    CHECK(m.request_id == 4);
+    CHECK(m.position == 3);
+    CHECK(m.token == static_cast<int>(ids.size()));
+    CHECK(m.ids == ids);
+    CHECK(m.data == xs);
+    // A frame whose length does not hold token ids is refused.
+    std::string bad;
+    pl::Message wrong = pl::make_expert_call_batch(4, 3, ids, xs);
+    wrong.ids.pop_back();  // encode writes ids.size() as the count
+    pl::encode(wrong, bad);
+    bad[4 + 16] = static_cast<char>(ids.size());  // the count says 5
+    CHECK(pl::decode(bad, m, err) == pl::Decode::kError);
+}
+
 TEST_CASE("a forward with remote experts is one process's bits",
           "[moe][pipeline]") {
     // Experts 2 and 3 run on a loopback expert server over a second
@@ -1800,11 +1957,17 @@ TEST_CASE("a forward with remote experts is one process's bits",
     // be: run on that backend (Vulkan: the GPU forward declines the model
     // and the per-op path sends the picks, i#1185; its own float order,
     // so compared within rounding).
+    // max_batch: most pairs a batched call holds (1 splits a layer's
+    // picks into one chunk each, which must not stall the host, i#1186);
+    // host_batched false: the host gets single calls, as an older one.
     const auto check = [&](const std::vector<std::byte>& img,
                            std::size_t window, bool batched,
-                           const char* be = nullptr) {
+                           const char* be = nullptr,
+                           std::uint32_t max_batch = 0,
+                           bool host_batched = true) {
         INFO("window " << window << " batched " << batched << " backend "
-                       << (be != nullptr ? be : "default"));
+                       << (be != nullptr ? be : "default") << " max_batch "
+                       << max_batch << " host_batched " << host_batched);
         const auto want = run(img, toks);
 
         auto g_srv = locus::gguf::GgufFile::parse(img);
@@ -1817,8 +1980,9 @@ TEST_CASE("a forward with remote experts is one process's bits",
             locus::pipeline::serve_expert_calls(server_model, sv[1], 2, 4);
             ::close(sv[1]);
         });
-        locus::pipeline::ExpertClient client({{2, 4, sv[0]}},
-                                             model.hparams().n_embd, window);
+        locus::pipeline::ExpertClient client(
+            {{2, 4, sv[0], host_batched}}, model.hparams().n_embd, window,
+            max_batch);
         if (window != 0) {
             REQUIRE(client.window() == window);
         }
@@ -1851,8 +2015,22 @@ TEST_CASE("a forward with remote experts is one process's bits",
         model.set_remote_experts(nullptr);
         ::close(sv[0]);  // the server sees EOF and returns
         server.join();
-        INFO("remote calls " << client.calls());
+        INFO("remote calls " << client.calls() << " batches "
+                             << client.batches());
         REQUIRE(client.calls() > 0);  // the remote path ran
+        // A batched forward on the CPU sends batched calls to a host
+        // that takes them; one token at a time sends single calls, and
+        // so does Vulkan, whose forward_batch goes per token when its GPU
+        // batch declines the model.
+        if (batched && host_batched && be == nullptr) {
+            CHECK(client.batches() > 0);
+            CHECK(client.batches() <= client.calls());
+            if (max_batch == 1) {
+                CHECK(client.batches() == client.calls());
+            }
+        } else {
+            CHECK(client.batches() == 0);
+        }
         REQUIRE(got.size() == want.size());
         if (be == nullptr) {
             REQUIRE(std::memcmp(got.data(), want.data(),
@@ -1873,6 +2051,13 @@ TEST_CASE("a forward with remote experts is one process's bits",
         const auto shared = qwen_image(+8.0f, /*zero_shared=*/false);
         CHECK(check(img, window, true) == check(img, window, false));
         CHECK(check(shared, window, true) == check(shared, window, false));
+        // Chunks of one and two pairs, and a host on single calls.
+        for (const std::uint32_t mb : {1u, 2u}) {
+            CHECK(check(shared, window, true, nullptr, mb) ==
+                  check(shared, window, false));
+        }
+        CHECK(check(shared, window, true, nullptr, 0, false) ==
+              check(shared, window, false));
         if (locus::backend::vulkan_backend_usable()) {
             // The same picks reach the expert host on Vulkan.
             CHECK(check(img, window, false, "vulkan") ==
