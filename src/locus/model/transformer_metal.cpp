@@ -292,8 +292,9 @@ MetalWeights& weights_of(std::shared_ptr<MetalWeights>& p, bool file_backed) {
 
 /**
  * Records body into a new batch and runs it. On an exception the batch
- * still open (a MoE layer may end and reopen it) is ended first, so
- * its recorded work finishes before the buffers can change.
+ * still open (a MoE layer may end and reopen it) is abandoned, never
+ * submitted: its recording stopped part way, so its work must not run.
+ * A batch a MoE layer ended before was already waited for.
  */
 template <typename F>
 void run_batch(Context& ctx, F&& body) {
@@ -301,9 +302,7 @@ void run_batch(Context& ctx, F&& body) {
     try {
         body();
     } catch (...) {
-        if (ctx.batch_open()) {
-            ctx.end_batch();
-        }
+        ctx.abandon_batch();
         throw;
     }
     ctx.end_batch();
