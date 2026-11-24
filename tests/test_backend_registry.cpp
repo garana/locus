@@ -316,8 +316,8 @@ TEST_CASE("neon q8k matvec matches scalar q8k", "[backend]") {
     }
 }
 TEST_CASE("neon q8k block-32 dots match scalar q8k", "[backend]") {
-    // Q8_0 / Q4_0 / IQ4_NL weights x a Q8_0 activation; 25 blocks per
-    // row, so the odd-block scalar tail runs too.
+    // Q8_0 / Q4_0 / Q5_0 / IQ4_NL weights x a Q8_0 activation; 25
+    // blocks per row, so the odd-block scalar tail runs too.
     using TT = locus::gguf::TensorType;
     const std::uint32_t rows = 5, cols = 800;
     std::mt19937 rng(47);
@@ -331,6 +331,7 @@ TEST_CASE("neon q8k block-32 dots match scalar q8k", "[backend]") {
     for (const auto& [type, bytes] :
          {std::pair{TT::kQ8_0, std::size_t{34}},
           std::pair{TT::kQ4_0, std::size_t{18}},
+          std::pair{TT::kQ5_0, std::size_t{22}},
           std::pair{TT::kIQ4_NL, std::size_t{18}}}) {
         std::vector<std::byte> w(static_cast<std::size_t>(rows) *
                                  (cols / 32) * bytes);

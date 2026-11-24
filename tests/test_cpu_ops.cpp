@@ -1544,13 +1544,15 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
             }
         }
     }
-    // 25 blocks per row: the odd-block tail runs too.
+    // 25 blocks per row: the odd-block tail runs too. Every block-32
+    // type, Q5_0 too (i#1077), equals the scalar dot as well.
     const std::uint32_t bcols = 800;
     const auto xq = tokens(bcols);
     std::uniform_int_distribution<int> byte_d(0, 255);
     std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
     for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
                                    std::pair{TensorType::kQ4_0, 18u},
+                                   std::pair{TensorType::kQ5_0, 22u},
                                    std::pair{TensorType::kIQ4_NL, 18u}}) {
         std::vector<std::byte> w(std::size_t{rows} * (bcols / 32) * bytes);
         for (auto& by : w) {
@@ -1564,13 +1566,16 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
         std::vector<float> got(std::size_t{rows} * n);
         matvec_batch_neon_q8k(m, xq, got, n);
         for (std::uint32_t tk = 0; tk < n; ++tk) {
-            std::vector<float> ref(rows);
-            matvec_neon_q8k(
-                m, {xq.data() + std::size_t{tk} * bcols, bcols}, ref);
+            const std::span<const float> x(xq.data() + std::size_t{tk} * bcols,
+                                           bcols);
+            std::vector<float> ref(rows), scalar(rows);
+            matvec_neon_q8k(m, x, ref);
+            matvec_q8k(m, x, scalar);
             for (std::uint32_t r = 0; r < rows; ++r) {
                 INFO("type " << static_cast<int>(t) << " r=" << r
                              << " t=" << tk);
                 REQUIRE(got[std::size_t{r} * n + tk] == ref[r]);
+                REQUIRE(ref[r] == scalar[r]);
             }
         }
     }
