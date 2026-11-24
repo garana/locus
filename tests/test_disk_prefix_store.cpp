@@ -169,6 +169,34 @@ TEST_CASE("DiskPrefixStore: every key field is part of the match",
     REQUIRE(wide.find(kPrompt) == 0);
 }
 
+// i#1180: the backend field carries a digest of the sources that
+// computed the KV, so another build's entries (and those of a binary
+// from before the digest, the plain name) miss, and the same build's hit.
+TEST_CASE("DiskPrefixStore: another build's kernels are a miss",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-digest")};
+    const auto in = blocks(2, 3);
+    DiskKey old = key();
+    old.backend = "metal";  // before i#1180
+    DiskKey now = key();
+    now.backend = "metal:532d9ddc";
+    DiskKey other = now;
+    other.backend = "metal:8cc17d54";
+    {
+        DiskPrefixStore s(g.dir, old, kBlockBytes, 1 << 20);
+        REQUIRE(s.write(kPrompt, 2, srcs(in)));
+    }
+    {
+        DiskPrefixStore s(g.dir, now, kBlockBytes, 1 << 20);
+        REQUIRE(s.find(kPrompt) == 0);
+        REQUIRE(s.write(kPrompt, 2, srcs(in)));
+    }
+    DiskPrefixStore same(g.dir, now, kBlockBytes, 1 << 20);
+    REQUIRE(same.find(kPrompt) == 2);
+    DiskPrefixStore later(g.dir, other, kBlockBytes, 1 << 20);
+    REQUIRE(later.find(kPrompt) == 0);
+}
+
 TEST_CASE("DiskPrefixStore: device attention is part of the match",
           "[disk_prefix]") {
     DirGuard g{temp_dir("locus-dps-devattn")};
@@ -726,4 +754,128 @@ TEST_CASE("DiskPrefixWorker reads blocks of a write not yet on disk",
     REQUIRE(got_a == a);
     REQUIRE(s->find(tb) == 3);  // the served write still reached disk
     REQUIRE(w.queued_blocks(tb) == 0);
+}
+
+// i#1180: a file's header gives back its store's key hash, and
+// clean_disk_prefix removes the files of every key not kept (several
+// servers can share a directory), never through a symlink, leaving
+// files it cannot read and other names alone.
+TEST_CASE("clean_disk_prefix keeps the files of the keys given",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-clean")};
+    const fs::path victim = temp_dir("locus-dps-clean-victim");
+    DirGuard gv{victim};
+    fs::create_directories(victim);
+    const auto in = blocks(2, 5);
+    DiskKey a = key();
+    a.backend = "metal:11111111";
+    DiskKey b = key();
+    b.backend = "vulkan:11111111";
+    DiskKey old = key();
+    old.backend = "metal:22222222";  // another build
+    std::uint64_t ka = 0, kb = 0, kold = 0;
+    fs::path pa, pb, pold, pold2;
+    {
+        DiskPrefixStore s(g.dir, a, kBlockBytes, 1 << 20);
+        REQUIRE(s.write(kPrompt, 2, srcs(in)));
+        ka = s.key_hash();
+        pa = s.path_for(kPrompt, 2);
+    }
+    {
+        DiskPrefixStore s(g.dir, b, kBlockBytes, 1 << 20);
+        REQUIRE(s.write(kPrompt, 2, srcs(in)));
+        kb = s.key_hash();
+        pb = s.path_for(kPrompt, 2);
+    }
+    {
+        DiskPrefixStore s(g.dir, old, kBlockBytes, 1 << 20);
+        REQUIRE(s.write(kPrompt, 2, srcs(in)));
+        REQUIRE(s.write(kPrompt, 1, srcs(in)));
+        kold = s.key_hash();
+        pold = s.path_for(kPrompt, 2);
+        pold2 = s.path_for(kPrompt, 1);
+    }
+    REQUIRE(ka != kb);
+    REQUIRE(ka != kold);
+    // The header names its key, whatever the prompt's length.
+    CHECK(locus::engine::disk_prefix_file_key(pa) == ka);
+    CHECK(locus::engine::disk_prefix_file_key(pb) == kb);
+    CHECK(locus::engine::disk_prefix_file_key(pold) == kold);
+    CHECK(locus::engine::disk_prefix_file_key(pold2) == kold);
+    // A MAC key moves the hash too.
+    {
+        DiskPrefixStore s(g.dir, a, kBlockBytes, 1 << 20);
+        s.set_mac_key("a shared secret");
+        CHECK(s.key_hash() != ka);
+    }
+
+    // A store-named file that is not a store file, a short one, another
+    // name, and a store-named symlink to a file of the old key outside.
+    const fs::path junk = g.dir / "00000000000000aa.lkv";
+    std::ofstream(junk) << "not a cache file";
+    const fs::path other = g.dir / "notes.txt";
+    std::ofstream(other) << "keep";
+    const fs::path outside = victim / "old.lkv";
+    fs::copy_file(pold, outside);
+    const fs::path link = g.dir / "00000000000000bb.lkv";
+    fs::create_symlink(outside, link);
+    CHECK_FALSE(locus::engine::disk_prefix_file_key(junk));
+    CHECK_FALSE(locus::engine::disk_prefix_file_key(link));
+
+    const std::uint64_t keep[] = {ka, kb};
+    SECTION("a dry run removes nothing") {
+        std::vector<fs::path> gone;
+        const auto r =
+            locus::engine::clean_disk_prefix(g.dir, keep, true, &gone);
+        CHECK(r.removed == 2);
+        CHECK(r.kept == 2);
+        CHECK(r.skipped == 1);
+        CHECK(gone.size() == 2);
+        CHECK(fs::exists(pold));
+        CHECK(fs::exists(pold2));
+    }
+    SECTION("the old build's files go, the rest stay") {
+        const auto r = locus::engine::clean_disk_prefix(g.dir, keep, false);
+        CHECK(r.removed == 2);
+        CHECK(r.removed_bytes > 0);
+        CHECK(r.kept == 2);
+        CHECK(r.skipped == 1);
+        CHECK_FALSE(fs::exists(pold));
+        CHECK_FALSE(fs::exists(pold2));
+        CHECK(fs::exists(pa));
+        CHECK(fs::exists(pb));
+        CHECK(fs::exists(junk));
+        CHECK(fs::exists(other));
+        CHECK(fs::is_symlink(link));
+        CHECK(fs::exists(outside));  // never reached through the link
+        // The kept store still reads its file.
+        DiskPrefixStore s(g.dir, a, kBlockBytes, 1 << 20);
+        REQUIRE(s.find(kPrompt) == 2);
+    }
+    SECTION("keeping one key removes the other's files") {
+        const std::uint64_t only[] = {ka};
+        const auto r = locus::engine::clean_disk_prefix(g.dir, only, false);
+        CHECK(r.removed == 3);
+        CHECK_FALSE(fs::exists(pb));
+        CHECK(fs::exists(pa));
+    }
+    SECTION("no key to keep, or a symlinked directory, is refused") {
+        CHECK_THROWS_AS(locus::engine::clean_disk_prefix(
+                            g.dir, std::span<const std::uint64_t>{}, false),
+                        std::invalid_argument);
+        const fs::path dlink = victim / "dirlink";
+        fs::create_symlink(g.dir, dlink);
+        CHECK_THROWS_AS(
+            locus::engine::clean_disk_prefix(dlink, keep, false),
+            std::runtime_error);
+        CHECK(fs::exists(pold));
+    }
+    SECTION("a directory group or others can write is refused") {
+        fs::permissions(g.dir, fs::perms::group_write, fs::perm_options::add);
+        CHECK_THROWS_AS(locus::engine::clean_disk_prefix(g.dir, keep, false),
+                        std::runtime_error);
+        fs::permissions(g.dir, fs::perms::group_write,
+                        fs::perm_options::remove);
+        CHECK(fs::exists(pold));
+    }
 }

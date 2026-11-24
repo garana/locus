@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -150,6 +151,15 @@ class DiskPrefixStore {
 
     /** @returns bytes of the indexed files in the directory. */
     std::uint64_t used_bytes() const;
+    /**
+     * @returns the hash naming this store's key (i#1180): the
+     *     checksum of the key's header, which seeds every file name.
+     *     It moves when anything in the key does (the model, the
+     *     backend and its compute digest, the route, the MAC key), so
+     *     the server prints it at boot and clean_disk_prefix keeps the
+     *     files whose header hashes to one of the hashes given.
+     */
+    std::uint64_t key_hash() const;
 
     const DiskKey& key() const { return key_; }
 
@@ -272,5 +282,49 @@ class DiskPrefixStore {
     /** Names the temporary files of writes in flight. */
     std::uint64_t tmp_seq_ = 0;
 };
+
+/**
+ * @returns the key hash (DiskPrefixStore::key_hash) of the store file
+ *     at `path`, from its header; nullopt when the file cannot be read
+ *     as one of this format version, or `path` is a symlink.
+ */
+std::optional<std::uint64_t> disk_prefix_file_key(
+    const std::filesystem::path& path);
+
+/** What clean_disk_prefix did. */
+struct PrefixCleanResult {
+    /** Files of another key: removed (or, dry run, to remove). */
+    std::uint64_t removed = 0;
+    std::uint64_t removed_bytes = 0;
+    /** Files of a key in the keep set. */
+    std::uint64_t kept = 0;
+    /** Store-named files whose header did not parse: left alone. */
+    std::uint64_t skipped = 0;
+};
+
+/**
+ * Removes from the disk prefix directory `dir` every store file
+ * ("<16 hex digits>.lkv") whose key hash is not in `keep` (i#1180):
+ * files of other models, backends or builds that no server will read
+ * again. Never follows a symlink: `dir` opens with O_NOFOLLOW, and
+ * every later step (the listing, fstatat, openat with O_NOFOLLOW,
+ * unlinkat) goes through that descriptor, so a `dir` swapped during
+ * the walk cannot redirect it; a symlink entry is left alone. `dir`
+ * must pass the store's own startup check: the user's, and not group-
+ * or world-writable. A file whose header does not parse, other entries
+ * and .tmp files are left alone.
+ *
+ * @param keep The key hashes to keep (each server's boot line), at
+ *     least one.
+ * @param dry_run Count, but remove nothing.
+ * @param removed_paths When set, receives each file removed.
+ * @throws std::invalid_argument when `keep` is empty;
+ *     std::runtime_error when `dir` is a symlink, not a directory,
+ *     owned by another user, or writable by group or others.
+ */
+PrefixCleanResult clean_disk_prefix(
+    const std::filesystem::path& dir, std::span<const std::uint64_t> keep,
+    bool dry_run, std::vector<std::filesystem::path>* removed_paths =
+                      nullptr);
 
 }  // namespace locus::engine

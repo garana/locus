@@ -57,7 +57,10 @@ disk, count as `usage.prompt_tokens_details.cached_tokens` (Anthropic:
 `cache_read_input_tokens`). The disk cache keeps each prefix's prompt
 tokens, so DIR must not be readable by other users (files are 0600).
 The server refuses a DIR that another user owns or that group or
-others can write.
+others can write. It prints its cache key at boot (`prefix cache key
+<16 hex>`); after an upgrade or a model change, `locus-prefix-clean
+--keep KEY DIR` (a KEY for each server sharing DIR) removes the files
+no server will read again.
 
 Structured output forces the reply to match a format, by masking the
 tokens that would break it:

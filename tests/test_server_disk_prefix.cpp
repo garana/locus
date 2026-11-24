@@ -10,6 +10,8 @@
 #include "catch_amalgamated.hpp"
 #include "httplib.h"
 #include "json.hpp"
+#include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/engine/disk_prefix_key.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
@@ -136,7 +138,14 @@ TEST_CASE("the disk prefix key follows the model file and its settings",
     const auto k = locus::engine::disk_key_for(g, model_path(), model,
                                                locus::kv::KvType::kF32, bb);
     REQUIRE(k.model_size == fs::file_size(model_path()));
-    REQUIRE(k.backend == model.active_backend().name);
+    // The backend, then 8 hex digits of the sources that compute KV
+    // (i#1180).
+    const std::string name(model.active_backend().name);
+    REQUIRE(k.backend.size() == name.size() + 9);
+    REQUIRE(k.backend.compare(0, name.size() + 1, name + ":") == 0);
+    REQUIRE(k.backend.find_first_not_of("0123456789abcdef",
+                                        name.size() + 1) ==
+            std::string::npos);
     REQUIRE(k.block_tokens > 0);
     REQUIRE(bb > 0);
     // The same file gives the same key; another KV type another one.
@@ -167,6 +176,22 @@ TEST_CASE("the disk prefix key follows the model file and its settings",
         g, model_path(), model, locus::kv::KvType::kF32, bb2);
     ::unsetenv("LOCUS_BATCH_DEQUANT");
     REQUIRE(dequant.overrides != k.overrides);
+
+    // On Vulkan its numeric modes are in the key too, under the
+    // backend's own name (k.backend has the digest after it).
+    if (locus::backend::vulkan_backend_usable()) {
+        model.use_backend(*locus::backend::find_backend("vulkan"));
+        locus::backend::vulkan_set_batch_invariant(false);
+        const auto vk_off = locus::engine::disk_key_for(
+            g, model_path(), model, locus::kv::KvType::kF32, bb2);
+        locus::backend::vulkan_set_batch_invariant(true);
+        const auto vk_on = locus::engine::disk_key_for(
+            g, model_path(), model, locus::kv::KvType::kF32, bb2);
+        locus::backend::vulkan_reset_batch_invariant();
+        model.use_backend(*locus::backend::find_backend(name));
+        REQUIRE(vk_on.backend.starts_with("vulkan:"));
+        REQUIRE(vk_on.overrides != vk_off.overrides);
+    }
 
     // A copy of the file with another mtime is another model.
     const fs::path copy = fs::temp_directory_path() /

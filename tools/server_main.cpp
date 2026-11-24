@@ -367,6 +367,13 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         if (!gpu_warn.empty()) {
             std::fprintf(stderr, "%s\n", gpu_warn.c_str());
         }
+        if (opt.engine.disk_prefix) {
+            // After the engine set the route and attention parts of the
+            // key: the hash locus-prefix-clean --keep takes (i#1180).
+            std::fprintf(stderr, "locus-server: prefix cache key %016llx\n",
+                         static_cast<unsigned long long>(
+                             opt.engine.disk_prefix->key_hash()));
+        }
         // An IPv6 address in brackets, so "[::1]:8080" reads unambiguously.
         const bool v6 = args.host.find(':') != std::string::npos;
         if (args.host.empty()) {

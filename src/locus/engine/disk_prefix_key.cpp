@@ -11,6 +11,7 @@
 #include <string_view>
 
 #include "locus/backend/variants.hpp"
+#include "locus/engine/compute_digest.hpp"
 
 namespace locus::engine {
 
@@ -50,7 +51,11 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
         h = fnv(fnv(h, head.data(), head.size()), f.file_bytes());
     });
     k.model_hash = h;
-    k.backend = m.active_backend().name;
+    // The backend, and a digest of the sources that computed the KV:
+    // another build's kernels or forward may sum in another order
+    // (i#1180), and an entry without one (an older binary's) misses.
+    const std::string_view be = m.active_backend().name;
+    k.backend = std::string(be) + ":" + kComputeDigest;
 
     const auto& hp = m.hparams();
     std::uint64_t o = kFnvOffset;
@@ -66,17 +71,18 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
     for (const char* var : {"LOCUS_BATCH_DEQUANT", "LOCUS_MOE_HYBRID",
                             "LOCUS_MOE_HYBRID_SLOTS", "LOCUS_VK_CPU_ROUTE",
                             "LOCUS_GPU_POOL_MB", "LOCUS_MOE_STATS",
-                            "LOCUS_CUDA_FORWARD"}) {
+                            "LOCUS_CUDA_FORWARD", "LOCUS_CPU_FAST"}) {
         const char* v = std::getenv(var);
         const std::string s = v != nullptr ? std::string("=") + v : "";
         o = fnv(fnv(o, var, std::strlen(var)), s.data(), s.size());
     }
-    if (k.backend == "vulkan") {
+    // The backend's own name: k.backend carries the digest after it.
+    if (be == "vulkan") {
         o = fnv(o, backend::vulkan_prefill_f16());
         o = fnv(o, backend::vulkan_batch_invariant());
         const std::string dev = backend::vulkan_device_name();
         o = fnv(o, dev.data(), dev.size());
-    } else if (k.backend == "cuda") {
+    } else if (be == "cuda") {
         const std::string dev = backend::cuda_device_name();
         o = fnv(o, dev.data(), dev.size());
     }

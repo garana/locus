@@ -759,8 +759,17 @@ guarding the default path.
   sequence stays the verified key, so a collision never returns a
   wrong prefix. A disk tier (`--prefix-cache-dir`, i#416) keeps one
   file per prefix with the full key (the model's GGUF header, size and
-  mtime, the backend and device, the KV geometry, RoPE settings and
-  the numeric modes that change KV bits, and on Vulkan where the MoE
+  mtime, the backend and device, a digest of what computes KV
+  (cmake/compute_digest.cmake over every source under src/locus,
+  CMakeLists.txt and the build's compiler, version, build type, C++
+  flags and shader compiler, made at build time: another build may sum
+  in another order, so an upgrade or a rebuild with other flags
+  misses; i#1180), the KV geometry, RoPE settings and
+  the numeric modes that change KV bits (the LOCUS_* switches that
+  pick other kernels among them, LOCUS_CPU_FAST too; not yet the
+  prefill budget or where a prefill resumed after a prefix hit, which
+  set a prompt's chunks and on the GPUs move KV's last bits, #1189),
+  and on Vulkan where the MoE
   experts run: routed on the GPU, or on the host with the picks on the
   GPU or on the CPU (i#1179), settled once the KV pool exists; a model with
   the MoE hybrid on is refused, since its hot set follows the requests
@@ -771,7 +780,15 @@ guarding the default path.
   world-writable (else startup fails), and symlinks in it are never
   followed. With `--prefix-cache-key-file`, each file (or helper blob)
   also ends with an HMAC-SHA-256 of its bytes, so one written without
-  the key is a miss: for a store others can write (#830). Entries
+  the key is a miss: for a store others can write (#830). Files of
+  another key stay until the byte cap evicts them; the server prints
+  its key's hash at boot (`prefix cache key <16 hex>`, the checksum of
+  the key's header, which seeds every file name), and
+  `locus-prefix-clean --keep KEY [--keep KEY ...] DIR` removes every
+  file whose header hashes to none of them (one KEY for each server
+  that shares DIR; `--dry-run` lists them). It never follows a
+  symlink (DIR, an entry or a file), and leaves files whose header it
+  cannot parse alone (i#1180). Entries
   evicted from RAM are written back by a worker thread, and the rest
   at shutdown; a prompt whose prefix is at least one block longer on
   disk waits in a LOADING state while the worker reads it into its
