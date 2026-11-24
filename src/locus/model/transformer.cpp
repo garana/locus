@@ -1830,10 +1830,12 @@ void TransformerModel::forward_batch_decode(
     if (metal_forward_supported()) {
         // Metal: groups of up to kMultiMax sequences through one forward
         // that reads each matrix once for all of them (i#1184), in even
-        // groups (9 as 5 + 4); a lone sequence, or a model it does not
-        // take, runs one GPU forward a sequence (i#866). So, as Vulkan,
-        // a sequence's logits differ in the last bits alone and in a
-        // batch.
+        // groups (9 as 5 + 4); a model it does not take runs one GPU
+        // forward a sequence (i#866). In the batch-invariant mode (a
+        // Q8_0 model's default) a lone sequence takes the same forward,
+        // so a sequence's logits match alone and in a batch; with it
+        // off (a K-quant model's default) a lone sequence takes
+        // metal_forward, and they differ in the last bits, as Vulkan.
         const std::uint32_t V = hp_.n_vocab;
         const std::uint32_t n_groups = (n + kMultiMax - 1) / kMultiMax;
         const std::uint32_t group = (n + n_groups - 1) / n_groups;
