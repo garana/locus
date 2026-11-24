@@ -816,9 +816,9 @@ guarding the default path.
   in another order, so an upgrade or a rebuild with other flags
   misses; i#1180), the KV geometry, RoPE settings and
   the numeric modes that change KV bits (the LOCUS_* switches that
-  pick other kernels among them, LOCUS_CPU_FAST too; not yet the
-  prefill budget or where a prefill resumed after a prefix hit, which
-  set a prompt's chunks and on the GPUs move KV's last bits, #1189),
+  pick other kernels among them, LOCUS_CPU_FAST too, and a prefill
+  budget other than the model's own chunk, which sets a prompt's chunks
+  and on the GPUs moves KV's last bits, #1189),
   and on Vulkan where the MoE
   experts run: routed on the GPU, or on the host with the picks on the
   GPU or on the CPU (i#1179), settled once the KV pool exists; a model with
@@ -850,6 +850,13 @@ guarding the default path.
   in the worker's write queue are copied from it (i#675). Blocks past
   the write backlog are written at preemption from the pool, so the
   step waits for the disk instead of a long recompute later (i#642).
+  Prefix hits, in RAM and on disk, are exact only up to the prefill's
+  chunking: after a hit of k tokens the rest is chunked from k, and on
+  Metal and Vulkan other chunks give other last bits of KV than a fresh
+  prefill of the same prompt (within batched prefill's tolerance of the
+  per-token forward, i#730). Where a prefill resumes depends on what
+  was cached before, so no key can hold it (#1189). The neon backend's
+  prefill gave the same bits at every chunking measured.
 - Prefix cache helper (`--prefix-cache-helper PATH`, i#655): the same
   tier kept by an external process, so the KV can live on remote or
   shared storage. Locus starts the helper and speaks the auth helper's

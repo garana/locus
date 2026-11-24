@@ -53,6 +53,12 @@ struct DiskKey {
      *  all a binary before i#1174 wrote), 1 (GPU) or 2 (host, CPU
      *  picks), so older files keep their meaning (i#1179). */
     bool experts_on_host_cpu = false;
+    /** The prefill budget, when it differs from the model's own chunk
+     *  (Engine::Config::prefill_budget, i#1189); 0 otherwise. It sets
+     *  how a prompt is cut into chunks, which on the GPU backends
+     *  changes the K/V bits. The header mixes it into `overrides`, so
+     *  the layout stays and a default budget keeps its files. */
+    std::uint32_t prefill_budget = 0;
 };
 
 /**
@@ -171,6 +177,9 @@ class DiskPrefixStore {
     /** Sets DiskKey::experts_on_host_cpu, as set_device_attention
      *  does. */
     void set_experts_on_host_cpu(bool on);
+    /** Sets DiskKey::prefill_budget (0: the model's chunk), as
+     *  set_device_attention does. */
+    void set_prefill_budget(std::uint32_t budget);
     /**
      * Ends every file with an HMAC-SHA-256 of its bytes under `key`
      * (i#830), so a file that someone without the key planted or

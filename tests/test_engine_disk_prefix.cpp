@@ -183,6 +183,45 @@ TEST_CASE("engine reads an evicted prefix back from the disk tier",
     REQUIRE(e.disk_prefix_hits() == 1);
 }
 
+// i#1189: the prefill budget sets a prompt's chunks, which on the GPU
+// backends move K/V's last bits, so the engine keys the store on it.
+// The default, or a budget equal to the model's own chunk, computes
+// the same KV and keeps the default's files; another budget misses
+// them.
+TEST_CASE("engine keys the disk tier on its prefill budget",
+          "[engine][disk_prefix]") {
+    if (!fs::exists(model_path())) {
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
+    }
+    Fixture f;
+    TempDir t("locus-edp-budget");
+    std::size_t bb;
+    const DiskKey key = key_for(f.model, bb);
+    const auto run = [&](std::uint32_t budget) {
+        auto store =
+            std::make_shared<DiskPrefixStore>(t.dir, key, bb, 64 << 20);
+        Engine::Config cfg = f.config(store);
+        cfg.prefill_budget = budget;
+        Engine e(f.model, f.tok.eos_id(), cfg);
+        return std::pair{store->key().prefill_budget, store->find(f.p)};
+    };
+    {
+        auto store =
+            std::make_shared<DiskPrefixStore>(t.dir, key, bb, 64 << 20);
+        Engine e(f.model, f.tok.eos_id(), f.config(store));
+        REQUIRE(store->key().prefill_budget == 0);
+        f.fill(e, *store);
+    }
+    const std::uint32_t own = f.model.prefill_chunk();
+    const auto [b_own, hit_own] = run(own);
+    CHECK(b_own == 0);
+    CHECK(hit_own >= 2);  // the default's file
+    const std::uint32_t other = own == 16 ? 32 : 16;
+    const auto [b_other, hit_other] = run(other);
+    CHECK(b_other == other);
+    CHECK(hit_other == 0);  // another key: the default's file misses
+}
+
 // i#561: the same on Vulkan, where the KV pool is the GPU-mapped
 // buffer itself: the write-back copies the GPU's K/V from it and a
 // read writes the GPU's next input into it. The tokens after a disk

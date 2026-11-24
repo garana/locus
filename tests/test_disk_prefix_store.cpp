@@ -149,7 +149,7 @@ TEST_CASE("DiskPrefixStore: every key field is part of the match",
         DiskPrefixStore s(g.dir, base, kBlockBytes, 1 << 20);
         REQUIRE(s.write(kPrompt, 2, srcs(in)));
     }
-    std::vector<DiskKey> others(9, base);
+    std::vector<DiskKey> others(10, base);
     others[0].model_hash ^= 1;
     others[1].model_size += 1;  // the model file changed, same name
     others[2].backend = "vulkan";
@@ -159,6 +159,7 @@ TEST_CASE("DiskPrefixStore: every key field is part of the match",
     others[6].layer_base = 1;
     others[7].overrides = 5;
     others[8].block_tokens = 2;
+    others[9].prefill_budget = 16;  // i#1189: folded into overrides
     for (std::size_t i = 0; i < others.size(); ++i) {
         CAPTURE(i);
         DiskPrefixStore s(g.dir, others[i], kBlockBytes, 1 << 20);

@@ -51,6 +51,12 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
         // Routed on the host, the picks run on the CPU or the GPU
         // (i#1174), with other bits again (i#1179).
         cfg_.disk_prefix->set_experts_on_host_cpu(m.experts_on_host_cpu());
+        // The budget sets a prompt's chunks, and on the GPU backends
+        // the chunks move K/V's last bits (i#1189); a budget equal to
+        // the model's own chunk computes what the default does.
+        cfg_.disk_prefix->set_prefill_budget(
+            cfg_.prefill_budget == m.prefill_chunk() ? 0
+                                                     : cfg_.prefill_budget);
         // The MoE hybrid's hot zone follows the requests served before,
         // so where an expert ran (GPU or CPU), and so the K/V bits,
         // depend on history no key can hold (i#664). Settled now, after
