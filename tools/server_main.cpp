@@ -8,6 +8,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -16,6 +17,7 @@
 #include "backend_cli.hpp"
 #include "cli_spec.hpp"
 #include "stage_config.hpp"
+#include "locus/chat/template.hpp"
 #include "locus/engine/disk_prefix_key.hpp"
 #include "locus/pipeline/handshake.hpp"
 #include "locus/gguf/gguf.hpp"
@@ -173,6 +175,21 @@ OpenAI + Anthropic compatible inference server (default port 8080):
                      argv[0]);
         return 2;
     }
+    // A named template replaces the GGUF's (i#1152); checked before the
+    // model loads.
+    std::optional<locus::chat::ChatTemplate> named_template;
+    if (!args.chat_template.empty()) {
+        named_template =
+            locus::chat::ChatTemplate::from_name(args.chat_template);
+        if (!named_template) {
+            std::fprintf(stderr,
+                         "%s: --chat-template %s: unknown (one of: %s)\n",
+                         argv[0], args.chat_template.c_str(),
+                         std::string(locus::chat::ChatTemplate::names())
+                             .c_str());
+            return 2;
+        }
+    }
     if (args.positional.empty()) {
         std::fprintf(stderr,
                      "usage: %s [--backend NAME] <model.gguf> "
@@ -313,8 +330,9 @@ OpenAI + Anthropic compatible inference server (default port 8080):
             opt.engine.disk_prefix->set_mac_key(
                 locus::pipeline::read_key_file(args.prefix_cache_key_file));
         }
-        opt.chat_template =
-            locus::chat::ChatTemplate::from_gguf(g);
+        opt.chat_template = named_template
+                                ? *named_template
+                                : locus::chat::ChatTemplate::from_gguf(g);
         if (!args.metrics_path.empty()) {
             opt.metrics_path = args.metrics_path;
         }

@@ -225,6 +225,14 @@ inline constexpr const char* kCommonHelp =
     "                   Qwen2.5-VL model, with its vision tower GGUF at\n"
     "                   path P (llama.cpp's mmproj; the model on a CPU\n"
     "                   backend)\n"
+    "  --chat-template NAME\n"
+    "                   locus-server: render chats with this template\n"
+    "                   instead of the GGUF's (for a GGUF that has\n"
+    "                   none, as older Llama 2 conversions): plain,\n"
+    "                   llama2, llama2-sys, llama2-sys-bos,\n"
+    "                   llama2-sys-strip, llama3, chatml, zephyr,\n"
+    "                   deepseek, deepseek2, deepseek-coder (llama.cpp's\n"
+    "                   names)\n"
     "  --image-classifier P locus-server: serve /v1/classify, and\n"
     "                   image inputs to /v1/embeddings under its name,\n"
     "                   with the CNN GGUF at path P (ResNet or\n"
@@ -479,6 +487,10 @@ struct BackendArgs {
     /** From --mmproj P: path to a Qwen2.5-VL vision tower GGUF for
      * image input in chat (i#1092); empty = none. */
     std::string mmproj;
+    /** From --chat-template NAME: the chat template to use instead of
+     * the GGUF's (one of chat::ChatTemplate::names(), i#1152); empty =
+     * the GGUF's. */
+    std::string chat_template;
     /** From --max-tokens N: per-request output-token cap (0 = the
      * server default). */
     std::uint32_t max_tokens = 0;
@@ -753,6 +765,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.mmproj = argv[++i];
         } else if (a.rfind("--mmproj=", 0) == 0) {
             out.mmproj = std::string(a.substr(9));
+        } else if (a == "--chat-template" && i + 1 < argc) {
+            out.chat_template = argv[++i];
+        } else if (a.rfind("--chat-template=", 0) == 0) {
+            out.chat_template = std::string(a.substr(16));
         } else if (a == "--max-tokens" && i + 1 < argc) {
             number("--max-tokens", argv[++i], out.max_tokens);
         } else if (a.rfind("--max-tokens=", 0) == 0) {

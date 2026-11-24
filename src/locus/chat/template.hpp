@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -33,7 +34,14 @@ class ChatTemplate {
   public:
     enum class Family {
         kPlain,     // "role: content" lines
-        kLlama2,    // [INST] ... [/INST]
+        // [INST] ... [/INST], llama.cpp's four variants (i#1152): a
+        // template without <<SYS>> (system text before the first user
+        // turn); with <<SYS>>; that plus <s> before each later [INST];
+        // and <<SYS>> with every message stripped.
+        kLlama2,
+        kLlama2Sys,
+        kLlama2SysBos,
+        kLlama2SysStrip,
         kLlama3,    // <|start_header_id|>...<|eot_id|>
         kChatML,    // <|im_start|>...<|im_end|> (Qwen and kin)
         kZephyr,    // <|user|> ... </s> (TinyLlama-chat)
@@ -47,6 +55,18 @@ class ChatTemplate {
 
     /** Fingerprints `tokenizer.chat_template` (kPlain if absent). */
     static ChatTemplate from_gguf(const gguf::GgufFile& g);
+
+    /**
+     * The template a name picks, for a GGUF that carries none
+     * (`--chat-template NAME`, i#1152): the names name() returns, as
+     * llama.cpp's built-in template names are ("llama2-sys-strip").
+     *
+     * @returns The template, or nullopt for an unknown name.
+     */
+    static std::optional<ChatTemplate> from_name(std::string_view name);
+
+    /** @returns Every name from_name() takes, comma separated. */
+    static std::string_view names();
 
     /**
      * Renders messages into a model-ready prompt.

@@ -238,6 +238,24 @@ TEST_CASE("the tcp-keepalive flag sets the client socket keepalive",
            c.tcp_keepalive_count == 3));
 }
 
+TEST_CASE("the chat-template flag names a template", "[cli]") {
+    std::array<const char*, 4> argv1 = {"prog", "--chat-template",
+                                        "llama2-sys-strip", "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()), const_cast<char**>(argv1.data()));
+    REQUIRE(a.chat_template == "llama2-sys-strip");
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+    std::array<const char*, 3> argv2 = {"prog", "--chat-template=chatml",
+                                        "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()), const_cast<char**>(argv2.data()));
+    REQUIRE(b.chat_template == "chatml");
+    std::array<const char*, 2> argv3 = {"prog", "m.gguf"};
+    auto c = locus_tools::parse_backend_args(
+        static_cast<int>(argv3.size()), const_cast<char**>(argv3.data()));
+    REQUIRE(c.chat_template.empty());  // the GGUF's template
+}
+
 TEST_CASE("the max-tokens flag sets the output token cap", "[cli]") {
     std::array<const char*, 5> argv1 = {"prog", "--max-tokens", "8192",
                                         "--audio-max-tokens=70", "m.gguf"};

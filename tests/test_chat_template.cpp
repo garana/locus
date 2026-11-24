@@ -33,6 +33,12 @@ TEST_CASE("template family detection", "[chat]") {
     REQUIRE(detect("...<|im_start|>...").family() ==
             Family::kChatML);
     REQUIRE(detect("...[INST]...").family() == Family::kLlama2);
+    // llama.cpp's variant rules, in its order (i#1152).
+    REQUIRE(detect("[INST] <<SYS>>").family() == Family::kLlama2Sys);
+    REQUIRE(detect("<<SYS>> bos_token + '[INST] '").family() ==
+            Family::kLlama2SysBos);
+    REQUIRE(detect("<<SYS>> bos_token + '[INST] ' + content.strip()")
+                .family() == Family::kLlama2SysStrip);
     REQUIRE(detect("...<|user|>...").family() ==
             Family::kZephyr);
     REQUIRE(detect("...\xef\xbd\x9cUser\xef\xbd\x9c...")
@@ -73,6 +79,60 @@ TEST_CASE("template family detection", "[chat]") {
             Family::kPlain);
 }
 
+TEST_CASE("a template name picks its family, as llama.cpp's names do",
+          "[chat]") {
+    // --chat-template NAME (i#1152): every family by its name(), and
+    // names() lists exactly those.
+    std::string listed;
+    for (const Family f :
+         {Family::kPlain, Family::kLlama2, Family::kLlama2Sys,
+          Family::kLlama2SysBos, Family::kLlama2SysStrip, Family::kLlama3,
+          Family::kChatML, Family::kZephyr, Family::kDeepSeek,
+          Family::kDeepSeek2, Family::kDeepSeekCoder}) {
+        const ChatTemplate t(f);
+        const auto got = ChatTemplate::from_name(t.name());
+        REQUIRE(got.has_value());
+        CHECK(got->family() == f);
+        listed += (listed.empty() ? "" : ", ") + std::string(t.name());
+    }
+    CHECK(ChatTemplate::names() == listed);
+    CHECK_FALSE(ChatTemplate::from_name("llama-2").has_value());
+    CHECK_FALSE(ChatTemplate::from_name("").has_value());
+}
+
+TEST_CASE("a llama2-sys-strip chat tokenizes to llama.cpp's ids",
+          "[chat][llama2]") {
+    // i#1152: Llama-2-7B-Chat Q4_K_M (TheBloke, 191239b3), a multi-turn
+    // chat rendered as locus-server does (--chat-template
+    // llama2-sys-strip; the GGUF carries no template) and encoded as it
+    // does; the ids are llama.cpp e8e6c7a's llama-tokenize of its own
+    // llama2-sys-strip rendering. The rendered </s> is EOS (id 2).
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/llama-2-7b-chat.Q4_K_M.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("llama-2-7b-chat.Q4_K_M.gguf absent");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    REQUIRE_FALSE(g.get_string("tokenizer.chat_template").has_value());
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const auto t = ChatTemplate::from_name("llama2-sys-strip");
+    REQUIRE(t.has_value());
+    const std::vector<Message> conv = {
+        {"system", "You are a helpful assistant."},
+        {"user", "Count from one to three."},
+        {"assistant", "  One, two, three.  "},
+        {"user", "Now count down from three."}};
+    const auto p = t->render(conv);
+    const std::vector<locus::tok::TokenId> want = {
+        1,     518,   25580, 29962, 3532,  14816, 29903, 6778,  13,
+        3492,  526,   263,   8444,  20255, 29889, 13,    29966, 829,
+        14816, 29903, 6778,  13,    13,    3981,  515,   697,   304,
+        2211,  29889, 518,   29914, 25580, 29962, 6716,  29892, 1023,
+        29892, 2211,  29889, 2,     518,   25580, 29962, 2567,  2302,
+        1623,  515,   2211,  29889, 518,   29914, 25580, 29962};
+    CHECK(tok->encode_literal(p.text, true, p.content) == want);
+}
+
 TEST_CASE("template rendering", "[chat]") {
     SECTION("llama3") {
         ChatTemplate t(Family::kLlama3);
@@ -93,12 +153,36 @@ TEST_CASE("template rendering", "[chat]") {
         REQUIRE(t.apply(kOneTurn) ==
                 "<|user|>\nhi</s>\n<|assistant|>\n");
     }
-    SECTION("llama2 folds system into first user turn") {
-        ChatTemplate t(Family::kLlama2);
-        const std::vector<Message> msgs = {{"system", "sys"},
-                                           {"user", "hi"}};
-        REQUIRE(t.apply(msgs) ==
-                "[INST] <<SYS>>\nsys\n<</SYS>>\n\nhi [/INST]");
+    SECTION("llama2 variants render as llama.cpp's") {
+        // llama.cpp e8e6c7a tests/test-chat-template.cpp's conversation
+        // and its expected_output strings for the llama2, -sys-bos and
+        // -sys-strip templates (i#1152); -sys is -sys-bos without <s>.
+        const std::vector<Message> conv = {
+            {"system", "You are a helpful assistant"},
+            {"user", "Hello"},
+            {"assistant", "Hi there"},
+            {"user", "Who are you"},
+            {"assistant", "   I am an assistant   "},
+            {"user", "Another question"}};
+        CHECK(ChatTemplate(Family::kLlama2).apply(conv) ==
+              "[INST] You are a helpful assistant\nHello [/INST]Hi there"
+              "</s>[INST] Who are you [/INST]   I am an assistant   </s>"
+              "[INST] Another question [/INST]");
+        CHECK(ChatTemplate(Family::kLlama2Sys).apply(conv) ==
+              "[INST] <<SYS>>\nYou are a helpful assistant\n<</SYS>>\n\n"
+              "Hello [/INST]Hi there</s>[INST] Who are you [/INST]   I am "
+              "an assistant   </s>[INST] Another question [/INST]");
+        CHECK(ChatTemplate(Family::kLlama2SysBos).apply(conv) ==
+              "[INST] <<SYS>>\nYou are a helpful assistant\n<</SYS>>\n\n"
+              "Hello [/INST]Hi there</s><s>[INST] Who are you [/INST]   I "
+              "am an assistant   </s><s>[INST] Another question [/INST]");
+        CHECK(ChatTemplate(Family::kLlama2SysStrip).apply(conv) ==
+              "[INST] <<SYS>>\nYou are a helpful assistant\n<</SYS>>\n\n"
+              "Hello [/INST]Hi there</s>[INST] Who are you [/INST]I am an "
+              "assistant</s>[INST] Another question [/INST]");
+        // The model answers after [/INST]: no assistant header either way.
+        CHECK(ChatTemplate(Family::kLlama2Sys).apply(conv, false) ==
+              ChatTemplate(Family::kLlama2Sys).apply(conv, true));
     }
     SECTION("plain concatenates content") {
         ChatTemplate t(Family::kPlain);
@@ -149,9 +233,10 @@ TEST_CASE("render marks each message's content in every family",
                                         {"assistant", "ok"},
                                         {"user", "again"}};
     for (const Family f :
-         {Family::kPlain, Family::kLlama2, Family::kLlama3, Family::kChatML,
-          Family::kZephyr, Family::kDeepSeek, Family::kDeepSeek2,
-          Family::kDeepSeekCoder}) {
+         {Family::kPlain, Family::kLlama2, Family::kLlama2Sys,
+          Family::kLlama2SysBos, Family::kLlama2SysStrip, Family::kLlama3,
+          Family::kChatML, Family::kZephyr, Family::kDeepSeek,
+          Family::kDeepSeek2, Family::kDeepSeekCoder}) {
         const ChatTemplate t(f);
         INFO("family " << t.name());
         const auto p = t.render(multi);

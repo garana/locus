@@ -13,7 +13,41 @@ const std::string kDsEos = "<\xef\xbd\x9c"
                            "end\xe2\x96\x81of\xe2\x96\x81sentence"
                            "\xef\xbd\x9c>";
 
+/** s without leading and trailing whitespace, as llama.cpp's trim()
+ *  (isspace: space, \t, \n, \v, \f, \r). */
+std::string_view trim(std::string_view s) {
+    constexpr std::string_view ws = " \t\n\v\f\r";
+    const auto b = s.find_first_not_of(ws);
+    if (b == std::string_view::npos) {
+        return {};
+    }
+    return s.substr(b, s.find_last_not_of(ws) - b + 1);
+}
+
+// Every family, in the order names() lists them.
+constexpr ChatTemplate::Family kFamilies[] = {
+    ChatTemplate::Family::kPlain,         ChatTemplate::Family::kLlama2,
+    ChatTemplate::Family::kLlama2Sys,     ChatTemplate::Family::kLlama2SysBos,
+    ChatTemplate::Family::kLlama2SysStrip, ChatTemplate::Family::kLlama3,
+    ChatTemplate::Family::kChatML,        ChatTemplate::Family::kZephyr,
+    ChatTemplate::Family::kDeepSeek,      ChatTemplate::Family::kDeepSeek2,
+    ChatTemplate::Family::kDeepSeekCoder};
+
 }  // namespace
+
+std::optional<ChatTemplate> ChatTemplate::from_name(std::string_view name) {
+    for (const Family f : kFamilies) {
+        if (ChatTemplate(f).name() == name) {
+            return ChatTemplate(f);
+        }
+    }
+    return std::nullopt;
+}
+
+std::string_view ChatTemplate::names() {
+    return "plain, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, "
+           "llama3, chatml, zephyr, deepseek, deepseek2, deepseek-coder";
+}
 
 ChatTemplate ChatTemplate::from_gguf(const gguf::GgufFile& g) {
     const auto t = g.get_string("tokenizer.chat_template");
@@ -31,6 +65,16 @@ ChatTemplate ChatTemplate::from_gguf(const gguf::GgufFile& g) {
         return ChatTemplate(Family::kChatML);
     }
     if (has("[INST]")) {
+        // llama.cpp's Llama 2 variant rules, in its order (i#1152).
+        if (has("content.strip()")) {
+            return ChatTemplate(Family::kLlama2SysStrip);
+        }
+        if (has("bos_token + '[INST]")) {
+            return ChatTemplate(Family::kLlama2SysBos);
+        }
+        if (has("<<SYS>>")) {
+            return ChatTemplate(Family::kLlama2Sys);
+        }
         return ChatTemplate(Family::kLlama2);
     }
     if (has("<|user|>")) {
@@ -103,26 +147,43 @@ ChatTemplate::Prompt ChatTemplate::render(
             }
             break;
         }
-        case Family::kLlama2: {
-            // system folds into the first user turn.
-            std::string system;
+        case Family::kLlama2:
+        case Family::kLlama2Sys:
+        case Family::kLlama2SysBos:
+        case Family::kLlama2SysStrip: {
+            // llama.cpp's LLM_CHAT_TEMPLATE_LLAMA_2* rendering, string
+            // for string (i#1152): an assistant turn ends with </s>,
+            // and the next user turn opens a new [INST] (<s>[INST] in
+            // the BOS variant). The model answers after [/INST], so
+            // there is no assistant header to add.
+            const bool sys = family_ != Family::kLlama2;
+            const bool bos = family_ == Family::kLlama2SysBos;
+            const bool strip = family_ == Family::kLlama2SysStrip;
+            bool inside = true;  // the opening [INST] below
+            out += "[INST] ";
             for (const Message& m : messages) {
+                const std::string_view c =
+                    strip ? trim(m.content) : std::string_view(m.content);
+                if (!inside) {
+                    inside = true;
+                    out += bos ? "<s>[INST] " : "[INST] ";
+                }
                 if (m.role == "system") {
-                    system = m.content;
-                } else if (m.role == "user") {
-                    out += "[INST] ";
-                    if (!system.empty()) {
+                    if (sys) {
                         out += "<<SYS>>\n";
-                        put(system);
+                        put(c);
                         out += "\n<</SYS>>\n\n";
-                        system.clear();
+                    } else {
+                        put(c);
+                        out += "\n";
                     }
-                    put(m.content);
+                } else if (m.role == "user") {
+                    put(c);
                     out += " [/INST]";
                 } else {
-                    out += " ";
-                    put(m.content);
-                    out += " ";
+                    put(c);
+                    out += "</s>";
+                    inside = false;
                 }
             }
             break;
@@ -201,6 +262,9 @@ ChatTemplate::Prompt ChatTemplate::render(
 std::string_view ChatTemplate::name() const {
     switch (family_) {
         case Family::kLlama2: return "llama2";
+        case Family::kLlama2Sys: return "llama2-sys";
+        case Family::kLlama2SysBos: return "llama2-sys-bos";
+        case Family::kLlama2SysStrip: return "llama2-sys-strip";
         case Family::kLlama3: return "llama3";
         case Family::kChatML: return "chatml";
         case Family::kZephyr: return "zephyr";
