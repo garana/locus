@@ -128,28 +128,40 @@ GB; driver 580.178.04, CUDA 12.6); Ubuntu 24.04, GCC 13.
 Automatic: the CPU backend `sse4` (its AVX build). locus does not move
 to CUDA by itself: pass `--backend cuda`.
 
-Recommended: `--backend cuda` for dense models that fit in 2 GB; the
-CPU default for larger ones.
+Recommended: `--backend cuda` for dense models that fit in 2 GB (2x to
+4x the CPU's decode; on Q8_0 its prefill is slower); the CPU default
+for larger ones.
 
-| workload                        | default (CPU) | `LOCUS_CPU_FAST=1` | `--backend cuda` | llama.cpp CPU | source |
-|---------------------------------|---------------|--------------------|------------------|---------------|--------|
-| decode, Llama 3.2 1B Q4_K_M     | 14.8          | 15.9               | 27.9             | 13.0          | #1059  |
-| prefill 2k, Llama 3.2 1B Q4_K_M | 27.1          | 28.0               | 59.5             | 30.5          | #1059  |
-| decode, Llama 3.2 1B Q8_0       | 10.6          | 10.8               | 25.8             | 8.9           | #1059  |
-| prefill 2k, Llama 3.2 1B Q8_0   | 30.3          | 31.4               | 34.0             | 26.8          | #1059  |
-| decode, Qwen1.5-MoE Q4_K_M      | 4.2           | 4.5                | does not fit     | 6.6           | #1077  |
-| prefill 2k, Qwen1.5-MoE Q4_K_M  | 4.4           | 4.5                | does not fit     | 13.0          | #1077  |
-| LTX-Video 2B, one DiT step      | 75.3 s        | 77.0 s             | not run          | PyTorch 85 s  | #982   |
+| workload                         | default (CPU) | llama.cpp CPU | `--backend cuda` | llama.cpp CUDA | source     |
+|----------------------------------|---------------|---------------|------------------|----------------|------------|
+| prefill 512, Llama 1B Q4_K_M     | 34.9          | 46.9          | 65.8             | 494.8          | #412, #411 |
+| decode, Llama 3.2 1B Q4_K_M      | 11.0          | 11.2          | 27.9             | 31.7           | #412, #411 |
+| prefill 512, Llama 1B Q8_0       | 40.1          | 45.1          | 35.9             | 498.4          | #412, #411 |
+| decode, Llama 3.2 1B Q8_0        | 7.0           | 7.1           | 25.8             | 36.3           | #412, #411 |
+| prefill 512, Qwen2.5-0.5B Q8_0   | 87.6          | 116.4         | 73.8             | 1191.0         | #412, #411 |
+| decode, Qwen2.5-0.5B Q8_0        | 16.5          | 16.8          | 44.5             | 81.2           | #412, #411 |
+| prefill 512, Orpheus 3B Q4_K_M   | 12.9          | 16.4          | 14.8             | does not load  | #412, #411 |
+| decode, Orpheus 3B Q4_K_M        | 4.2           | 4.3           | 1.1              | does not load  | #412, #411 |
+| prefill 512, Qwen1.5-MoE Q4_K_M  | 14.4          | 20.6          | does not fit     | not run        | #412       |
+| decode, Qwen1.5-MoE Q4_K_M       | 5.3           | 5.7           | does not fit     | not run        | #412       |
+| LTX-Video 2B, one DiT step       | 75.3 s        | PyTorch 85 s  | not run          | not run        | #982       |
 
-- `LOCUS_CPU_FAST=1` gains 1 to 7% on the dense rows, near the noise:
-  the default stays, as it reproduces the goldens. On the DiT step it
-  cuts the self attention (12.2 to 10.4 s, #1062) but not the whole
-  step (one run each).
-- The MoE on the CPU trails llama.cpp (#1077, Backlog). Its rows have
-  the 9.5 GB file already in the page cache; a cold first run decodes
-  at 1.1, all page faults.
-- llama.cpp here is a CPU build (commit e8e6c7a, 4 threads), so the
-  CUDA rows compare with locus's own CPU.
+- Measured on main at 2f96456b against llama.cpp e8e6c7a (a CPU build,
+  4 threads, and a CUDA build for sm_50), median of 3 runs. Decode
+  follows a short prompt; Orpheus's is "1, 2, 3, 4, 5," (one run), as
+  it ends early on others.
+- On the CPU, decode is at 0.93x to 0.99x of llama.cpp and prefill at
+  0.70x to 0.89x (#1198). The MoE rows have the 9.5 GB file in the page
+  cache; a cold first prefill runs at 4.3.
+- On CUDA, prefill is at 0.06x to 0.13x of llama.cpp (#1195); on Q8_0
+  it is slower than the CPU. Decode is at 0.88x on Q4_K_M, 0.71x on
+  Q8_0 (#1197) and 0.55x on Qwen2.5, which runs per op (#1196).
+- Orpheus (1.94 GB of weights) does not fit the 2 GB card: llama.cpp
+  fails to load it, and locus pages its weights.
+- `LOCUS_CPU_FAST=1` gained 1 to 7% on the dense rows (#1059), near the
+  noise: the default stays, as it reproduces the goldens. On the DiT
+  step it cuts the self attention (12.2 to 10.4 s, #1062) but not the
+  whole step (one run each).
 - Vulkan on this card has 2 GB of device memory and no host import:
   an MoE whose experts do not fit routes on the host and runs the
   picked experts on the CPU (i#1174), the rest on the GPU. Qwen1.5-MoE
