@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
@@ -209,5 +210,12 @@ TEST_CASE("amortized LM head byte-exact: quantized head",
     if (!std::filesystem::exists(q4k_path())) {
         SKIP("Q4_K model not present (llama-3.2-1b-q4_k_m.gguf)");
     }
+    // On Metal a K-quant model decodes alone through metal_forward and
+    // batched through other kernels unless batch-invariant mode is set
+    // (i#1184); set, the two agree byte for byte.
+    struct Mode {
+        Mode() { locus::backend::metal::set_batch_invariant(true); }
+        ~Mode() { locus::backend::metal::reset_batch_invariant(); }
+    } const mode;
     sweep_backends(q4k_path());
 }

@@ -595,6 +595,124 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
     }
 }
 
+// K-quants over several activation columns (i#1184): 8 lanes a row,
+// 4 rows a simdgroup, 2 simdgroups. A lane takes one unit of a block at
+// a time, the elements a run of bytes holds, dequantizes it once and
+// dots it with every column's x, read straight from memory (each
+// column's x is read once per row either way). A row's sum runs in the
+// same order whatever the column count, so a column's bits do not
+// depend on N or on the columns beside it.
+// Q6_K unit u (4 a block): half n = u / 2, l0 = 16 (u & 1). Its four
+// runs (quarters v = 0..3) are elements 128 n + 32 v + l0 + 0..15: low
+// 4 bits from ql[64 n + 32 (v & 1) + l0 ..] (the high nibble for
+// v >= 2), high 2 from qh[32 n + l0 ..] >> 2 v, scale
+// sc[8 n + (u & 1) + 2 v]. Byte loads: the stride is 210.
+struct KColQ6 {
+    static constant constexpr uint kBlockBytes = 210;
+    static constant constexpr uint kUnits = 4;
+    static constant constexpr uint kRuns = 4;
+    static uint run_at(uint u, uint r) {
+        return 32 * (u / 2) + 8 * r + 4 * (u & 1);
+    }
+    static void deq(device const uchar* blk, uint u, thread float4* lx) {
+        const uint n = u / 2, l0 = 16 * (u & 1);
+        device const uchar* ql = blk + 64 * n + l0;
+        device const uchar* qh = blk + 128 + 32 * n + l0;
+        device const char* sc = (device const char*)(blk + 192 + 8 * n +
+                                                     (u & 1));
+        const float d = f16_at(blk + 208);
+        const float dv[4] = {d * float(sc[0]), d * float(sc[2]),
+                             d * float(sc[4]), d * float(sc[6])};
+        for (uint k = 0; k < 4; ++k) {
+            float4 v[4];
+            for (uint e = 0; e < 4; ++e) {
+                const uint i = 4 * k + e;
+                const uint lo = ql[i], hi = ql[32 + i], h = qh[i];
+                v[0][e] = float(int((lo & 0xF) | ((h & 3) << 4)) - 32);
+                v[1][e] = float(int((hi & 0xF) | (((h >> 2) & 3) << 4)) - 32);
+                v[2][e] = float(int((lo >> 4) | (((h >> 4) & 3) << 4)) - 32);
+                v[3][e] = float(int((hi >> 4) | ((h >> 6) << 4)) - 32);
+            }
+            for (uint r = 0; r < 4; ++r) lx[4 * r + k] = dv[r] * v[r];
+        }
+    }
+};
+// K::kUnits lanes a row, so a lane takes unit tx of every block in
+// turn; kKColSg simdgroups a threadgroup share each block's x for all
+// N columns, staged in threadgroup memory (each lane loading its own
+// x from memory bounded these at 8 columns: x reads grew with rows x
+// N). The staging does not change the values, so a row's sum is the
+// same at any N.
+constant constexpr uint kKColSg = 8;
+template <uint N, typename K>
+inline void mv_k_cols_impl(device const uchar* w, device const float* xb,
+                           device float* out, constant MvParams& p,
+                           threadgroup float4* xs, uint tg, uint sg,
+                           uint lane) {
+    constexpr uint LPR = K::kUnits;
+    const uint tx = lane % LPR, ty = lane / LPR;
+    const uint r = tg * (kKColSg * 32 / LPR) + sg * (32 / LPR) + ty;
+    const uint tid = sg * 32 + lane;
+    const uint nb = p.cols / 256;
+    device const uchar* row =
+        w + p.w_off + ulong(r < p.rows ? r : 0) * nb * K::kBlockBytes;
+    float acc[N];
+    for (uint c = 0; c < N; ++c) acc[c] = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        // Block b's 64 float4 of x for each column (0 past n_slots).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < N * 64; i += kKColSg * 32) {
+            const uint c = i / 64, k = i % 64;
+            xs[i] = c < p.n_slots
+                        ? ((device const float4*)(xb + p.x_off +
+                                                  ulong(c) *
+                                                      p.x_slot_stride))
+                              [64 * b + k]
+                        : float4(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float4 lx[4 * K::kRuns];
+        K::deq(row + b * K::kBlockBytes, tx, lx);
+        for (uint c = 0; c < N; ++c) {
+            threadgroup const float4* y = xs + 64 * c;
+            float sum = 0.0f;
+            for (uint rn = 0; rn < K::kRuns; ++rn) {
+                threadgroup const float4* yr = y + K::run_at(tx, rn);
+                sum += dot(lx[4 * rn], yr[0]) + dot(lx[4 * rn + 1], yr[1]) +
+                       dot(lx[4 * rn + 2], yr[2]) + dot(lx[4 * rn + 3], yr[3]);
+            }
+            acc[c] += sum;
+        }
+    }
+    for (uint c = 0; c < N; ++c) {
+        float t = acc[c];
+        if (LPR >= 8) {
+            t += simd_shuffle_down(t, 4);
+        }
+        t += simd_shuffle_down(t, 2);
+        t += simd_shuffle_down(t, 1);
+        if (tx == 0 && r < p.rows && c < p.n_slots) {
+            device float* o = out + p.out_off + ulong(c) * p.out_slot_stride + r;
+            const float v = p.scale * t;
+            *o = p.accumulate != 0 ? *o + v : v;
+        }
+    }
+}
+
+#define MV_K_COLS(NAME, N, K)                                             \
+    kernel void NAME(device const uchar* w [[buffer(0)]],                 \
+                     device const float* xb [[buffer(1)]],                \
+                     device float* out [[buffer(2)]],                     \
+                     constant MvParams& p [[buffer(3)]],                  \
+                     uint tg [[threadgroup_position_in_grid]],            \
+                     uint sg [[simdgroup_index_in_threadgroup]],          \
+                     uint lane [[thread_index_in_simdgroup]]) {           \
+        threadgroup float4 xs[N * 64];                                    \
+        mv_k_cols_impl<N, K>(w, xb, out, p, xs, tg, sg, lane);            \
+    }
+MV_K_COLS(mv_q6_k_cols4, 4, KColQ6)
+MV_K_COLS(mv_q6_k_cols8, 8, KColQ6)
+
 // Q5_K: 176-byte super-blocks of 256 (f16 d and dmin, 12 packed
 // scale / min bytes as Q4_K's, 32 qh bytes, 128 nibble bytes). Pair j
 // (sub-blocks 2 j and 2 j + 1) takes nibble bytes 32 j ..: element

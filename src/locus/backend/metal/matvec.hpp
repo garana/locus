@@ -112,6 +112,10 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
  * @param n The columns, 1 to 8.
  * @param norm_w When set, the RMSNorm (weights norm_w, epsilon eps) as
  *     a prologue, each column over its own x (as MvFuse::norm_w).
+ * @param kquant Whether Q6_K may take its columns kernel (from 4
+ *     columns, where it beats n matvecs). Its bits differ from the
+ *     matvec's, so a caller that must give a sequence the same bits at
+ *     any n passes false. Q4_K has none (no form beat its matvecs).
  * @returns false when this type or shape has no such kernel (the
  *     caller then runs n matvecs).
  */
@@ -123,7 +127,7 @@ bool record_matvec_cols(Context& ctx, gguf::TensorType t,
                         std::uint64_t out_off, std::uint32_t out_stride,
                         std::uint32_t n, bool accumulate,
                         const Context::Buffer* norm_w = nullptr,
-                        float eps = 0.0f);
+                        float eps = 0.0f, bool kquant = false);
 
 /** The steps a matvec can take around its dot (i#1064), so the decode
  *  saves their dispatches and barriers. */
@@ -148,14 +152,16 @@ struct MvFuse {
  * lone sequence also decodes through metal_forward_multi, so a
  * request's logits are bit-identical alone or batched; off, it takes
  * metal_forward. LOCUS_METAL_BATCH_INVARIANT=1 / 0, or this call, sets
- * it; the default is on.
+ * it; unset, the model decides
+ * (TransformerModel::metal_batch_invariant).
  */
 void set_batch_invariant(bool on);
 /** Drops a set_batch_invariant setting: back to the
- * LOCUS_METAL_BATCH_INVARIANT or the default. */
+ * LOCUS_METAL_BATCH_INVARIANT or the model's default. */
 void reset_batch_invariant();
-/** @returns Whether batch-invariant Metal decode is on. */
-bool batch_invariant();
+/** @returns 1 or 0 when the call or LOCUS_METAL_BATCH_INVARIANT set
+ *  the mode, -1 when neither did. */
+int batch_invariant_setting();
 
 /** @returns Whether t's matvec takes MvFuse::norm_w. */
 bool matvec_prenorm_ok(gguf::TensorType t);

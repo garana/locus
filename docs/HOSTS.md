@@ -70,21 +70,21 @@ of Orpheus and Qwen3-Coder the two are within 1%. Concurrent clients
 decode together since #1184; locus-server, Llama 1B, 128 tokens a
 client, tok/s in all:
 
-| model  | clients | Metal before #1184 | Metal | Metal, invariant off | Vulkan |
-|--------|---------|--------------------|-------|----------------------|--------|
-| Q8_0   | 1       | 214.8              | 208.0 | 213.9                | 208.0  |
-| Q8_0   | 4       | 207.8              | 503.7 | 517.5                | 434.3  |
-| Q8_0   | 8       | 203.7              | 530.7 | 545.5                | 431.1  |
-| Q4_K_M | 1       | 282.3              | 280.2 | 280.4                | 284.4  |
-| Q4_K_M | 4       | 274.4              | 373.5 | 379.3                | 403.5  |
-| Q4_K_M | 8       | 267.0              | 392.7 | 398.2                | 415.1  |
+| model  | clients | Metal before #1184 | Metal, invariant | Metal, not invariant | Vulkan |
+|--------|---------|--------------------|------------------|----------------------|--------|
+| Q8_0   | 1       | 214.8              | 208.0            | 213.9                | 208.0  |
+| Q8_0   | 4       | 207.8              | 503.7            | 517.5                | 434.3  |
+| Q8_0   | 8       | 203.7              | 530.7            | 545.5                | 431.1  |
+| Q4_K_M | 1       | 279.8              | 276.2            | 280.1                | 285.4  |
+| Q4_K_M | 4       | 273.2              | 372.6            | 397.4                | 403.5  |
+| Q4_K_M | 8       | 265.2              | 392.8            | 430.8                | 414.8  |
 
-A Q4_K_M model with several clients still does 5 to 7% better on
-`--backend vulkan` (Metal has no Q4_K columns kernel yet). The
-batch-invariant mode (the default: a request decodes to the same bits
-alone or batched) costs a lone sequence about 2%;
+Batch-invariant mode (a request decodes to the same bits alone or
+batched) is the default for Q8_0 and costs a lone request about 2%;
 `LOCUS_METAL_BATCH_INVARIANT=0` takes it back for a single-user
-server.
+server. A Q4_K or Q6_K model runs the fastest kernels by default
+instead, as on Vulkan, and `LOCUS_METAL_BATCH_INVARIANT=1` makes it
+invariant at the cost above.
 
 | workload, model                    | locus Metal | locus Vulkan | llama.cpp Metal | source |
 |------------------------------------|-------------|--------------|-----------------|--------|

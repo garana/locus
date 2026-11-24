@@ -1653,7 +1653,8 @@ TEST_CASE("bench: metal matmul against matvecs for a few rows",
     }
     namespace mb = locus::backend::metal;
     Context& ctx = Context::get();
-    for (const TensorType ty : {TensorType::kQ8_0, TensorType::kQ4_K}) {
+    for (const TensorType ty :
+         {TensorType::kQ8_0, TensorType::kQ4_K, TensorType::kQ6_K}) {
         for (const auto& [rows, cols] :
              {std::pair<std::uint32_t, std::uint32_t>{2048, 2048},
               {8192, 2048}, {2048, 8192}}) {
@@ -1687,7 +1688,8 @@ TEST_CASE("bench: metal matmul against matvecs for a few rows",
                 const double cols_us = time([&] {
                     if (!mb::record_matvec_cols(ctx, ty, rows, cols, wb, 0,
                                                 xb, 0, cols, ob, 0, rows, n,
-                                                false)) {
+                                                false, nullptr, 0.0f,
+                                                true)) {
                         for (std::uint32_t t = 0; t < n; ++t) {
                             mb::record_matvec(ctx, ty, rows, cols, wb, 0,
                                               xb, t * cols, ob,
@@ -1729,7 +1731,8 @@ TEST_CASE("metal matvec over columns matches a matvec a column",
     Context& ctx = Context::get();
     std::mt19937 rng(1184);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (const TensorType ty : {TensorType::kQ8_0}) {
+    for (const TensorType ty :
+         {TensorType::kQ8_0, TensorType::kQ4_K, TensorType::kQ6_K}) {
         for (const auto& [rows, cols] :
              {std::pair<std::uint32_t, std::uint32_t>{37, 256},
               {200, 1024}, {1027, 2048}}) {
@@ -1741,17 +1744,28 @@ TEST_CASE("metal matvec over columns matches a matvec a column",
             for (auto& v : init) v = dist(rng);
             Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
             for (std::uint32_t n = 1; n <= 8; ++n) {
+                // Q6_K's kernel from 4 columns; Q4_K has none.
+                const bool has = ty == TensorType::kQ8_0 ||
+                                 (ty == TensorType::kQ6_K && n >= 4);
+                if (!has) {
+                    std::lock_guard lk(mb::device_mutex());
+                    CHECK_FALSE(mb::record_matvec_cols(
+                        ctx, ty, rows, cols, wb, 0, xb, 0, xs, xb, 0, os, n,
+                        false, nullptr, 0.0f, true));
+                    continue;
+                }
                 for (const bool acc : {false, true}) {
-                    CAPTURE(rows, cols, n, acc);
+                    CAPTURE(static_cast<int>(ty), rows, cols, n, acc);
+                    const bool kq = ty != TensorType::kQ8_0;
                     Context::Buffer o1 =
                         ctx.upload(std::as_bytes(std::span(init)));
                     Context::Buffer o2 =
                         ctx.upload(std::as_bytes(std::span(init)));
                     {
                         std::lock_guard lk(mb::device_mutex());
-                        REQUIRE(mb::record_matvec_cols(ctx, ty, rows, cols,
-                                                       wb, 0, xb, 0, xs, o1,
-                                                       0, os, n, acc));
+                        REQUIRE(mb::record_matvec_cols(
+                            ctx, ty, rows, cols, wb, 0, xb, 0, xs, o1, 0, os,
+                            n, acc, nullptr, 0.0f, true));
                         for (std::uint32_t c = 0; c < n; ++c) {
                             mb::record_matvec(ctx, ty, rows, cols, wb, 0, xb,
                                               c * xs, o2,
@@ -1764,8 +1778,12 @@ TEST_CASE("metal matvec over columns matches a matvec a column",
                         for (std::uint32_t r = 0; r < os; ++r) {
                             const std::size_t i = std::size_t{c} * os + r;
                             if (c < n && r < rows) {
+                                // K-quants: w = dl q - ml per weight
+                                // here, dl (q . x) - ml sum(x) in the
+                                // matvec, so a little more rounding.
                                 REQUIRE(a[i] == Catch::Approx(b[i])
-                                                    .margin(1e-4)
+                                                    .margin(kq ? 5e-4
+                                                               : 1e-4)
                                                     .epsilon(1e-5));
                             } else {
                                 // Other columns and the stride's padding

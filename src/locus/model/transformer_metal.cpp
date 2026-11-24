@@ -122,6 +122,29 @@ std::uint64_t TransformerModel::metal_multi_tokens() {
     return g_metal_multi_tokens.load();
 }
 
+bool TransformerModel::metal_batch_invariant() const {
+    const int set = backend::metal::batch_invariant_setting();
+    if (set >= 0) {
+        return set == 1;
+    }
+    const auto kq = [](const backend::Mat& m) {
+        return m.type == gguf::TensorType::kQ4_K ||
+               m.type == gguf::TensorType::kQ6_K;
+    };
+    if (kq(out_w_)) {
+        return false;
+    }
+    for (const Layer& lay : layers_) {
+        for (const backend::Mat* m : {&lay.wq, &lay.wk, &lay.wv, &lay.wo,
+                                      &lay.w_gate, &lay.w_up, &lay.w_down}) {
+            if (kq(*m)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 namespace {
 
 /** Scratch buffers of the Metal forward (grow-only; device_mutex). */
@@ -1232,6 +1255,9 @@ bool TransformerModel::metal_forward_multi(
 
         const MetalRec r{ctx, weights_of(metal_weights_, file_backed_), hp_,
                          hd, metal_neox()};
+        // Q6_K's columns kernel changes its bits with n, so only when
+        // the decode need not be batch-invariant.
+        const bool kquant = !metal_batch_invariant();
         // out[c] (+)= wt in[c] for the n rows: one matvec over the
         // columns (each weight read once), else one a row; norm, when
         // set, as the matvec's RMSNorm prologue (in is then the norm's
@@ -1246,7 +1272,7 @@ bool TransformerModel::metal_forward_multi(
             if (metal::record_matvec_cols(ctx, wt.type, wt.rows, wt.cols,
                                           *wb.buf, wb.off, in, 0, in_stride,
                                           out, out_off, out_stride, n, acc,
-                                          norm, hp_.rms_eps)) {
+                                          norm, hp_.rms_eps, kquant)) {
                 return;
             }
             if (norm != nullptr) {

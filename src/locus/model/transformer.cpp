@@ -1198,7 +1198,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
         }
     }
     if (first && last && backend_->name == "metal" && !embed_in &&
-        backend::metal::batch_invariant()) {
+        metal_batch_invariant()) {
         // Batch-invariant mode (i#1184): a lone token through the
         // batched decode's forward, so its logits and K / V have a
         // batched step's bits. The whole head; rows outside the range
@@ -1839,7 +1839,7 @@ void TransformerModel::forward_batch_decode(
         const std::uint32_t group = (n + n_groups - 1) / n_groups;
         for (std::uint32_t g = 0; g < n; g += group) {
             const std::uint32_t m = std::min(group, n - g);
-            if ((m >= 2 || backend::metal::batch_invariant()) &&
+            if ((m >= 2 || metal_batch_invariant()) &&
                 metal_forward_multi(toks.subspan(g, m), seqs.subspan(g, m),
                                     cache,
                                     logits.subspan(std::size_t{g} * V,

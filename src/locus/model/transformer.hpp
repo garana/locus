@@ -330,6 +330,18 @@ class TransformerModel {
     /** @returns How many of those tokens ran several sequences at once
      *  (i#1184; tests). */
     static std::uint64_t metal_multi_tokens();
+    /**
+     * @returns Whether Metal decode is batch-invariant for this model
+     *     (i#1184, as Vulkan's #432): a lone sequence takes the batched
+     *     forward too, and every matrix one kernel at any sequence
+     *     count, so a request's logits are bit-identical alone and
+     *     batched. backend::metal::set_batch_invariant or
+     *     LOCUS_METAL_BATCH_INVARIANT sets it; else it is on unless the
+     *     model has Q4_K or Q6_K weights. For those the fastest kernels
+     *     differ with the count (metal_forward alone, Q6_K's columns
+     *     kernel from 4 sequences), as on Vulkan.
+     */
+    bool metal_batch_invariant() const;
 
     /**
      * Settles where the routed experts run (i#654) and returns it. On
