@@ -148,6 +148,26 @@ bool parse_name(const std::string& name, std::uint64_t& digest) {
     return true;
 }
 
+/** `overrides` with a non-zero prefill budget folded in (FNV-1a over
+ *  a tag and the budget's bytes, i#1189); 0 leaves it as it was, so a
+ *  store at the model's own chunk keeps its files. */
+std::uint64_t with_prefill_budget(std::uint64_t overrides,
+                                  std::uint32_t budget) {
+    if (budget == 0) {
+        return overrides;
+    }
+    constexpr std::uint64_t kPrime = 0x100000001b3ull;
+    constexpr std::string_view kTag = "prefill_budget";
+    std::uint64_t h = overrides;
+    for (const char c : kTag) {
+        h = (h ^ static_cast<unsigned char>(c)) * kPrime;
+    }
+    for (int i = 0; i < 4; ++i) {
+        h = (h ^ ((budget >> (8 * i)) & 0xffu)) * kPrime;
+    }
+    return h;
+}
+
 }  // namespace
 
 fs::path ensure_private_dir(const fs::path& given) {
@@ -246,7 +266,7 @@ std::vector<std::uint8_t> DiskPrefixStore::header(
     put(h, static_cast<std::uint64_t>(block_bytes_));
     put(h, key_.model_hash);
     put(h, key_.model_size);
-    put(h, key_.overrides);
+    put(h, with_prefill_budget(key_.overrides, key_.prefill_budget));
     put(h, static_cast<std::uint32_t>(key_.device_attention));
     // The experts' route: 0 host with GPU picks, 1 GPU, 2 host with CPU
     // picks (DiskKey::experts_on_host_cpu).
@@ -690,6 +710,13 @@ void DiskPrefixStore::set_experts_on_gpu(bool on) {
 void DiskPrefixStore::set_experts_on_host_cpu(bool on) {
     std::lock_guard lock(mu_);
     key_.experts_on_host_cpu = on;
+    const std::vector<std::uint8_t> k = header({}, 0);
+    key_seed_ = checksum(k.data(), k.size());
+}
+
+void DiskPrefixStore::set_prefill_budget(std::uint32_t budget) {
+    std::lock_guard lock(mu_);
+    key_.prefill_budget = budget;
     const std::vector<std::uint8_t> k = header({}, 0);
     key_seed_ = checksum(k.data(), k.size());
 }
