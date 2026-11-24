@@ -60,17 +60,20 @@ struct Dev {
 };
 
 /**
- * Random-but-sane rows of a Q4_K, IQ4_NL or IQ4_XS weight (random
- * bytes, bounded f16 scales), as test_cpu_ops does.
+ * Random-but-sane rows of a Q4_K, Q6_K, Q8_0, IQ4_NL or IQ4_XS weight
+ * (random bytes, bounded f16 scales), as test_cpu_ops does.
  * @param cols A multiple of the type's block size (256, or 32 for
- *     IQ4_NL).
+ *     Q8_0 and IQ4_NL).
  */
 std::vector<std::byte> quant_rows(TensorType t, std::uint32_t rows,
                                   std::uint32_t cols, std::uint32_t seed) {
     const std::size_t bytes = t == TensorType::kQ4_K    ? 144
+                              : t == TensorType::kQ6_K   ? 210
+                              : t == TensorType::kQ8_0   ? 34
                               : t == TensorType::kIQ4_XS ? 136
                                                          : 18;
-    const std::uint32_t per = t == TensorType::kIQ4_NL ? 32 : 256;
+    const std::uint32_t per =
+        t == TensorType::kIQ4_NL || t == TensorType::kQ8_0 ? 32 : 256;
     const std::size_t blocks = std::size_t{rows} * (cols / per);
     std::vector<std::byte> w(blocks * bytes);
     std::mt19937 rng(seed);
@@ -80,6 +83,11 @@ std::vector<std::byte> quant_rows(TensorType t, std::uint32_t rows,
     }
     const std::uint16_t d = f32_to_f16(0.01f), dmin = f32_to_f16(0.005f);
     for (std::size_t b = 0; b < blocks; ++b) {
+        if (t == TensorType::kQ6_K) {
+            // ql, qh and the int8 scales are any bytes; d comes last.
+            std::memcpy(w.data() + b * bytes + 208, &d, 2);
+            continue;
+        }
         std::memcpy(w.data() + b * bytes, &d, 2);
         if (t == TensorType::kQ4_K) {
             std::memcpy(w.data() + b * bytes + 2, &dmin, 2);
@@ -168,7 +176,8 @@ TEST_CASE("cuda device matvecs equal matvec_cuda", "[cuda][device]") {
     constexpr std::uint32_t n = 40;
     const auto x = random_floats(std::size_t{n} * cols, 8);
     for (const TensorType type :
-         {TensorType::kQ4_K, TensorType::kIQ4_NL, TensorType::kIQ4_XS}) {
+         {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0,
+          TensorType::kIQ4_NL, TensorType::kIQ4_XS}) {
         INFO("type " << static_cast<int>(type));
         // w's address may repeat across types; the pool keys by address.
         cuda_pool_reset();
@@ -188,11 +197,18 @@ TEST_CASE("cuda device matvecs equal matvec_cuda", "[cuda][device]") {
             REQUIRE(cuda_dev_finish());
             REQUIRE(same_bits(dout.get(), ref));
         }
-        {
-            Dev dx(x), dout(ref.size()), scratch(std::size_t{rows} * 32);
-            REQUIRE(cuda_dev_matvec_batch(m, dx.p, dout.p, n, scratch.p));
+        // 13 tokens too: the Q4_K and Q6_K prefill tile (8 tokens a
+        // warp, i#1195) then ends in a partial tile, as 37 rows do.
+        for (const std::uint32_t nb : {n, 13u}) {
+            INFO("tokens " << nb);
+            const std::vector<float> xb(x.begin(),
+                                        x.begin() + std::size_t{nb} * cols);
+            const std::vector<float> want(ref.begin(),
+                                          ref.begin() + std::size_t{nb} * rows);
+            Dev dx(xb), dout(want.size()), scratch(std::size_t{rows} * 32);
+            REQUIRE(cuda_dev_matvec_batch(m, dx.p, dout.p, nb, scratch.p));
             REQUIRE(cuda_dev_finish());
-            REQUIRE(same_bits(dout.get(), ref));
+            REQUIRE(same_bits(dout.get(), want));
         }
     }
     cuda_pool_reset();
