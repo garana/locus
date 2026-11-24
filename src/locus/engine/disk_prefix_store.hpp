@@ -306,18 +306,21 @@ struct PrefixCleanResult {
  * Removes from the disk prefix directory `dir` every store file
  * ("<16 hex digits>.lkv") whose key hash is not in `keep` (i#1180):
  * files of other models, backends or builds that no server will read
- * again. Never follows a symlink: `dir` itself must not be one, a
- * symlink entry is left alone, and files open with O_NOFOLLOW. A file
- * whose header does not parse, other entries and .tmp files are left
- * alone.
+ * again. Never follows a symlink: `dir` opens with O_NOFOLLOW, and
+ * every later step (the listing, fstatat, openat with O_NOFOLLOW,
+ * unlinkat) goes through that descriptor, so a `dir` swapped during
+ * the walk cannot redirect it; a symlink entry is left alone. `dir`
+ * must pass the store's own startup check: the user's, and not group-
+ * or world-writable. A file whose header does not parse, other entries
+ * and .tmp files are left alone.
  *
  * @param keep The key hashes to keep (each server's boot line), at
  *     least one.
  * @param dry_run Count, but remove nothing.
  * @param removed_paths When set, receives each file removed.
  * @throws std::invalid_argument when `keep` is empty;
- *     std::runtime_error when `dir` is a symlink, not a directory, or
- *     owned by another user.
+ *     std::runtime_error when `dir` is a symlink, not a directory,
+ *     owned by another user, or writable by group or others.
  */
 PrefixCleanResult clean_disk_prefix(
     const std::filesystem::path& dir, std::span<const std::uint64_t> keep,

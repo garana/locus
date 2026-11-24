@@ -870,4 +870,12 @@ TEST_CASE("clean_disk_prefix keeps the files of the keys given",
             std::runtime_error);
         CHECK(fs::exists(pold));
     }
+    SECTION("a directory group or others can write is refused") {
+        fs::permissions(g.dir, fs::perms::group_write, fs::perm_options::add);
+        CHECK_THROWS_AS(locus::engine::clean_disk_prefix(g.dir, keep, false),
+                        std::runtime_error);
+        fs::permissions(g.dir, fs::perms::group_write,
+                        fs::perm_options::remove);
+        CHECK(fs::exists(pold));
+    }
 }

@@ -260,26 +260,6 @@ else()
     target_sources(locus PRIVATE src/locus/backend/metal/context_stub.cpp)
 endif()
 
-# The disk prefix key's digest of the sources that compute KV
-# (i#1180), made at build time so an edit to any of them changes it.
-file(GLOB_RECURSE LOCUS_COMPUTE_SOURCES CONFIGURE_DEPENDS
-     ${CMAKE_SOURCE_DIR}/src/locus/backend/*
-     ${CMAKE_SOURCE_DIR}/src/locus/model/*
-     ${CMAKE_SOURCE_DIR}/src/locus/kv/*)
-set(LOCUS_COMPUTE_DIGEST
-    ${CMAKE_BINARY_DIR}/generated/locus/engine/compute_digest.hpp)
-add_custom_command(
-    OUTPUT ${LOCUS_COMPUTE_DIGEST}
-    COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
-            -DOUT=${LOCUS_COMPUTE_DIGEST}
-            -P ${CMAKE_SOURCE_DIR}/cmake/compute_digest.cmake
-    DEPENDS ${LOCUS_COMPUTE_SOURCES}
-            ${CMAKE_SOURCE_DIR}/cmake/compute_digest.cmake
-    COMMENT "Digest of the sources that compute KV")
-add_custom_target(locus_compute_digest DEPENDS ${LOCUS_COMPUTE_DIGEST})
-add_dependencies(locus locus_compute_digest)
-target_include_directories(locus PRIVATE ${CMAKE_BINARY_DIR}/generated)
-
 # ----------------------------------------------------------------
 # Vectorized CPU support: probe which SIMD flags the compiler
 # accepts; each kernel variant is its own source file built with
@@ -662,6 +642,60 @@ if(CUDAToolkit_FOUND)
 else()
     message(STATUS "locus CUDA: not found, GPU backend disabled")
 endif()
+
+# The disk prefix key's digest of what computes KV (i#1180), made at
+# build time so an edit changes it: every source under src/locus (the
+# kernels, the forward, the engine's prefill chunking), CMakeLists.txt
+# (each kernel variant's flags) and the build's configuration (the
+# compiler and its version, the build type, the C++ flags, the shader
+# compiler), written here only when it changes.
+file(GLOB_RECURSE LOCUS_COMPUTE_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_SOURCE_DIR}/src/locus/*)
+string(TOUPPER "${CMAKE_BUILD_TYPE}" LOCUS_BUILD_TYPE_UPPER)
+set(LOCUS_BUILD_CONFIG
+    "cxx ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\n")
+string(APPEND LOCUS_BUILD_CONFIG
+    "type ${CMAKE_BUILD_TYPE}\n"
+    "flags ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${LOCUS_BUILD_TYPE_UPPER}}\n"
+    "system ${CMAKE_SYSTEM_PROCESSOR} ${CMAKE_SYSTEM_NAME}\n")
+if(CMAKE_OBJCXX_COMPILER_ID)
+    string(APPEND LOCUS_BUILD_CONFIG
+        "objcxx ${CMAKE_OBJCXX_COMPILER_ID} ${CMAKE_OBJCXX_COMPILER_VERSION}\n")
+endif()
+if(CMAKE_CUDA_COMPILER_ID)
+    string(APPEND LOCUS_BUILD_CONFIG
+        "cuda ${CMAKE_CUDA_COMPILER_ID} ${CMAKE_CUDA_COMPILER_VERSION}\n"
+        "cuda_flags ${CMAKE_CUDA_FLAGS}\n")
+endif()
+foreach(tool IN ITEMS GLSLANG_VALIDATOR GLSLC)
+    if(${tool})
+        execute_process(COMMAND ${${tool}} --version
+                        OUTPUT_VARIABLE ver ERROR_QUIET
+                        OUTPUT_STRIP_TRAILING_WHITESPACE)
+        string(APPEND LOCUS_BUILD_CONFIG "${tool} ${ver}\n")
+    endif()
+endforeach()
+set(LOCUS_BUILD_CONFIG_FILE
+    ${CMAKE_BINARY_DIR}/generated/locus/engine/build_config.txt)
+# Rewritten only when it changes, so the digest reruns on a
+# reconfigure that changed the compiler or the flags.
+file(CONFIGURE OUTPUT ${LOCUS_BUILD_CONFIG_FILE}
+     CONTENT "${LOCUS_BUILD_CONFIG}")
+set(LOCUS_COMPUTE_DIGEST
+    ${CMAKE_BINARY_DIR}/generated/locus/engine/compute_digest.hpp)
+add_custom_command(
+    OUTPUT ${LOCUS_COMPUTE_DIGEST}
+    COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
+            -DCONFIG=${LOCUS_BUILD_CONFIG_FILE}
+            -DOUT=${LOCUS_COMPUTE_DIGEST}
+            -P ${CMAKE_SOURCE_DIR}/cmake/compute_digest.cmake
+    DEPENDS ${LOCUS_COMPUTE_SOURCES} ${LOCUS_BUILD_CONFIG_FILE}
+            ${CMAKE_SOURCE_DIR}/CMakeLists.txt
+            ${CMAKE_SOURCE_DIR}/cmake/compute_digest.cmake
+    COMMENT "Digest of what computes KV")
+add_custom_target(locus_compute_digest DEPENDS ${LOCUS_COMPUTE_DIGEST})
+add_dependencies(locus locus_compute_digest)
+target_include_directories(locus PRIVATE ${CMAKE_BINARY_DIR}/generated)
 
 enable_testing()
 add_subdirectory(tests)

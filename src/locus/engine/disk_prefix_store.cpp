@@ -1,5 +1,6 @@
 #include "locus/engine/disk_prefix_store.hpp"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -703,17 +704,15 @@ std::uint64_t DiskPrefixStore::key_hash() const {
     return key_seed_;
 }
 
-std::optional<std::uint64_t> disk_prefix_file_key(const fs::path& path) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) {
-        return std::nullopt;  // a symlink (ELOOP), or unreadable
-    }
+namespace {
+
+/** The key hash from a store file's header (open fd), or nullopt. */
+std::optional<std::uint64_t> key_of_fd(int fd) {
     std::uint8_t h[kKeyHeaderBytes];
     struct stat st {};
-    const bool ok = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-                    pread_full(fd, h, sizeof h, 0);
-    ::close(fd);
-    if (!ok || std::memcmp(h, kMagic, sizeof kMagic) != 0) {
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        !pread_full(fd, h, sizeof h, 0) ||
+        std::memcmp(h, kMagic, sizeof kMagic) != 0) {
         return std::nullopt;
     }
     std::uint32_t version, backend_len;
@@ -729,6 +728,28 @@ std::optional<std::uint64_t> disk_prefix_file_key(const fs::path& path) {
     return checksum(h, sizeof h);
 }
 
+/** Closes a DIR* on every exit. */
+struct DirCloser {
+    DIR* d;
+    ~DirCloser() {
+        if (d != nullptr) {
+            ::closedir(d);
+        }
+    }
+};
+
+}  // namespace
+
+std::optional<std::uint64_t> disk_prefix_file_key(const fs::path& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return std::nullopt;  // a symlink (ELOOP), or unreadable
+    }
+    const std::optional<std::uint64_t> k = key_of_fd(fd);
+    ::close(fd);
+    return k;
+}
+
 PrefixCleanResult clean_disk_prefix(const fs::path& dir,
                                     std::span<const std::uint64_t> keep,
                                     bool dry_run,
@@ -738,31 +759,60 @@ PrefixCleanResult clean_disk_prefix(const fs::path& dir,
             "clean_disk_prefix: no key to keep (that would remove every "
             "file)");
     }
+    // Every step goes through the directory opened here: a DIR swapped
+    // for a symlink after this open cannot redirect the walk.
+    const int dfd = ::open(dir.c_str(),
+                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dfd < 0) {
+        const int err = errno;
+        throw std::runtime_error(
+            dir.string() + ": " +
+            (err == ELOOP || err == ENOTDIR
+                 ? std::string("a symlink or not a directory; give the "
+                               "directory itself")
+                 : std::string(std::strerror(err))));
+    }
+    DirCloser closer{::fdopendir(dfd)};
+    if (closer.d == nullptr) {
+        const int err = errno;
+        ::close(dfd);
+        throw std::runtime_error(dir.string() + ": " + std::strerror(err));
+    }
+    // As the store checks its directory at startup (ensure_private_dir).
     struct stat st {};
-    if (::lstat(dir.c_str(), &st) != 0) {
-        throw std::runtime_error(dir.string() + ": " +
-                                 std::strerror(errno));
-    }
-    if (S_ISLNK(st.st_mode)) {
-        throw std::runtime_error(dir.string() +
-                                 ": a symlink; give the directory itself");
-    }
-    if (!S_ISDIR(st.st_mode)) {
+    if (::fstat(dfd, &st) != 0 || !S_ISDIR(st.st_mode)) {
         throw std::runtime_error(dir.string() + ": not a directory");
     }
     if (st.st_uid != ::geteuid()) {
+        throw std::runtime_error(dir.string() + ": owned by another user");
+    }
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
         throw std::runtime_error(dir.string() +
-                                 ": owned by another user");
+                                 ": group or others can write to it");
     }
     PrefixCleanResult r;
-    for (const fs::directory_entry& e : fs::directory_iterator(dir)) {
-        std::error_code ec;
+    errno = 0;
+    while (const dirent* e = ::readdir(closer.d)) {
+        const std::string name = e->d_name;
         std::uint64_t digest;
-        if (!fs::is_regular_file(e.symlink_status(ec)) ||
-            !parse_name(e.path().filename().string(), digest)) {
-            continue;  // not a store file (or a symlink to one)
+        if (!parse_name(name, digest)) {
+            continue;  // not a store name
         }
-        const std::optional<std::uint64_t> k = disk_prefix_file_key(e.path());
+        struct stat fst {};
+        if (::fstatat(dfd, name.c_str(), &fst, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(fst.st_mode)) {
+            continue;  // a symlink (or anything else) under a store name
+        }
+        const int fd =
+            ::openat(dfd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+            ++r.skipped;
+            continue;
+        }
+        struct stat ost {};
+        const bool got = ::fstat(fd, &ost) == 0;
+        const std::optional<std::uint64_t> k = key_of_fd(fd);
+        ::close(fd);
         if (!k) {
             ++r.skipped;
             continue;
@@ -771,14 +821,14 @@ PrefixCleanResult clean_disk_prefix(const fs::path& dir,
             ++r.kept;
             continue;
         }
-        const std::uint64_t bytes = e.file_size(ec);
-        // remove() unlinks the name: had it become a symlink since, the
-        // link goes, never its target.
-        if (dry_run || fs::remove(e.path(), ec)) {
+        // unlinkat removes the name, never what it points to.
+        if (dry_run || ::unlinkat(dfd, name.c_str(), 0) == 0) {
             ++r.removed;
-            r.removed_bytes += ec ? 0 : bytes;
+            if (got) {
+                r.removed_bytes += static_cast<std::uint64_t>(ost.st_size);
+            }
             if (removed_paths != nullptr) {
-                removed_paths->push_back(e.path());
+                removed_paths->push_back(dir / name);
             }
         }
     }
