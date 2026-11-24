@@ -2609,6 +2609,42 @@ void TransformerModel::expert_out_on(const backend::Backend& b,
                   hp_.n_ff_exp, xb, gate, up, d);
 }
 
+void TransformerModel::expert_out_batch(std::uint32_t layer,
+                                        std::uint32_t expert,
+                                        std::span<const float> xs,
+                                        std::uint32_t m,
+                                        std::span<float> ds) const {
+    if (layer < layer_begin_ || layer >= layer_end_ ||
+        layers_[layer].gate_exps.base.rows == 0) {
+        throw std::out_of_range("expert_out_batch: no MoE layer " +
+                                std::to_string(layer));
+    }
+    if (expert >= hp_.n_expert) {
+        throw std::out_of_range("expert_out_batch: no expert " +
+                                std::to_string(expert));
+    }
+    const std::size_t E = hp_.n_embd, ff = hp_.n_ff_exp;
+    if (xs.size() != m * E || ds.size() != m * E) {
+        throw std::invalid_argument(
+            "expert_out_batch: xs and ds take m x n_embd");
+    }
+    if (m == 0) {
+        return;
+    }
+    const Layer& lay = layers_[layer];
+    const backend::Ops op = effective_ops(backend_, q8k_activations());
+    // As moe_ffn_batch's per-expert step: matvec_batch matches m
+    // matvecs, so each row keeps expert_out's bits on the CPU.
+    std::vector<float> g(m * ff), u(m * ff);
+    matvec_batch(op, lay.gate_exps.expert(expert), xs, g, m);
+    matvec_batch(op, lay.up_exps.expert(expert), xs, u, m);
+    for (std::size_t q = 0; q < m; ++q) {
+        backend::silu_mul({g.data() + q * ff, ff}, {u.data() + q * ff, ff},
+                          {g.data() + q * ff, ff});
+    }
+    matvec_batch(op, lay.down_exps.expert(expert), g, ds, m);
+}
+
 void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
                          std::uint32_t layer) const {
     using namespace locus::backend;
@@ -2823,13 +2859,13 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
     const std::uint32_t ff = hp_.n_ff_exp;
     const std::uint32_t k = hp_.n_expert_used;
 
-    // Expert parallelism (#781): only moe_ffn sends picks to the expert
-    // hosts, so with remote experts each token goes through it, a token
-    // at a time (i#1185); this covers every batched caller (prefill,
-    // multi-sequence decode, a stage's layers). Batched remote calls,
-    // which would keep the batch, are #1186. The same bits either way:
-    // this function matches n moe_ffn calls.
-    if (remote_experts_ != nullptr) {
+    // Expert parallelism (#781): the remote picks of all n tokens go to
+    // the expert hosts as one batched call each (i#1186, phase 3). With
+    // the MoE hybrid on as well, each token goes through moe_ffn, a
+    // token at a time (i#1185). The same bits either way: this function
+    // matches n moe_ffn calls.
+    RemoteExperts* const rx = remote_experts_;
+    if (rx != nullptr && moe_hybrid() != nullptr) {
         for (std::uint32_t t = 0; t < n; ++t) {
             const std::size_t o = static_cast<std::size_t>(t) * E;
             std::copy_n(xbf.data() + o, E, ws.xb.data());
@@ -2871,7 +2907,8 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
             if (hy != nullptr) {
                 on_cpu[static_cast<std::size_t>(t) * k + s] =
                     !moe_hybrid_touch(*hy, op, lay, layer, e, api);
-            } else {
+            } else if (rx == nullptr || !rx->remote(layer, e)) {
+                // Another host's experts are its calls, not this host's.
                 ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert,
                                     gpu, api);
             }
@@ -2883,14 +2920,20 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
     struct Use {
         std::uint32_t e, t, s;
     };
-    std::vector<Use> uses, cold;
+    // The remote picks (far) stay in (token, slot) order.
+    std::vector<Use> uses, cold, far;
     uses.reserve(static_cast<std::size_t>(n) * k);
     for (std::uint32_t t = 0; t < n; ++t) {
         for (std::uint32_t s = 0;
              s < static_cast<std::uint32_t>(picked[t].size());
              ++s) {
+            const std::uint32_t e = picked[t][s].first;
+            if (rx != nullptr && rx->remote(layer, e)) {
+                far.push_back({e, t, s});
+                continue;
+            }
             (on_cpu[static_cast<std::size_t>(t) * k + s] ? cold : uses)
-                .push_back({picked[t][s].first, t, s});
+                .push_back({e, t, s});
         }
     }
     const auto by_expert = [](const Use& a, const Use& b) {
@@ -2934,6 +2977,18 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
 
     // Phase 3: weight-stationary swiglu -> res[(t*k + s)*E].
     std::vector<float> res(static_cast<std::size_t>(n) * k * E);
+    // The remote picks first, as one batched call per host, so the
+    // hosts work while this one computes the local picks below.
+    std::vector<std::uint32_t> far_ids(far.size());
+    std::vector<float> far_xs(far.size() * E);
+    if (!far.empty()) {
+        for (std::size_t q = 0; q < far.size(); ++q) {
+            far_ids[q] = far[q].e;
+            std::copy_n(xbf.data() + static_cast<std::size_t>(far[q].t) * E,
+                        E, far_xs.data() + q * E);
+        }
+        rx->start_batch(layer, far_ids, far_xs);
+    }
     // The CPU uses run on the CPU backend while the GPU runs the rest;
     // each writes only its own res slots.
     std::future<void> cold_done;
@@ -3003,6 +3058,20 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
             }
         }
         i = j;
+    }
+    // The replies into their res slots, weighted as the local ones.
+    if (!far.empty()) {
+        std::vector<float> far_d(far.size() * E);
+        rx->finish_batch(far_d, static_cast<std::uint32_t>(far.size()));
+        for (std::size_t q = 0; q < far.size(); ++q) {
+            const float wgt = picked[far[q].t][far[q].s].second;
+            const float* dq = far_d.data() + q * E;
+            float* r = res.data() +
+                       (static_cast<std::size_t>(far[q].t) * k + far[q].s) * E;
+            for (std::uint32_t c = 0; c < E; ++c) {
+                r[c] = wgt * dq[c];
+            }
+        }
     }
 
     if (cold_done.valid()) {

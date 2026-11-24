@@ -39,7 +39,20 @@ enum class MsgType : std::uint16_t {
     kExpertOut = 6,   /**< The reply to a kExpertCall, with its tags:
                        *   data = the expert's output d (n_embd floats),
                        *   before the router weight. */
+    kExpertCallBatch = 7, /**< n expert calls of one layer at once
+                       *   (i#1186): position = layer, token = n, data =
+                       *   the n hidden states (n x n_embd floats), ids =
+                       *   their n expert ids (u32, after the floats on
+                       *   the wire, never through a float). */
+    kExpertOutBatch = 8,  /**< The reply to a kExpertCallBatch: token =
+                       *   n, data = the n outputs (n x n_embd), in call
+                       *   order. */
 };
+
+/** Most (expert, hidden state) pairs in one kExpertCallBatch: a larger
+ *  batch goes in several calls (i#1186), so a host's read cap stays
+ *  kMaxExpertBatch x (n_embd + 1) floats (i#850). */
+constexpr std::uint32_t kMaxExpertBatch = 4096;
 
 /**
  * One pipeline message, tagged by kind. `request_id` and `position`
@@ -55,6 +68,8 @@ struct Message {
     std::uint32_t position = 0;
     tok::TokenId token = 0;      /**< kToken only. */
     std::vector<float> data;     /**< kActivation / kLogits payload. */
+    /** kExpertCallBatch only: the expert id of each hidden state. */
+    std::vector<std::uint32_t> ids;
 };
 
 /** @returns A kToken message. */
@@ -82,6 +97,20 @@ Message make_expert_call(std::uint64_t request_id, std::uint32_t layer,
  */
 Message make_expert_out(std::uint64_t request_id, std::uint32_t layer,
                         std::uint32_t expert, std::vector<float> d);
+/**
+ * @returns A kExpertCallBatch: run expert `experts[i]` of layer `layer`
+ *     on hidden state i of `xs` (experts.size() x n_embd floats).
+ */
+Message make_expert_call_batch(std::uint64_t request_id,
+                               std::uint32_t layer,
+                               std::span<const std::uint32_t> experts,
+                               std::span<const float> xs);
+/**
+ * @returns The kExpertOutBatch reply: `ds` holds the n outputs in call
+ *     order (n x n_embd floats).
+ */
+Message make_expert_out_batch(std::uint64_t request_id, std::uint32_t layer,
+                              std::uint32_t n, std::vector<float> ds);
 
 /** Outcome of a buffer decode attempt (mirrors auth::HelperDecode). */
 enum class Decode {

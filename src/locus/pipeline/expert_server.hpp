@@ -10,12 +10,15 @@ namespace locus::pipeline {
  * Serves expert calls on one connection (expert parallelism, #781)
  * until the peer closes it: each kExpertCall (layer, expert, xb) gets a
  * kExpertOut with the same tags and model.expert_out's d, so the
- * caller gets the bits its own moe_ffn would add. Calls are answered
- * one at a time, in order.
+ * caller gets the bits its own moe_ffn would add. A kExpertCallBatch
+ * (i#1186) runs each expert once over its hidden states
+ * (expert_out_batch) and gets one kExpertOutBatch, in call order; an
+ * empty one is the client's probe and gets an empty reply. Calls are
+ * answered one at a time, in order.
  *
  * Anything else ends the connection: another message kind, an expert
  * outside [expert_lo, expert_hi), a layer the model has no experts in,
- * or an xb that is not n_embd floats.
+ * an xb that is not n_embd floats, or a batch over kMaxExpertBatch.
  *
  * @param fd A connected socket; the caller closes it.
  * @returns The number of calls answered.

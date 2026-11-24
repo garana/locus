@@ -26,7 +26,9 @@ bool valid_type(std::uint16_t t) {
            t == static_cast<std::uint16_t>(MsgType::kLogits) ||
            t == static_cast<std::uint16_t>(MsgType::kSessionEnd) ||
            t == static_cast<std::uint16_t>(MsgType::kExpertCall) ||
-           t == static_cast<std::uint16_t>(MsgType::kExpertOut);
+           t == static_cast<std::uint16_t>(MsgType::kExpertOut) ||
+           t == static_cast<std::uint16_t>(MsgType::kExpertCallBatch) ||
+           t == static_cast<std::uint16_t>(MsgType::kExpertOutBatch);
 }
 
 // Little-endian integer append helpers (portable regardless of host
@@ -85,7 +87,13 @@ bool parse_payload(const char* p, std::uint32_t len, Message& out) {
     const std::int32_t token =
         static_cast<std::int32_t>(get_u32(p + 16));
     const std::uint32_t nf = get_u32(p + 20);
-    if (static_cast<std::uint64_t>(nf) * 4u + kHeaderBytes != len) {
+    // A kExpertCallBatch carries token u32 ids after its floats.
+    const bool with_ids =
+        type == static_cast<std::uint16_t>(MsgType::kExpertCallBatch);
+    const std::uint64_t ni =
+        with_ids ? static_cast<std::uint32_t>(token) : 0u;
+    if (static_cast<std::uint64_t>(nf) * 4u + ni * 4u + kHeaderBytes !=
+        len) {
         return false;
     }
     out.type = static_cast<MsgType>(type);
@@ -96,6 +104,10 @@ bool parse_payload(const char* p, std::uint32_t len, Message& out) {
     if (nf > 0) {
         std::memcpy(out.data.data(), p + kHeaderBytes,
                     static_cast<std::size_t>(nf) * 4u);
+    }
+    out.ids.resize(static_cast<std::size_t>(ni));
+    for (std::size_t i = 0; i < out.ids.size(); ++i) {
+        out.ids[i] = get_u32(p + kHeaderBytes + std::size_t{nf} * 4u + 4 * i);
     }
     return true;
 }
@@ -189,19 +201,45 @@ Message make_expert_out(std::uint64_t request_id, std::uint32_t layer,
                           std::move(d));
 }
 
+Message make_expert_call_batch(std::uint64_t request_id,
+                               std::uint32_t layer,
+                               std::span<const std::uint32_t> experts,
+                               std::span<const float> xs) {
+    Message m = expert_message(MsgType::kExpertCallBatch, request_id, layer,
+                               static_cast<std::uint32_t>(experts.size()),
+                               std::vector<float>(xs.begin(), xs.end()));
+    m.ids.assign(experts.begin(), experts.end());
+    return m;
+}
+
+Message make_expert_out_batch(std::uint64_t request_id, std::uint32_t layer,
+                              std::uint32_t n, std::vector<float> ds) {
+    return expert_message(MsgType::kExpertOutBatch, request_id, layer, n,
+                          std::move(ds));
+}
+
 void encode(const Message& m, std::string& out) {
     const std::uint32_t nf = static_cast<std::uint32_t>(m.data.size());
-    const std::uint32_t frame_len = kHeaderBytes + nf * 4u;
+    // A kExpertCallBatch's ids follow its floats as u32 (i#1186); its
+    // token holds their count, so the frame length says where they end.
+    const bool with_ids = m.type == MsgType::kExpertCallBatch;
+    const std::uint32_t ni =
+        with_ids ? static_cast<std::uint32_t>(m.ids.size()) : 0u;
+    const std::uint32_t frame_len = kHeaderBytes + nf * 4u + ni * 4u;
     put_u32(out, frame_len);
     put_u16(out, static_cast<std::uint16_t>(m.type));
     put_u16(out, 0);  // flags
     put_u64(out, m.request_id);
     put_u32(out, m.position);
-    put_u32(out, static_cast<std::uint32_t>(m.token));
+    put_u32(out, with_ids ? ni : static_cast<std::uint32_t>(m.token));
     put_u32(out, nf);
     if (nf > 0) {
         out.append(reinterpret_cast<const char*>(m.data.data()),
                    static_cast<std::size_t>(nf) * 4u);
+    }
+    for (const std::uint32_t id : with_ids ? std::span(m.ids)
+                                           : std::span<const std::uint32_t>()) {
+        put_u32(out, id);
     }
 }
 
