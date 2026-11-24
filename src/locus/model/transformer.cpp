@@ -2908,34 +2908,46 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
             }
         });
     }
-    std::vector<float> down(E);
-    auto swiglu = [&](const Mat& wg, const Mat& wu, const Mat& wd,
-                      std::uint32_t ffw, const float* xin,
-                      float* dout) {
-        matvec_mt(op, wg, {xin, E}, {ws.gate.data(), ffw});
-        matvec_mt(op, wu, {xin, E}, {ws.up.data(), ffw});
-        silu_mul({ws.gate.data(), ffw}, {ws.up.data(), ffw},
-                 {ws.gate.data(), ffw});
-        matvec_mt(op, wd, {ws.gate.data(), ffw}, {dout, E});
-    };
-    std::uint32_t cur = UINT32_MAX;
-    Mat wg, wu, wd;
-    for (const auto& u : uses) {
-        if (u.e != cur) {
-            cur = u.e;
-            wg = lay.gate_exps.expert(u.e);
-            wu = lay.up_exps.expert(u.e);
-            wd = lay.down_exps.expert(u.e);
+    // Each expert's uses (sorted by expert) as one batch: its weights are
+    // read once for all its tokens (i#1077), not once per token.
+    // matvec_batch is byte-identical to the per-token matvecs, so the
+    // res slots get the same bits.
+    std::vector<float> xg, gg, ug, dg;
+    for (std::size_t i = 0; i < uses.size();) {
+        const std::uint32_t e = uses[i].e;
+        std::size_t j = i;
+        while (j < uses.size() && uses[j].e == e) {
+            ++j;
         }
-        swiglu(wg, wu, wd, ff,
-               xbf.data() + static_cast<std::size_t>(u.t) * E,
-               down.data());
-        const float wgt = picked[u.t][u.s].second;
-        float* r = res.data() +
-                   (static_cast<std::size_t>(u.t) * k + u.s) * E;
-        for (std::uint32_t i = 0; i < E; ++i) {
-            r[i] = wgt * down[i];
+        const auto m = static_cast<std::uint32_t>(j - i);
+        xg.resize(static_cast<std::size_t>(m) * E);
+        gg.resize(static_cast<std::size_t>(m) * ff);
+        ug.resize(static_cast<std::size_t>(m) * ff);
+        dg.resize(static_cast<std::size_t>(m) * E);
+        for (std::uint32_t q = 0; q < m; ++q) {
+            std::copy_n(xbf.data() + static_cast<std::size_t>(uses[i + q].t) *
+                                         E,
+                        E, xg.data() + static_cast<std::size_t>(q) * E);
         }
+        matvec_batch(op, lay.gate_exps.expert(e), xg, gg, m);
+        matvec_batch(op, lay.up_exps.expert(e), xg, ug, m);
+        for (std::uint32_t q = 0; q < m; ++q) {
+            const std::size_t o = static_cast<std::size_t>(q) * ff;
+            silu_mul({gg.data() + o, ff}, {ug.data() + o, ff},
+                     {gg.data() + o, ff});
+        }
+        matvec_batch(op, lay.down_exps.expert(e), gg, dg, m);
+        for (std::uint32_t q = 0; q < m; ++q) {
+            const auto& u = uses[i + q];
+            const float wgt = picked[u.t][u.s].second;
+            const float* dq = dg.data() + static_cast<std::size_t>(q) * E;
+            float* r = res.data() +
+                       (static_cast<std::size_t>(u.t) * k + u.s) * E;
+            for (std::uint32_t c = 0; c < E; ++c) {
+                r[c] = wgt * dq[c];
+            }
+        }
+        i = j;
     }
 
     if (cold_done.valid()) {
@@ -2968,6 +2980,22 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
     const std::uint32_t ffs =
         hp_.n_ff_shexp > 0 ? hp_.n_ff_shexp
                            : ff * hp_.n_expert_shared;
+    // The shared experts over all n tokens at once (i#1077), byte-
+    // identical to a swiglu per token: their weights are read once.
+    std::vector<float> sh;
+    if (hp_.n_expert_shared > 0) {
+        std::vector<float> sg(static_cast<std::size_t>(n) * ffs),
+            su(static_cast<std::size_t>(n) * ffs);
+        sh.resize(static_cast<std::size_t>(n) * E);
+        matvec_batch(op, lay.gate_shexp, xbf, sg, n);
+        matvec_batch(op, lay.up_shexp, xbf, su, n);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::size_t o = static_cast<std::size_t>(t) * ffs;
+            silu_mul({sg.data() + o, ffs}, {su.data() + o, ffs},
+                     {sg.data() + o, ffs});
+        }
+        matvec_batch(op, lay.down_shexp, sg, sh, n);
+    }
     for (std::uint32_t t = 0; t < n; ++t) {
         std::fill(acc.begin(), acc.end(), 0.0f);
         for (std::uint32_t s = 0;
@@ -2990,10 +3018,9 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
                           {&logit, 1});
                 g = 1.0f / (1.0f + std::exp(-logit));
             }
-            swiglu(lay.gate_shexp, lay.up_shexp, lay.down_shexp,
-                   ffs, xt_in, down.data());
+            const float* st = sh.data() + static_cast<std::size_t>(t) * E;
             for (std::uint32_t i = 0; i < E; ++i) {
-                acc[i] += g * down[i];
+                acc[i] += g * st[i];
             }
         }
         float* xt = x.data() + static_cast<std::size_t>(t) * E;

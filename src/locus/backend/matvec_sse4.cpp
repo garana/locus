@@ -1151,6 +1151,54 @@ float row_nibble32_q8_0_sse4(bool iq4nl, const std::byte* row,
 }
 
 /**
+ * One Q5_0 (22 B blocks: f16 scale, 32 high bits, 16 nibble bytes)
+ * weight row dotted with a Q8_0 activation, in row_q8_0_q8_0_sse4's
+ * float order (i#1077). Weight j is (nibble | high bit j << 4) - 16,
+ * as scalar unpack_block32; the 32 high bits become 0x10 bytes the way
+ * ggml's bytes_from_bits_32 does, then block32_lanes_sse4's lane sums,
+ * so the result is bit-identical to scalar vec_dot_block32_q8_0.
+ */
+float row_q5_0_q8_0_sse4(const std::byte* row, const float* xd,
+                         const std::int8_t* xq, std::size_t nb) {
+    const __m128i lo4 = _mm_set1_epi8(0x0f);
+    const __m128i sixteen = _mm_set1_epi8(16);
+    const __m128i bit10 = _mm_set1_epi8(0x10);
+    // Byte i of a 16-byte group tests bit i % 8 of its source byte.
+    const __m128i bits = _mm_set_epi8(
+        static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+    // Weights 0-15 take high bits 0-15 (qh bytes 0, 1); 16-31 take
+    // 16-31 (bytes 2, 3).
+    const __m128i rep_lo =
+        _mm_set_epi8(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m128i rep_hi =
+        _mm_set_epi8(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2);
+    const auto lanes = [&](const std::byte* blk, const std::int8_t* x) {
+        std::uint32_t qh;
+        std::memcpy(&qh, blk + 2, 4);
+        const __m128i h = _mm_cvtsi32_si128(static_cast<int>(qh));
+        const auto high = [&](const __m128i rep) {
+            const __m128i v = _mm_and_si128(_mm_shuffle_epi8(h, rep), bits);
+            return _mm_and_si128(_mm_cmpeq_epi8(v, bits), bit10);
+        };
+        const __m128i b =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 6));
+        const __m128i w0 = _mm_sub_epi8(
+            _mm_or_si128(_mm_and_si128(b, lo4), high(rep_lo)), sixteen);
+        const __m128i w1 = _mm_sub_epi8(
+            _mm_or_si128(_mm_and_si128(_mm_srli_epi16(b, 4), lo4),
+                         high(rep_hi)),
+            sixteen);
+        const __m128i x0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x));
+        const __m128i x1 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + 16));
+        return _mm_add_epi32(lanes16_sse4(_mm_abs_epi8(w0), w0, x0),
+                             lanes16_sse4(_mm_abs_epi8(w1), w1, x1));
+    };
+    return row_block32_q8_0_sse4<22>(row, xd, xq, nb, lanes);
+}
+
+/**
  * row_q8_0_q8_0_sse4 for kT tokens: each weight block and its absolute
  * values are loaded once and dotted with every token's quants; each token's
  * float lanes and reduction keep the one-token order, so out[t] is the
@@ -2212,6 +2260,7 @@ float row_iq4_xs_q8k_sse4(const std::byte* row, const Q8kAct& a,
 enum class Q8Path {
     kBlock32,      // Q8_0
     kBlock32Nib,   // Q4_0, IQ4_NL: nibbles decoded, then Q8_0's lanes
+    kBlock32Q5,    // Q5_0: nibbles and high bits decoded, then the same
     kQ2K,
     kK,
     kIQ1,
@@ -2229,6 +2278,9 @@ Q8Path q8_path(gguf::TensorType type, std::size_t cols) {
     }
     if ((type == T::kQ4_0 || type == T::kIQ4_NL) && cols % 32 == 0) {
         return Q8Path::kBlock32Nib;
+    }
+    if (type == T::kQ5_0 && cols % 32 == 0) {
+        return Q8Path::kBlock32Q5;
     }
     if (cols % 256 != 0) {
         return Q8Path::kOther;
@@ -2335,7 +2387,8 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
         matvec_q8k(w, x, out);  // other types: scalar Q8_K / Q8_0
         return;
     }
-    if (path == Q8Path::kBlock32 || path == Q8Path::kBlock32Nib) {
+    if (path == Q8Path::kBlock32 || path == Q8Path::kBlock32Nib ||
+        path == Q8Path::kBlock32Q5) {
         const std::size_t nb = cols / 32;
         std::vector<float> xd(nb);
         std::vector<std::int8_t> xq(cols);
@@ -2344,6 +2397,9 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
         for (std::uint32_t r = 0; r < w.rows; ++r) {
             out[r] = path == Q8Path::kBlock32
                          ? row_q8_0_q8_0_sse4(w.data + r * nb * 34,
+                                              xd.data(), xq.data(), nb)
+                     : path == Q8Path::kBlock32Q5
+                         ? row_q5_0_q8_0_sse4(w.data + r * nb * 22,
                                               xd.data(), xq.data(), nb)
                          : row_nibble32_q8_0_sse4(iq4nl,
                                                   w.data + r * nb * 18,
@@ -2404,9 +2460,11 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
     const std::uint32_t tile = static_cast<std::uint32_t>(
         std::max<std::size_t>(1, (std::size_t{96} << 10) / cols));
     const std::size_t row_bytes = mat_row_bytes(w);
-    if (path == Q8Path::kBlock32Nib) {
-        // Q4_0 / IQ4_NL: each token quantized once, then the per-token
-        // row kernel over a tile of tokens while the row is in cache.
+    if (path == Q8Path::kBlock32Nib || path == Q8Path::kBlock32Q5) {
+        // Q4_0 / IQ4_NL / Q5_0: each token quantized once, then the
+        // per-token row kernel over a tile of tokens while the row is in
+        // cache.
+        const bool q5 = path == Q8Path::kBlock32Q5;
         const std::size_t nb = cols / 32;
         thread_local std::vector<float> xd;
         thread_local std::vector<std::int8_t> xq;
@@ -2423,9 +2481,12 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
                 const std::byte* row = w.data + r * row_bytes;
                 float* o = out_batch.data() + std::size_t{r} * n;
                 for (std::uint32_t t = t0; t < t1; ++t) {
-                    o[t] = row_nibble32_q8_0_sse4(iq4nl, row,
-                                                  xd.data() + t * nb,
-                                                  xq.data() + t * cols, nb);
+                    o[t] = q5 ? row_q5_0_q8_0_sse4(row, xd.data() + t * nb,
+                                                   xq.data() + t * cols, nb)
+                              : row_nibble32_q8_0_sse4(iq4nl, row,
+                                                       xd.data() + t * nb,
+                                                       xq.data() + t * cols,
+                                                       nb);
                 }
             }
         }

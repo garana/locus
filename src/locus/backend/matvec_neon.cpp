@@ -479,6 +479,34 @@ inline float unpack_block32_neon(gguf::TensorType type, const std::byte* blk,
         hi = vld1q_s8(reinterpret_cast<const std::int8_t*>(q + 16));
         return d;
     }
+    if (type == gguf::TensorType::kQ5_0) {
+        // d, 32 high bits, 16 nibble bytes (i#1077): weight j is
+        // (nibble | high bit j << 4) - 16, as scalar unpack_block32.
+        std::uint32_t qh;
+        std::memcpy(&qh, blk + 2, 4);
+        const uint8x16_t v = vld1q_u8(q + 4);
+        const uint8x16_t nlo = vandq_u8(v, vdupq_n_u8(0x0f));
+        const uint8x16_t nhi = vshrq_n_u8(v, 4);
+        // Byte i of each half tests bit i % 8 of its qh byte: weights
+        // 0-15 take qh bytes 0, 1; weights 16-31 take bytes 2, 3.
+        static constexpr std::uint8_t kBits[16] = {
+            1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+        const uint8x16_t bits = vld1q_u8(kBits);
+        const uint8x16_t src_lo =
+            vcombine_u8(vdup_n_u8(static_cast<std::uint8_t>(qh)),
+                        vdup_n_u8(static_cast<std::uint8_t>(qh >> 8)));
+        const uint8x16_t src_hi =
+            vcombine_u8(vdup_n_u8(static_cast<std::uint8_t>(qh >> 16)),
+                        vdup_n_u8(static_cast<std::uint8_t>(qh >> 24)));
+        const uint8x16_t b10 = vdupq_n_u8(0x10);
+        const uint8x16_t hlo = vandq_u8(vtstq_u8(src_lo, bits), b10);
+        const uint8x16_t hhi = vandq_u8(vtstq_u8(src_hi, bits), b10);
+        lo = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(nlo, hlo)),
+                      vdupq_n_s8(16));
+        hi = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(nhi, hhi)),
+                      vdupq_n_s8(16));
+        return d;
+    }
     const uint8x16_t v = vld1q_u8(q);
     const uint8x16_t nlo = vandq_u8(v, vdupq_n_u8(0x0f));
     const uint8x16_t nhi = vshrq_n_u8(v, 4);
@@ -1856,7 +1884,9 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
         d8.resize(nb);
         q8.resize(x.size());
         quantize_activation_q8_0_neon(x, d8.data(), q8.data());
-        const std::size_t bb = w.type == gguf::TensorType::kQ8_0 ? 34 : 18;
+        const std::size_t bb = w.type == gguf::TensorType::kQ8_0   ? 34
+                               : w.type == gguf::TensorType::kQ5_0 ? 22
+                                                                   : 18;
         for (std::uint32_t r = 0; r < w.rows; ++r) {
             out[r] = row_block32_q8_0_neon(w.type, w.data + r * nb * bb, bb,
                                            nb, d8.data(), q8.data());
@@ -2047,7 +2077,9 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                                      d8.data() + t * nb,
                                      q8.data() + t * cols);
         }
-        const std::size_t bb = w.type == gguf::TensorType::kQ8_0 ? 34 : 18;
+        const std::size_t bb = w.type == gguf::TensorType::kQ8_0   ? 34
+                               : w.type == gguf::TensorType::kQ5_0 ? 22
+                                                                   : 18;
         const std::uint32_t tile = q8_token_tile(cols);
         for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
             const std::uint32_t t1 = std::min(n, t0 + tile);

@@ -2175,6 +2175,22 @@ float unpack_block32(gguf::TensorType type, const std::byte* row,
             }
             return f16_to_f32(load_u16(blk));
         }
+        case T::kQ5_0: {
+            // d, 32 high bits, then 16 nibble bytes: weight j is
+            // (nibble | high bit << 4) - 16, as dequant_block_q5_0
+            // (i#1077: ggml's vec_dot_type for Q5_0 is Q8_0).
+            const std::byte* blk = row + b * kQ5_0BlockBytes;
+            std::uint32_t qh;
+            std::memcpy(&qh, blk + 2, 4);
+            const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 6);
+            for (int i = 0; i < 16; ++i) {
+                const int h0 = static_cast<int>((qh >> i) & 1u) << 4;
+                const int h1 = static_cast<int>((qh >> (i + 16)) & 1u) << 4;
+                q[i] = static_cast<std::int8_t>(((qs[i] & 0x0f) | h0) - 16);
+                q[i + 16] = static_cast<std::int8_t>(((qs[i] >> 4) | h1) - 16);
+            }
+            return f16_to_f32(load_u16(blk));
+        }
         default: {  // kIQ4_NL
             const std::byte* blk = row + b * kIQ4_NLBlockBytes;
             const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 2);
@@ -2235,7 +2251,8 @@ float vec_dot_block32_q8_0(gguf::TensorType type, const std::byte* row,
 
 bool is_q8_0_act_type(gguf::TensorType type) {
     using T = gguf::TensorType;
-    return type == T::kQ8_0 || type == T::kQ4_0 || type == T::kIQ4_NL;
+    return type == T::kQ8_0 || type == T::kQ4_0 || type == T::kQ5_0 ||
+           type == T::kIQ4_NL;
 }
 
 bool is_q8k_type(gguf::TensorType type) {
