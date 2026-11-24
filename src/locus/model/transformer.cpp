@@ -2823,6 +2823,24 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
     const std::uint32_t ff = hp_.n_ff_exp;
     const std::uint32_t k = hp_.n_expert_used;
 
+    // Expert parallelism (#781): only moe_ffn sends picks to the expert
+    // hosts, so with remote experts each token goes through it, a token
+    // at a time (i#1185); this covers every batched caller (prefill,
+    // multi-sequence decode, a stage's layers). Batched remote calls,
+    // which would keep the batch, are #1186. The same bits either way:
+    // this function matches n moe_ffn calls.
+    if (remote_experts_ != nullptr) {
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::size_t o = static_cast<std::size_t>(t) * E;
+            std::copy_n(xbf.data() + o, E, ws.xb.data());
+            moe_ffn(lay, ws, layer);
+            for (std::uint32_t i = 0; i < E; ++i) {
+                x[o + i] += ws.moe_acc[i];
+            }
+        }
+        return;
+    }
+
     // Phase 1: route each token (byte-identical to moe_ffn).
     std::vector<std::vector<std::pair<std::uint32_t, float>>>
         picked(n);

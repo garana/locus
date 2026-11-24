@@ -2690,7 +2690,12 @@ bool vulkan_hparams_supported(const model::Hparams& hp) {
 }
 
 bool vulkan_forward_supported(const model::TransformerModel& m) {
-    return vulkan_hparams_supported(m.hparams()) && gpu_weights_ok(m);
+    // Experts on another host (i#1185): only the host forward's moe_ffn
+    // sends their picks, so the GPU forwards (single, batched, multi-
+    // sequence: all ask here) decline the model, as Metal's does; it
+    // then runs per op, its matvecs still on the GPU.
+    return vulkan_hparams_supported(m.hparams()) &&
+           !m.has_remote_experts() && gpu_weights_ok(m);
 }
 
 bool vulkan_moe_gpu_route(const model::TransformerModel& m) {

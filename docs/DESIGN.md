@@ -819,7 +819,8 @@ guarding the default path.
   experts run: routed on the GPU, or on the host with the picks on the
   GPU or on the CPU (i#1179), settled once the KV pool exists; a model with
   the MoE hybrid on is refused, since its hot set follows the requests
-  served before), the tokens and a checksum per block, so a mismatch
+  served before, and so are remote experts, #1185),
+  the tokens and a checksum per block, so a mismatch
   or a torn file reads as a miss; a byte cap evicts the least recently
   used file. The checksums catch damage, not tampering, so the
   directory must be the server user's own and not group- or
@@ -1197,9 +1198,16 @@ side, `TransformerModel::set_remote_experts` takes a
 `model::RemoteExperts` (`pipeline::ExpertClient` over those
 connections): `moe_ffn` starts the remote picks, computes the local
 ones meanwhile, then adds every pick in pick order, and its readahead
-skips the remote experts. Only the per-token CPU forward uses it; the
-batched and GPU forwards compute every expert locally, which gives the
-same output since each host maps the whole file. `locus-run
+skips the remote experts. The batched CPU forwards (a prefill chunk, a
+multi-sequence decode, a stage's layers) run such a layer's MoE a token
+at a time through `moe_ffn`, so their picks reach the expert hosts too,
+with the same bits (#1185; batched remote calls are #1186). The GPU
+whole-token forwards (Vulkan's, Metal's) never call `moe_ffn`, so they
+decline such a model and it runs per op, its matvecs still on the GPU.
+The remote picks carry the bits of whatever backend each expert host
+runs, which the main host does not know, so the disk prefix tier is
+refused with remote experts.
+`locus-run
 --remote-experts HOST:PORT=LO:HI` (repeatable) connects to each
 `locus-experts` and installs the client. A host lost mid-run ends the
 run: the client's error reaches the caller and nothing retries.

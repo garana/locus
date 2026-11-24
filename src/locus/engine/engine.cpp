@@ -61,6 +61,17 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
                 "is on (its cold experts run on the CPU as the hot set "
                 "changes); set LOCUS_MOE_HYBRID=0 to use the disk tier");
         }
+        // Experts on another host (i#1185): their picks are the expert
+        // host's bits, from whatever backend it runs, which this host
+        // does not know (and on Vulkan here the GPU forward declines the
+        // model), so K/V would differ from a local run's under the same
+        // key.
+        if (m.has_remote_experts()) {
+            throw std::invalid_argument(
+                "--prefix-cache-dir: not supported with remote experts "
+                "(their K/V bits come from the expert hosts' backends); "
+                "drop --remote-experts to use the disk tier");
+        }
         cfg_.prefix_cache = true;
     }
     if (cfg_.prefix_cache) {
