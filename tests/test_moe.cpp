@@ -588,6 +588,45 @@ TEST_CASE("the engine keys the disk prefix store on the vulkan expert "
     const auto id2 = engine2.submit({3, 7, 1}, 2);
     engine2.run_to_completion();
     REQUIRE(engine2.get(id2)->generated.size() == 2);
+
+    // i#1185: with experts on another host, the Vulkan forwards decline
+    // the model (only moe_ffn sends the picks), and the disk tier is
+    // refused on Vulkan, whose K/V bits then differ from a local run's;
+    // on the CPU it is kept (the picks are one process's bits).
+    struct NoneRemote : locus::model::RemoteExperts {
+        bool remote(std::uint32_t, std::uint32_t) const override {
+            return false;
+        }
+        void start(std::uint32_t, std::uint32_t,
+                   std::span<const float>) override {}
+        void finish(std::span<float>) override {}
+    } none;
+    model.set_remote_experts(&none);
+    struct Unset {
+        TransformerModel& m;
+        ~Unset() { m.set_remote_experts(nullptr); }
+    } unset{model};
+    REQUIRE(model.has_remote_experts());
+    REQUIRE_FALSE(locus::backend::vulkan_forward_supported(model));
+    auto store3 = locus::engine::open_disk_prefix(
+        (base / "kv3").string(), 1 << 20, g, path, model,
+        locus::kv::KvType::kF32);
+    locus::engine::Engine::Config cfg3;
+    cfg3.disk_prefix = store3;
+    CHECK_THROWS_AS(locus::engine::Engine(
+                        model, static_cast<locus::tok::TokenId>(-1), cfg3),
+                    std::invalid_argument);
+    model.use_backend(locus::backend::best_backend());
+    auto store4 = locus::engine::open_disk_prefix(
+        (base / "kv4").string(), 1 << 20, g, path, model,
+        locus::kv::KvType::kF32);
+    locus::engine::Engine::Config cfg4;
+    cfg4.disk_prefix = store4;
+    locus::engine::Engine engine4(
+        model, static_cast<locus::tok::TokenId>(-1), cfg4);
+    const auto id4 = engine4.submit({3, 7, 1}, 2);
+    engine4.run_to_completion();
+    REQUIRE(engine4.get(id4)->generated.size() == 2);
 }
 
 TEST_CASE("the disk prefix tier takes a cuda MoE model with the hybrid "
@@ -1753,9 +1792,14 @@ TEST_CASE("a forward with remote experts is one process's bits",
     const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5, 2};
     // batched: the prompt goes through forward_batch (a batched prefill),
     // whose MoE sends its remote picks too (i#1185). Returns the calls.
+    // be: run on that backend (Vulkan: the GPU forward declines the model
+    // and the per-op path sends the picks, i#1185; its own float order,
+    // so compared within rounding).
     const auto check = [&](const std::vector<std::byte>& img,
-                           std::size_t window, bool batched) {
-        INFO("window " << window << " batched " << batched);
+                           std::size_t window, bool batched,
+                           const char* be = nullptr) {
+        INFO("window " << window << " batched " << batched << " backend "
+                       << (be != nullptr ? be : "default"));
         const auto want = run(img, toks);
 
         auto g_srv = locus::gguf::GgufFile::parse(img);
@@ -1772,6 +1816,9 @@ TEST_CASE("a forward with remote experts is one process's bits",
                                              model.hparams().n_embd, window);
         if (window != 0) {
             REQUIRE(client.window() == window);
+        }
+        if (be != nullptr) {
+            model.use_backend(*locus::backend::find_backend(be));
         }
         model.set_remote_experts(&client);
         auto cache = model.make_cache();
@@ -1796,8 +1843,15 @@ TEST_CASE("a forward with remote experts is one process's bits",
         INFO("remote calls " << client.calls());
         REQUIRE(client.calls() > 0);  // the remote path ran
         REQUIRE(got.size() == want.size());
-        REQUIRE(std::memcmp(got.data(), want.data(),
-                            got.size() * sizeof(float)) == 0);
+        if (be == nullptr) {
+            REQUIRE(std::memcmp(got.data(), want.data(),
+                                got.size() * sizeof(float)) == 0);
+        } else {
+            for (std::size_t i = 0; i < got.size(); ++i) {
+                REQUIRE(got[i] ==
+                        Catch::Approx(want[i]).epsilon(1e-3).margin(1e-3));
+            }
+        }
         return client.calls();
     };
     // Window 1 makes start() read a host's reply before its next call
@@ -1808,5 +1862,12 @@ TEST_CASE("a forward with remote experts is one process's bits",
         const auto shared = qwen_image(+8.0f, /*zero_shared=*/false);
         CHECK(check(img, window, true) == check(img, window, false));
         CHECK(check(shared, window, true) == check(shared, window, false));
+        if (locus::backend::vulkan_backend_usable()) {
+            // The same picks reach the expert host on Vulkan.
+            CHECK(check(img, window, false, "vulkan") ==
+                  check(img, window, false));
+            CHECK(check(shared, window, true, "vulkan") ==
+                  check(shared, window, false));
+        }
     }
 }

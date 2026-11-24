@@ -435,6 +435,13 @@ class TransformerModel {
      */
     void set_remote_experts(RemoteExperts* r) { remote_experts_ = r; }
 
+    /** @returns Whether an MoE model has experts on other hosts
+     *  (set_remote_experts): a GPU whole-token forward, which never
+     *  calls moe_ffn, must decline it then (i#1185). */
+    bool has_remote_experts() const {
+        return remote_experts_ != nullptr && hp_.n_expert > 0;
+    }
+
     /** @returns Paged-cache layers: the loaded slice, or the arch's
      * own count (ArchSpec::cache_layers). */
     std::uint32_t cache_layer_count() const;
