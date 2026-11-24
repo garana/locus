@@ -591,8 +591,8 @@ TEST_CASE("the engine keys the disk prefix store on the vulkan expert "
 
     // i#1185: with experts on another host, the Vulkan forwards decline
     // the model (only moe_ffn sends the picks), and the disk tier is
-    // refused on Vulkan, whose K/V bits then differ from a local run's;
-    // on the CPU it is kept (the picks are one process's bits).
+    // refused on every backend: the picks are the expert hosts' bits,
+    // from backends this host does not know.
     struct NoneRemote : locus::model::RemoteExperts {
         bool remote(std::uint32_t, std::uint32_t) const override {
             return false;
@@ -622,6 +622,11 @@ TEST_CASE("the engine keys the disk prefix store on the vulkan expert "
         locus::kv::KvType::kF32);
     locus::engine::Engine::Config cfg4;
     cfg4.disk_prefix = store4;
+    CHECK_THROWS_AS(locus::engine::Engine(
+                        model, static_cast<locus::tok::TokenId>(-1), cfg4),
+                    std::invalid_argument);
+    // Without remote experts the CPU takes the tier.
+    model.set_remote_experts(nullptr);
     locus::engine::Engine engine4(
         model, static_cast<locus::tok::TokenId>(-1), cfg4);
     const auto id4 = engine4.submit({3, 7, 1}, 2);
@@ -1818,6 +1823,12 @@ TEST_CASE("a forward with remote experts is one process's bits",
             REQUIRE(client.window() == window);
         }
         if (be != nullptr) {
+            // These images are heap buffers, which no unmap hook clears
+            // from the Vulkan weight pool (keyed by host pointer): a
+            // later image at an earlier one's address would hit its
+            // stale GPU weights (seen on the Pi: window 1's shared image
+            // 5% off). A fresh pool for each Vulkan run.
+            locus::backend::vulkan_reset_state();
             model.use_backend(*locus::backend::find_backend(be));
         }
         model.set_remote_experts(&client);

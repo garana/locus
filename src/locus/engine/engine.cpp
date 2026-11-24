@@ -62,15 +62,15 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
                 "changes); set LOCUS_MOE_HYBRID=0 to use the disk tier");
         }
         // Experts on another host (i#1185): their picks are the expert
-        // host's bits. On the CPU those equal the local ones (one
-        // process's bits), but on a GPU backend the local picks, and on
-        // Vulkan the whole forward (the GPU forward declines the model),
-        // differ from a run without them, under the same key.
-        if (m.has_remote_experts() && !m.active_backend().ops.cpu) {
+        // host's bits, from whatever backend it runs, which this host
+        // does not know (and on Vulkan here the GPU forward declines the
+        // model), so K/V would differ from a local run's under the same
+        // key.
+        if (m.has_remote_experts()) {
             throw std::invalid_argument(
-                "--prefix-cache-dir: not supported with remote experts on "
-                "a GPU backend (their K/V bits differ from a local run's); "
-                "use a CPU backend or no disk tier");
+                "--prefix-cache-dir: not supported with remote experts "
+                "(their K/V bits come from the expert hosts' backends); "
+                "drop --remote-experts to use the disk tier");
         }
         cfg_.prefix_cache = true;
     }
