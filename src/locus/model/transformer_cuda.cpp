@@ -112,7 +112,13 @@ bool TransformerModel::cuda_forward_supported() const {
         const char* e = std::getenv("LOCUS_CUDA_FORWARD");
         return e != nullptr && std::string_view(e) == "0";
     }();
-    if (off || backend_->name != "cuda" || !spec_->plain_attention ||
+    // The plain llama attention, or qwen2's (q / k / v biases, NEOX
+    // RoPE; not qwen2vl's M-RoPE, whose text positions are not the
+    // sequence's), as Metal's forward takes (i#1196).
+    const bool attn_ok =
+        spec_->plain_attention ||
+        (spec_->qwen2_attention && hp_.rope_sections[0] == 0);
+    if (off || backend_->name != "cuda" || !attn_ok ||
         layer_begin_ != 0 || layer_end_ != hp_.n_layers ||
         hp_.norm_type != NormType::kRmsNorm || hp_.embd_norm ||
         hp_.n_kv_heads == 0 || out_w_.rows != hp_.n_vocab ||
@@ -123,6 +129,14 @@ bool TransformerModel::cuda_forward_supported() const {
         if (lay.is_moe()) {
             return false;
         }
+    }
+    // Weights the pool cannot keep resident page through it on every
+    // step, and the per-op path is faster then (Orpheus 3B Q4_K_M on a
+    // 2 GB card, i#1196): decline, with the MoE hybrid's margin.
+    const backend::Ops& op = backend_->ops;
+    if (op.pool_budget != nullptr &&
+        weight_bytes_ > op.pool_budget() / 10 * 9) {
+        return false;
     }
     return true;
 }
@@ -171,6 +185,8 @@ bool TransformerModel::cuda_forward(
     const std::uint32_t lo = rows_out.end == 0 ? 0 : rows_out.begin;
     const std::uint32_t R = (rows_out.end == 0 ? V : rows_out.end) - lo;
     const Mat head = R == V ? out_w_ : mat_rows(out_w_, lo, R);
+    // qwen2_attention: NEOX RoPE (qwen2moe_attention's rope_neox_yarn).
+    const bool neox = spec_->qwen2_attention;
 
     // Host tables: embeddings, RoPE (cos, sin) pairs, each token's row
     // offset in the mirror, and the attention's block tables (one per
@@ -187,8 +203,13 @@ bool TransformerModel::cuda_forward(
             op.dequant_row(embd_, static_cast<std::uint32_t>(toks[t]),
                            {xh.data() + std::size_t{t} * E, E});
         }
-        rope_norm_table(hd, pos[t], hp_.rope_freq_base, rope_factors(),
-                        {cs.data() + std::size_t{t} * hd, hd});
+        if (neox) {
+            rope_neox_table(hd, pos[t], hp_.rope_freq_base, Yarn{},
+                            {cs.data() + std::size_t{t} * hd, hd});
+        } else {
+            rope_norm_table(hd, pos[t], hp_.rope_freq_base, rope_factors(),
+                            {cs.data() + std::size_t{t} * hd, hd});
+        }
         rows[t] = std::uint64_t{s.blocks[pos[t] / bt]} * cache.block_floats() +
                   std::uint64_t{pos[t] % bt} * kvd;
         auto [it, fresh] = table_of.try_emplace(
@@ -244,13 +265,26 @@ bool TransformerModel::cuda_forward(
         const Layer& lay = layers_[l];
         const float* an = cuda_dev_const(lay.attn_norm.data(), E);
         const float* fn = cuda_dev_const(lay.ffn_norm.data(), E);
+        // qwen2's q / k / v biases, added after each projection as
+        // qwen2moe_attention does; a missing one adds nothing.
+        const auto bias = [&](float* d, std::span<const float> bh,
+                              std::size_t width) {
+            if (bh.empty()) {
+                return true;
+            }
+            const float* db = cuda_dev_const(bh.data(), bh.size());
+            return db != nullptr && bh.size() == width &&
+                   cuda_dev_add_rows(d, db, width, n);
+        };
         ok = an != nullptr && fn != nullptr &&
              cuda_dev_rmsnorm(b.x, an, eps, b.xb, E, n) &&
              cuda_dev_matvec_batch(lay.wq, b.xb, b.q, n, b.scratch) &&
              cuda_dev_matvec_batch(lay.wk, b.xb, b.k, n, b.scratch) &&
              cuda_dev_matvec_batch(lay.wv, b.xb, b.v, n, b.scratch) &&
-             cuda_dev_rope(b.q, b.cs, H, hd, qd, n) &&
-             cuda_dev_rope(b.k, b.cs, KV, hd, kvd, n) &&
+             bias(b.q, lay.wq_bias, qd) && bias(b.k, lay.wk_bias, kvd) &&
+             bias(b.v, lay.wv_bias, kvd) &&
+             cuda_dev_rope(b.q, b.cs, H, hd, qd, n, neox) &&
+             cuda_dev_rope(b.k, b.cs, KV, hd, kvd, n, neox) &&
              cuda_dev_kv_scatter(
                  b.k, b.v, n, static_cast<std::uint32_t>(kvd),
                  static_cast<const std::uint64_t*>(b.rows),

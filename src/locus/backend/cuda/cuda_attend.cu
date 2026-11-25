@@ -314,7 +314,8 @@ bool cuda_kv_attend(const KvAttend& a) {
         meta[a.n_q + i] = tab;
         max_pos = std::max(max_pos, pos + 1);
     }
-    if ((group != 1 && group != 2 && group != 4 && group != 8) ||
+    // Groups 1 to 8: Qwen2.5-0.5B's is 7 and Llama 3.2 3B's 3 (i#1196).
+    if (group < 1 || group > 8 || a.n_heads % a.n_kv_heads != 0 ||
         a.head_dim > kAttendThreads ||
         kAttendThreads % a.head_dim != 0) {
         return false;  // a shape the kernel does not take: host attends
@@ -380,7 +381,11 @@ bool cuda_kv_attend(const KvAttend& a) {
     switch (group) {
         case 1: partial(gqa_attend_partial<1>); break;
         case 2: partial(gqa_attend_partial<2>); break;
+        case 3: partial(gqa_attend_partial<3>); break;
         case 4: partial(gqa_attend_partial<4>); break;
+        case 5: partial(gqa_attend_partial<5>); break;
+        case 6: partial(gqa_attend_partial<6>); break;
+        case 7: partial(gqa_attend_partial<7>); break;
         case 8: partial(gqa_attend_partial<8>); break;
         default: return false;  // checked above; other sizes: host
     }

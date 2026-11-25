@@ -4141,7 +4141,7 @@ __global__ void dev_rmsnorm_kernel(const float* __restrict__ x,
 __global__ void dev_rope_kernel(float* __restrict__ x,
                                 const float* __restrict__ cs,
                                 std::uint32_t n_heads, std::uint32_t hd,
-                                std::size_t stride) {
+                                std::size_t stride, bool neox) {
     const std::uint32_t t = blockIdx.y;
     const std::uint32_t pairs = hd / 2;
     const std::uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4149,12 +4149,26 @@ __global__ void dev_rope_kernel(float* __restrict__ x,
         return;
     }
     const std::uint32_t h = k / pairs, p = k % pairs;
-    float* v = x + t * stride + std::size_t{h} * hd + 2 * p;
+    // rope_norm pairs (2p, 2p + 1); NEOX pairs (p, p + hd/2) (i#1196).
+    float* head = x + t * stride + std::size_t{h} * hd;
+    float* v0 = neox ? head + p : head + 2 * p;
+    float* v1 = neox ? head + p + pairs : head + 2 * p + 1;
     const float c = cs[(std::size_t{t} * pairs + p) * 2];
     const float s = cs[(std::size_t{t} * pairs + p) * 2 + 1];
-    const float x0 = v[0], x1 = v[1];
-    v[0] = __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s));
-    v[1] = __fadd_rn(__fmul_rn(x0, s), __fmul_rn(x1, c));
+    const float x0 = *v0, x1 = *v1;
+    *v0 = __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s));
+    *v1 = __fadd_rn(__fmul_rn(x0, s), __fmul_rn(x1, c));
+}
+
+/** x[t * width + i] += b[i] for every row t (grid.y). */
+__global__ void dev_add_rows_kernel(float* __restrict__ x,
+                                    const float* __restrict__ b,
+                                    std::size_t width) {
+    const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (i < width) {
+        float* row = x + std::size_t{blockIdx.y} * width;
+        row[i] = __fadd_rn(row[i], b[i]);
+    }
 }
 
 /** gate = gate / (1 + exp(-gate)) * up (silu_mul). */
@@ -4315,10 +4329,17 @@ bool cuda_dev_rmsnorm(const float* dx, const float* dw, float eps,
 
 bool cuda_dev_rope(float* dx, const float* dcs, std::uint32_t n_heads,
                    std::uint32_t hd, std::size_t stride,
-                   std::uint32_t tokens) {
+                   std::uint32_t tokens, bool neox) {
     const std::size_t work = std::size_t{n_heads} * (hd / 2);
-    dev_rope_kernel<<<dim3(blocks_for(work), tokens), 256>>>(dx, dcs, n_heads,
-                                                            hd, stride);
+    dev_rope_kernel<<<dim3(blocks_for(work), tokens), 256>>>(
+        dx, dcs, n_heads, hd, stride, neox);
+    return cuda_ok(cudaGetLastError());
+}
+
+bool cuda_dev_add_rows(float* dx, const float* db, std::size_t width,
+                       std::uint32_t tokens) {
+    dev_add_rows_kernel<<<dim3(blocks_for(width), tokens), 256>>>(dx, db,
+                                                                 width);
     return cuda_ok(cudaGetLastError());
 }
 

@@ -129,22 +129,22 @@ Automatic: the CPU backend `sse4` (its AVX build). locus does not move
 to CUDA by itself: pass `--backend cuda`.
 
 Recommended: `--backend cuda` for dense models that fit in 2 GB (1.7x
-to 2.2x the CPU's decode, 1.2x to 3.9x its prefill); the CPU default
+to 2.2x the CPU's decode, 2.3x to 3.9x its prefill); the CPU default
 for larger ones.
 
-| workload                         | default (CPU) | llama.cpp CPU | `--backend cuda` | llama.cpp CUDA | source     |
-|----------------------------------|---------------|---------------|------------------|----------------|------------|
-| prefill 512, Llama 1B Q4_K_M     | 31.9          | 46.2          | 125.8            | 499.9          | #412, #411 |
-| decode, Llama 3.2 1B Q4_K_M      | 16.1          | 17.8          | 27.9             | 31.7           | #412, #411 |
-| prefill 512, Llama 1B Q8_0       | 38.4          | 44.0          | 90.6             | 500.1          | #412, #411 |
-| decode, Llama 3.2 1B Q8_0        | 11.6          | 11.9          | 25.8             | 36.2           | #412, #411 |
-| prefill 512, Qwen2.5-0.5B Q8_0   | 86.7          | 115.3         | 106.1            | 1195.6         | #412, #411 |
-| decode, Qwen2.5-0.5B Q8_0        | 25.9          | 27.9          | 44.0             | 80.9           | #412, #411 |
-| prefill 512, Orpheus 3B Q4_K_M   | 12.4          | 15.9          | 23.1             | does not load  | #412, #411 |
-| decode, Orpheus 3B Q4_K_M        | 6.5           | 7.0           | 1.6              | does not load  | #412, #411 |
-| prefill 512, Qwen1.5-MoE Q4_K_M  | 14.2          | 20.1          | does not fit     | not run        | #412       |
-| decode, Qwen1.5-MoE Q4_K_M       | 8.1           | 9.1           | does not fit     | not run        | #412       |
-| LTX-Video 2B, one DiT step       | 75.3 s        | PyTorch 85 s  | not run          | not run        | #982       |
+| workload                         | default (CPU) | llama.cpp CPU | `--backend cuda` | llama.cpp CUDA | source      |
+|----------------------------------|---------------|---------------|------------------|----------------|-------------|
+| prefill 512, Llama 3.2 1B Q4_K_M | 31.9          | 46.2          | 125.8            | 499.9          | #412, #411  |
+| decode, Llama 3.2 1B Q4_K_M      | 16.1          | 17.8          | 27.9             | 31.7           | #412, #411  |
+| prefill 512, Llama 3.2 1B Q8_0   | 38.4          | 44.0          | 90.6             | 500.1          | #412, #411  |
+| decode, Llama 3.2 1B Q8_0        | 11.6          | 11.9          | 25.8             | 36.2           | #412, #411  |
+| prefill 512, Qwen2.5-0.5B Q8_0   | 86.7          | 115.3         | 196.7            | 1195.6         | #412, #1196 |
+| decode, Qwen2.5-0.5B Q8_0        | 25.9          | 27.9          | 53.1             | 80.9           | #412, #1196 |
+| prefill 512, Orpheus 3B Q4_K_M   | 12.4          | 15.9          | 24.0             | does not load  | #412, #1196 |
+| decode, Orpheus 3B Q4_K_M        | 6.5           | 7.0           | 1.6              | does not load  | #412, #1196 |
+| prefill 512, Qwen1.5-MoE Q4_K_M  | 14.2          | 20.1          | does not fit     | not run        | #412        |
+| decode, Qwen1.5-MoE Q4_K_M       | 8.1           | 9.1           | does not fit     | not run        | #412        |
+| LTX-Video 2B, one DiT step       | 75.3 s        | PyTorch 85 s  | not run          | not run        | #982        |
 
 - Measured on main at 4fb4f9d8 against llama.cpp e8e6c7a (a CPU build,
   4 threads, and a CUDA build for sm_50), median of 3 runs. Decode
@@ -155,11 +155,15 @@ for larger ones.
   GB (one module out) it ran 32% to 40% slower on both. The MoE rows
   have the 9.5 GB file in the page cache; a cold first prefill runs at
   8.5.
-- On CUDA, prefill is at 0.09x to 0.25x of llama.cpp (#1200). Decode
-  is at 0.88x on Q4_K_M, 0.71x on Q8_0 (#1197) and 0.54x on Qwen2.5,
-  which runs per op (#1196).
+- On CUDA, prefill is at 0.16x to 0.25x of llama.cpp (#1200). Decode
+  is at 0.88x on Q4_K_M, 0.71x on Q8_0 (#1197) and 0.66x on Qwen2.5.
+  The Qwen2.5 and Orpheus CUDA rows are of #1196 (Qwen2 on the
+  one-submit forward).
 - Orpheus (1.94 GB of weights) does not fit the 2 GB card: llama.cpp
-  fails to load it, and locus pages its weights (slower than the CPU).
+  fails to load it, and locus runs it per op, paging its weights
+  (slower than the CPU). The one-submit forward declines a model whose
+  weights exceed 90% of the weight pool, as paging through it on every
+  step is slower still (Orpheus prefill 19.3, decode 1.5).
 - `LOCUS_CPU_FAST=1` gained 1 to 7% on the dense rows (#1059), near the
   noise: the default stays, as it reproduces the goldens. On the DiT
   step it cuts the self attention (12.2 to 10.4 s, #1062) but not the
@@ -183,10 +187,11 @@ Recommended: no flags; leave `--kv-type` at f32 and `--engines` at 1.
 
 | workload                         | command               | number                                                                  | source     |
 |----------------------------------|-----------------------|-------------------------------------------------------------------------|------------|
-| text, Llama 3.2 1B Q4_K_M        | default               | prefill 31 to 33, decode 7.6 to 7.7 (llama.cpp: 66, 9.6)                | #1059      |
-| text, Qwen2.5-0.5B Q8_0          | default               | prefill 63 to 75, decode 14.5 to 14.9 (llama.cpp: 229, 13.0)            | #1059      |
+| text, Llama 3.2 1B Q4_K_M        | default               | prefill 34 to 38, decode 10.7 to 11.0 (llama.cpp: 66, 8.1)              | #412       |
+| text, Llama 3.2 1B Q8_0          | default               | prefill 34 to 35, decode 6.9 (llama.cpp: 52, 6.0)                       | #412       |
+| text, Qwen2.5-0.5B Q8_0          | default               | prefill 71 to 89, decode 16.6 to 17.5 (llama.cpp: 205, 12.1)            | #412       |
 | text, Qwen2.5-0.5B Q8_0          | `LOCUS_CPU_FAST=1`    | prefill 124 to 127, decode 15.4 to 15.8 (llama.cpp: 226, 13.6)          | #1076      |
-| text on V3D                      | do not                | 1B Q4_K_M prefill 1.2, decode 0.7 (neon: 24.6, 10.6)                    | #607, #612 |
+| text on V3D                      | do not                | 1B Q4_K_M prefill 1.3, decode 0.7 (neon: 35, 10.7)                      | #412       |
 | MoE, DeepSeek-V2-Lite Q4_K_M     | default               | 15 decode tokens in 34.6 s; Vulkan 4x slower                            | #679, #252 |
 | speech, Orpheus 3B Q4_K_M + SNAC | default, `--ctx 2048` | real-time factor 27 to 29, first audio after 56 to 70 s                 | #245, #984 |
 | speech on V3D                    | does not run          | the weights exceed V3D's 1.98 GiB heap                                  | #245, #976 |
@@ -196,10 +201,23 @@ Recommended: no flags; leave `--kv-type` at f32 and `--engines` at 1.
 | KV cache, Llama 1B Q4_K_M        | `--kv-type f32`       | prefill 33.7, decode 8.1 (q8: 25.2, 8.3; q4: 23.6, 8.1; f16: 20.6, 7.4) | #1059      |
 | engine core pinning              | not offered           | no gain on 4 cores with 2 engines                                       | #1015      |
 
-- Prefill trails llama.cpp at 0.3x to 0.5x by default; on Q8_0,
-  `LOCUS_CPU_FAST=1` brings it to 0.56x (#1076). The decode columns
-  differ in setup: locus decodes after its prompt, llama-bench's tg128
-  from an empty context.
+- The text rows: main at 2f96456b against llama.cpp a956a85 (a CPU
+  build, 4 threads), the range of 3 runs; prefill is a prompt of 505
+  or 506 tokens, decode 127 tokens after "1, 2, 3, 4, 5,". bitcoind and
+  other processes left about 1.8 GB free, and the prefill runs vary up
+  to 20% (Qwen2.5 71 to 89).
+- At the medians, prefill trails llama.cpp at 0.35x to 0.66x by
+  default (#1076); on Q8_0, `LOCUS_CPU_FAST=1` brought it to 0.56x
+  (#1076, an older run). Decode leads it by 15% to 39% at the medians
+  (15% to 45% over the runs); the decode columns differ in setup:
+  locus decodes after its prompt, llama-bench's tg128 from an empty
+  context.
+- On V3D, the 1B Q8_0 prefill is killed out of memory (4 GB shared with
+  the CPU), and Orpheus 3B fails to allocate its heap, as speech on
+  V3D does.
+- Orpheus 3B as text ran at prefill 2.3 to 2.8 and decode 0.4 to 1.8
+  here, against llama.cpp's 18.0 and 3.65 on the same host: not yet
+  explained, so it has no row.
 - `--kv-type q8` only to fit a longer context: it keeps the decode
   speed and costs about 25% of the prefill.
 - `LOCUS_CPU_FAST`: Q8_0 takes the dotprod fast path (four
