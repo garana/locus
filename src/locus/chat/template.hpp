@@ -42,6 +42,15 @@ class ChatTemplate {
         kLlama2Sys,
         kLlama2SysBos,
         kLlama2SysStrip,
+        // Mistral's [INST] families, llama.cpp's five (i#1204): v1 (a
+        // space before [INST] and [/INST]), v3 (assistant text
+        // trimmed), v3-tekken (no space after [INST]), and v7 / v7-tekken
+        // ([SYSTEM_PROMPT]...[/SYSTEM_PROMPT]; v7-tekken by name only).
+        kMistralV1,
+        kMistralV3,
+        kMistralV3Tekken,
+        kMistralV7,
+        kMistralV7Tekken,
         kLlama3,    // <|start_header_id|>...<|eot_id|>
         kChatML,    // <|im_start|>...<|im_end|> (Qwen and kin)
         kZephyr,    // <|user|> ... </s> (TinyLlama-chat)

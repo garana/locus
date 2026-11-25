@@ -25,7 +25,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Tokenizers:** SentencePiece, byte-level BPE (gpt2, llama3 and
   qwen2 pretokenizers), the T5 unigram model and BERT's WordPiece,
   with chat templates (the GGUF's, or `--chat-template NAME` for a GGUF
-  that has none).
+  that has none or one read as another family), llama.cpp's families
+  including the Mistral ones.
 - **Backends:** neon, avx2, sse4 and scalar on the CPU; vulkan (the
   whole forward pass on the GPU); cuda (the whole forward pass on the
   GPU for dense models that fit, prefill through cuBLAS); metal

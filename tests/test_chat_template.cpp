@@ -39,6 +39,25 @@ TEST_CASE("template family detection", "[chat]") {
             Family::kLlama2SysBos);
     REQUIRE(detect("<<SYS>> bos_token + '[INST] ' + content.strip()")
                 .family() == Family::kLlama2SysStrip);
+    // Mistral's families first, in llama.cpp's order (i#1204), on the
+    // fragments its rules key on (the official templates of
+    // tests/test-chat-template.cpp): v7 by [SYSTEM_PROMPT] even with a
+    // Llama 2 marker; v1 by ' [INST] ' + system_message; v3 and
+    // v3-tekken by [AVAILABLE_TOOLS], tekken when "[INST]" is quoted.
+    REQUIRE(detect("{{ '[SYSTEM_PROMPT] ' }}{{ '[INST] ' }}<<SYS>>")
+                .family() == Family::kMistralV7);
+    REQUIRE(detect("{{- ' [INST] ' + system_message + '\\n\\n' + "
+                   "message['content'] + ' [/INST]' }}")
+                .family() == Family::kMistralV1);
+    REQUIRE(detect("{{- \"[AVAILABLE_TOOLS] [\" }}{{- \"[INST] \" + "
+                   "message[\"content\"] + \"[/INST]\" }}")
+                .family() == Family::kMistralV3);
+    REQUIRE(detect("{{- \"[AVAILABLE_TOOLS][\" }}{{- \"[INST]\" + "
+                   "message[\"content\"] + \"[/INST]\" }}")
+                .family() == Family::kMistralV3Tekken);
+    // An [INST] template with neither keeps the Llama 2 rules.
+    REQUIRE(detect("{{ '[INST] ' + message['content'] + ' [/INST]' }}")
+                .family() == Family::kLlama2);
     REQUIRE(detect("...<|user|>...").family() ==
             Family::kZephyr);
     REQUIRE(detect("...\xef\xbd\x9cUser\xef\xbd\x9c...")
@@ -86,9 +105,11 @@ TEST_CASE("a template name picks its family, as llama.cpp's names do",
     std::string listed;
     for (const Family f :
          {Family::kPlain, Family::kLlama2, Family::kLlama2Sys,
-          Family::kLlama2SysBos, Family::kLlama2SysStrip, Family::kLlama3,
-          Family::kChatML, Family::kZephyr, Family::kDeepSeek,
-          Family::kDeepSeek2, Family::kDeepSeekCoder}) {
+          Family::kLlama2SysBos, Family::kLlama2SysStrip, Family::kMistralV1,
+          Family::kMistralV3, Family::kMistralV3Tekken, Family::kMistralV7,
+          Family::kMistralV7Tekken, Family::kLlama3, Family::kChatML,
+          Family::kZephyr, Family::kDeepSeek, Family::kDeepSeek2,
+          Family::kDeepSeekCoder}) {
         const ChatTemplate t(f);
         const auto got = ChatTemplate::from_name(t.name());
         REQUIRE(got.has_value());
@@ -130,6 +151,39 @@ TEST_CASE("a llama2-sys-strip chat tokenizes to llama.cpp's ids",
         2211,  29889, 518,   29914, 25580, 29962, 6716,  29892, 1023,
         29892, 2211,  29889, 2,     518,   25580, 29962, 2567,  2302,
         1623,  515,   2211,  29889, 518,   29914, 25580, 29962};
+    CHECK(tok->encode_literal(p.text, true, p.content) == want);
+}
+
+TEST_CASE("a mistral-v3 chat tokenizes to llama.cpp's ids",
+          "[chat][mistral]") {
+    // i#1204: Mistral-7B-Instruct-v0.3 Q4_K_M (bartowski, 61fd4167). Its
+    // GGUF template is the old '[INST] ' form, which locus and llama.cpp
+    // both read as llama2, so the family is picked by name, as
+    // locus-server --chat-template mistral-v3 does. The ids are llama.cpp
+    // e8e6c7a's llama-tokenize of its own mistral-v3 rendering; [INST],
+    // [/INST] and </s> are control tokens 3, 4 and 2.
+    const std::string path =
+        std::string(LOCUS_SOURCE_DIR) +
+        "/tests/models/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("Mistral-7B-Instruct-v0.3-Q4_K_M.gguf absent");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    REQUIRE(ChatTemplate::from_gguf(g).family() == Family::kLlama2);
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const auto t = ChatTemplate::from_name("mistral-v3");
+    REQUIRE(t.has_value());
+    const std::vector<Message> conv = {
+        {"system", "You are a helpful assistant."},
+        {"user", "Count from one to three."},
+        {"assistant", "  One, two, three.  "},
+        {"user", "Now count down from three."}};
+    const auto p = t->render(conv);
+    const std::vector<locus::tok::TokenId> want = {
+        1,     3,     29473, 1763, 1228,  1032,  11633, 14660, 29491,
+        781,   781,   3840,  1245, 1392,  1066,  2480,  29491, 4,
+        29473, 3155,  29493, 1757, 29493, 2480,  29491, 2,     3,
+        29473, 3729,  2881,  1828, 1245,  2480,  29491, 4};
     CHECK(tok->encode_literal(p.text, true, p.content) == want);
 }
 
@@ -184,6 +238,42 @@ TEST_CASE("template rendering", "[chat]") {
         CHECK(ChatTemplate(Family::kLlama2Sys).apply(conv, false) ==
               ChatTemplate(Family::kLlama2Sys).apply(conv, true));
     }
+    SECTION("mistral families render as llama.cpp's") {
+        // The same conversation and llama.cpp e8e6c7a's expected_output
+        // strings for its mistral 'v1', 'v3', 'v3-tekken' and 'v7'
+        // templates (i#1204). v7-tekken has no case there: it is v7
+        // without the spaces (LLM_CHAT_TEMPLATE_MISTRAL_V7_TEKKEN).
+        const std::vector<Message> conv = {
+            {"system", "You are a helpful assistant"},
+            {"user", "Hello"},
+            {"assistant", "Hi there"},
+            {"user", "Who are you"},
+            {"assistant", "   I am an assistant   "},
+            {"user", "Another question"}};
+        CHECK(ChatTemplate(Family::kMistralV1).apply(conv) ==
+              " [INST] You are a helpful assistant\n\nHello [/INST] Hi "
+              "there</s> [INST] Who are you [/INST]    I am an assistant   "
+              "</s> [INST] Another question [/INST]");
+        CHECK(ChatTemplate(Family::kMistralV3).apply(conv) ==
+              "[INST] You are a helpful assistant\n\nHello[/INST] Hi there"
+              "</s>[INST] Who are you[/INST] I am an assistant</s>[INST] "
+              "Another question[/INST]");
+        CHECK(ChatTemplate(Family::kMistralV3Tekken).apply(conv) ==
+              "[INST]You are a helpful assistant\n\nHello[/INST]Hi there"
+              "</s>[INST]Who are you[/INST]   I am an assistant   </s>"
+              "[INST]Another question[/INST]");
+        CHECK(ChatTemplate(Family::kMistralV7).apply(conv) ==
+              "[SYSTEM_PROMPT] You are a helpful assistant[/SYSTEM_PROMPT]"
+              "[INST] Hello[/INST] Hi there</s>[INST] Who are you[/INST]    "
+              "I am an assistant   </s>[INST] Another question[/INST]");
+        CHECK(ChatTemplate(Family::kMistralV7Tekken).apply(conv) ==
+              "[SYSTEM_PROMPT]You are a helpful assistant[/SYSTEM_PROMPT]"
+              "[INST]Hello[/INST]Hi there</s>[INST]Who are you[/INST]   I "
+              "am an assistant   </s>[INST]Another question[/INST]");
+        // No assistant header: the model answers after [/INST].
+        CHECK(ChatTemplate(Family::kMistralV3).apply(conv, false) ==
+              ChatTemplate(Family::kMistralV3).apply(conv, true));
+    }
     SECTION("plain concatenates content") {
         ChatTemplate t(Family::kPlain);
         const std::vector<Message> msgs = {{"user", "a"},
@@ -234,9 +324,11 @@ TEST_CASE("render marks each message's content in every family",
                                         {"user", "again"}};
     for (const Family f :
          {Family::kPlain, Family::kLlama2, Family::kLlama2Sys,
-          Family::kLlama2SysBos, Family::kLlama2SysStrip, Family::kLlama3,
-          Family::kChatML, Family::kZephyr, Family::kDeepSeek,
-          Family::kDeepSeek2, Family::kDeepSeekCoder}) {
+          Family::kLlama2SysBos, Family::kLlama2SysStrip, Family::kMistralV1,
+          Family::kMistralV3, Family::kMistralV3Tekken, Family::kMistralV7,
+          Family::kMistralV7Tekken, Family::kLlama3, Family::kChatML,
+          Family::kZephyr, Family::kDeepSeek, Family::kDeepSeek2,
+          Family::kDeepSeekCoder}) {
         const ChatTemplate t(f);
         INFO("family " << t.name());
         const auto p = t.render(multi);
