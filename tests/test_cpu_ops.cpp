@@ -2751,7 +2751,8 @@ TEST_CASE("sgemm_batch matches the scalar matvec within rounding",
 
 // i#1198: the activation quantize runs in SSE2 on x86-64; it must give
 // the scalar form's bits: random blocks, a zero block, NaN and inf
-// inputs, products on a .5 tie (round to even) and tiny values.
+// inputs, products on a .5 tie (round to even), tiny values, an amax
+// near 1e-38 (1 / d overflows, so x * id is +-inf) and one of 1e-45.
 TEST_CASE("quantize_activation_q8_0 gives the scalar form's bits", "[ops]") {
     const auto scalar = [](const float* xb, float& d_out, std::int8_t* qs) {
         float amax = 0.0f;
@@ -2791,6 +2792,11 @@ TEST_CASE("quantize_activation_q8_0 gives the scalar form's bits", "[ops]") {
     x[160 + 10] = -inf;
     for (int j = 0; j < 32; ++j) {
         x[192 + j] = nan;  // block 6: all NaN
+        // Block 7: amax about 1e-38, so 1 / d overflows to inf and each
+        // nonzero x * id is +-inf (the cast keeps the low byte).
+        x[224 + j] = 1e-38f * dist(rng);
+        // Block 8: amax 1e-45, so d rounds to 0 and id is 0.
+        x[256 + j] = j % 2 == 0 ? 1e-45f : -1e-45f;
     }
     std::vector<float> d(nb), want_d(nb);
     std::vector<std::int8_t> qs(nb * 32), want_qs(nb * 32);

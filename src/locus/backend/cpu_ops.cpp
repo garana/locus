@@ -2132,9 +2132,10 @@ struct BlockQ8_0Act {
  *
  * On x86-64 the block runs in SSE2 (i#1198: the scalar form was 8.6% of
  * a CPU prefill): _mm_max_ps with the running max second skips a NaN as
- * std::max does, the multiply is the same, and _mm_cvtps_epi32 rounds to
+ * std::max does, the multiply is the same, _mm_cvtps_epi32 rounds to
  * nearest even under the default rounding mode as std::nearbyint does,
- * so the bits are the scalar form's.
+ * and the int8 cast keeps the low byte as x86's scalar cast does, so the
+ * bits are the scalar form's on x86.
  */
 inline void quantize_block32_act(const float* xb, float* d_out,
                                  std::int8_t* qs) {
@@ -2159,18 +2160,24 @@ inline void quantize_block32_act(const float* xb, float* d_out,
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     *d_out = f16_to_f32(f32_to_f16(d));
 #if defined(__x86_64__) && defined(__SSE2__)
+    // The int8 cast keeps the low byte: masked to 0..255, then packed
+    // signed to 16 bits (exact) and unsigned to 8, so nothing saturates.
+    // That matters when 1 / d overflows (amax under about 3.7e-37):
+    // x * id is then +-inf, the conversion gives 0x80000000, and the
+    // scalar's cast keeps its low byte, 0.
     const __m128 vid = _mm_set1_ps(id);
+    const __m128i lowb = _mm_set1_epi32(0xff);
     __m128i q[8];
     for (int i = 0; i < 8; ++i) {
         const __m128 p = _mm_mul_ps(v[i], vid);
         const __m128i ok = _mm_castps_si128(_mm_cmpord_ps(p, p));
-        q[i] = _mm_and_si128(_mm_cvtps_epi32(p), ok);
+        q[i] = _mm_and_si128(_mm_and_si128(_mm_cvtps_epi32(p), ok), lowb);
     }
     for (int h = 0; h < 2; ++h) {
         const __m128i a = _mm_packs_epi32(q[4 * h], q[4 * h + 1]);
         const __m128i b = _mm_packs_epi32(q[4 * h + 2], q[4 * h + 3]);
         _mm_storeu_si128(reinterpret_cast<__m128i*>(qs + 16 * h),
-                         _mm_packs_epi16(a, b));
+                         _mm_packus_epi16(a, b));
     }
 #else
     for (int j = 0; j < 32; ++j) {
