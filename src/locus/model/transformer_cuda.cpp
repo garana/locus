@@ -132,10 +132,12 @@ bool TransformerModel::cuda_forward_supported() const {
     }
     // Weights the pool cannot keep resident page through it on every
     // step, and the per-op path is faster then (Orpheus 3B Q4_K_M on a
-    // 2 GB card, i#1196): decline, with the MoE hybrid's margin.
+    // 2 GB card, i#1196: 2.08 GB of weights, an 0.83 GB budget):
+    // decline. No margin: Llama 3.2 1B Q8_0 (1.31 GB) fills 96% of its
+    // 1.37 GB budget and runs resident; a 10% margin sent it per op
+    // (decode 25.8 to 23.6 tok/s).
     const backend::Ops& op = backend_->ops;
-    if (op.pool_budget != nullptr &&
-        weight_bytes_ > op.pool_budget() / 10 * 9) {
+    if (op.pool_budget != nullptr && weight_bytes_ > op.pool_budget()) {
         return false;
     }
     return true;

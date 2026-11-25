@@ -2973,8 +2973,7 @@ class WeightPool {
             std::size_t free_b = 0, total_b = 0;
             budget_ = cuda_ok(cudaMemGetInfo(&free_b, &total_b))
                           ? free_b / 5 * 4  // ~80% of free VRAM
-                          : (std::size_t{512} << 20);
-        }
+                          : (std::size_t{512} << 20);        }
     }
 
     /** Reserves room (evicting LRU) then cudaMallocs `bytes`; nullptr
@@ -3576,7 +3575,9 @@ constexpr std::size_t kGemmMaxBytes = std::size_t{256} << 20;
  * the tile, with its own sum order, so not the per-token kernel's bits.
  * LOCUS_CUDA_GEMM=0 turns it off (a numeric mode: the disk prefix key
  * holds it). Same layouts as launch_tile.
- * @returns false, launching nothing, when the GEMM does not apply.
+ * @returns false when the GEMM does not apply (launching nothing), or
+ *     when cublasSgemm fails after the dequantize ran; either way the
+ *     caller's tile kernel then writes all of out.
  */
 bool launch_gemm(gguf::TensorType type, const std::uint8_t* w,
                  const float* x, float* out, std::uint32_t rows,
