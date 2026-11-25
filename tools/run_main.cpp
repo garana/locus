@@ -272,9 +272,13 @@ int main(int argc, char** argv) {
 
         using clock = std::chrono::steady_clock;
         if (args.warmup && !ids.empty()) {
-            // Throwaway request: first-touch weight uploads and
-            // pipeline warm-up land here, not in the timed run.
-            engine.submit({ids.front()}, 1);
+            // Throwaway request: first-touch weight uploads, pipeline
+            // warm-up and the batched prefill's scratch land here, not
+            // in the timed run. The prompt reversed: the same length,
+            // so the same prefill path, and no prefix the timed run
+            // could reuse.
+            std::vector<locus::tok::TokenId> rev(ids.rbegin(), ids.rend());
+            engine.submit(rev, 1);
             engine.run_to_completion();
         }
         const std::uint32_t conc = std::max(1u, args.concurrent);
