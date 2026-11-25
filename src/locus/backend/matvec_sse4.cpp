@@ -699,23 +699,11 @@ __m128i lane_pairs_mask() {
                          7, 15);
 }
 
-/** Adds scale * s (8 int16 per-lane sums) to the int32 lanes lo (0..3)
- *  and hi (4..7). */
-void add_scaled_lanes(__m128i s, int scale, __m128i& lo, __m128i& hi) {
-    // madd on s interleaved with zeros: each int32 is s_e * scale + 0 *
-    // (scale's high half), the product exactly, one fast instruction
-    // where mullo_epi32 is two slow ones (i#719). Signed scales (Q6_K's
-    // int8) work too: the zero cancels the sign-extended high half.
-    const __m128i scv = _mm_set1_epi32(scale);
-    const __m128i z = _mm_setzero_si128();
-    lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(s, z), scv));
-    hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(s, z), scv));
-}
-
 /** Adds c0 * s0 + c1 * s1 (8 int16 per-lane sums each, signed scales)
  *  to the int32 lanes lo (0..3) and hi (4..7): s0 and s1 interleaved,
  *  one madd by the pair (c0, c1) gives both products of a lane, exactly
- *  (|s| < 2^15, |c| <= 128). */
+ *  (|s| < 2^15, |c| <= 128), one fast instruction where mullo_epi32 is
+ *  two slow ones (i#719). */
 void add_scaled_two(__m128i s0, __m128i s1, int c0, int c1, __m128i& lo,
                     __m128i& hi) {
     const __m128i scv = _mm_set1_epi32(static_cast<int>(
@@ -1730,13 +1718,19 @@ void row_q4_k_q8k_sse4_xt(const std::byte* row, const Q8kAct* a,
 /**
  * row_k_q8k_sse4 for a Q6_K row and kT tokens: the block's 6-bit codes
  * decoded and shuffled once, each token's integer lane sums and f32
- * sums in the one-token kernel's order.
+ * sums in the one-token kernel's order. A token's offset terms come
+ * from its q6off when set (q6_k_offsets_sse4), else are computed here:
+ * the same integers either way.
  */
 template <int kT>
 void row_q6_k_q8k_sse4_xt(const std::byte* row, const Q8kAct* a,
                           std::size_t nb, float* out) {
     const __m128i il = lane_pairs_mask();
     const __m128i u1 = _mm_set1_epi8(1);
+    bool have_off = true;
+    for (int t = 0; t < kT; ++t) {
+        have_off = have_off && a[t].q6off != nullptr;
+    }
     float sums[kT][8] = {};
     for (std::size_t b = 0; b < nb; ++b) {
         const std::byte* blk = row + b * 210;
@@ -1748,18 +1742,31 @@ void row_q6_k_q8k_sse4_xt(const std::byte* row, const Q8kAct* a,
             acc_lo[t] = _mm_setzero_si128();
             acc_hi[t] = _mm_setzero_si128();
         }
-        for (int j = 0; j < 16; ++j) {
-            const __m128i rv = _mm_shuffle_epi8(
+        // Group j's 8 per-lane int16 sums of (raw6 - 32) * q8 for token t.
+        const auto group = [&](__m128i rv, int t, int j) {
+            const __m128i qv = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(a[t].qs + b * 256 + j * 16));
+            const __m128i off =
+                have_off
+                    ? _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+                          a[t].q6off + b * 128 + j * 8))
+                    : _mm_slli_epi16(_mm_maddubs_epi16(u1, qv), 5);
+            return _mm_sub_epi16(_mm_maddubs_epi16(rv, qv), off);
+        };
+        // Two groups a step, scaled by one madd (add_scaled_two: |s| <=
+        // 2 * 32 * 128, |scale| <= 128, so exact): the same int32 sums
+        // as one group at a time.
+        for (int j = 0; j < 16; j += 2) {
+            const __m128i rv0 = _mm_shuffle_epi8(
                 _mm_load_si128(reinterpret_cast<const __m128i*>(aux + j * 16)),
                 il);
+            const __m128i rv1 = _mm_shuffle_epi8(
+                _mm_load_si128(
+                    reinterpret_cast<const __m128i*>(aux + (j + 1) * 16)),
+                il);
             for (int t = 0; t < kT; ++t) {
-                const __m128i qv = _mm_loadu_si128(
-                    reinterpret_cast<const __m128i*>(a[t].qs + b * 256 +
-                                                     j * 16));
-                const __m128i s = _mm_sub_epi16(
-                    _mm_maddubs_epi16(rv, qv),
-                    _mm_slli_epi16(_mm_maddubs_epi16(u1, qv), 5));
-                add_scaled_lanes(s, sc[j], acc_lo[t], acc_hi[t]);
+                add_scaled_two(group(rv0, t, j), group(rv1, t, j + 1), sc[j],
+                               sc[j + 1], acc_lo[t], acc_hi[t]);
             }
         }
         const float bd = f16_to_f32(load_u16(blk + 208));
@@ -2606,17 +2613,27 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
     hbs.resize(nb * 16 * n);
     const bool shuffle =
         path == Q8Path::kK && w.type != gguf::TensorType::kQ3_K;
+    const bool q4k = w.type == gguf::TensorType::kQ4_K;
+    const bool q6k = w.type == gguf::TensorType::kQ6_K;
+    // Q6_K's offset terms (32 * the q8 pair sums) depend on the token
+    // alone: taken once per token here, not once per row and group
+    // (i#1198). The same integers, so the same bits.
+    thread_local std::vector<std::int16_t> hq6;
+    hq6.resize(q6k ? nb * 128 * n : 0);
     for (std::uint32_t t = 0; t < n; ++t) {
         quantize_q8k_sse4(x_batch.subspan(t * cols, cols), shuffle,
                           hd.data() + t * nb, hqs.data() + t * cols,
                           hbs.data() + t * nb * 16);
+        if (q6k) {
+            q6_k_offsets_sse4(hqs.data() + t * cols, nb,
+                              hq6.data() + t * nb * 128);
+        }
     }
     const auto act = [&](std::uint32_t t) {
         return Q8kAct{hd.data() + t * nb, hqs.data() + t * cols,
-                      hbs.data() + t * nb * 16};
+                      hbs.data() + t * nb * 16,
+                      q6k ? hq6.data() + t * nb * 128 : nullptr};
     };
-    const bool q4k = w.type == gguf::TensorType::kQ4_K;
-    const bool q6k = w.type == gguf::TensorType::kQ6_K;
     for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
         const std::uint32_t t1 = std::min(n, t0 + tile);
         for (std::uint32_t r = 0; r < w.rows; ++r) {
