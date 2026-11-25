@@ -72,7 +72,8 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
     for (const char* var : {"LOCUS_BATCH_DEQUANT", "LOCUS_MOE_HYBRID",
                             "LOCUS_MOE_HYBRID_SLOTS", "LOCUS_VK_CPU_ROUTE",
                             "LOCUS_GPU_POOL_MB", "LOCUS_MOE_STATS",
-                            "LOCUS_CUDA_FORWARD", "LOCUS_CPU_FAST"}) {
+                            "LOCUS_CUDA_FORWARD", "LOCUS_CUDA_GEMM",
+                            "LOCUS_CPU_FAST"}) {
         const char* v = std::getenv(var);
         const std::string s = v != nullptr ? std::string("=") + v : "";
         o = fnv(fnv(o, var, std::strlen(var)), s.data(), s.size());

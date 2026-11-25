@@ -8,6 +8,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -2343,7 +2344,72 @@ float row_q8k_sse4(Q8Path path, gguf::TensorType type, const std::byte* row,
  */
 void quantize_q8k_sse4(std::span<const float> x, bool shuffle, float* d,
                        std::int8_t* qs, std::int16_t* bsums) {
-    quantize_activation_q8k(x, d, qs, bsums);
+    // quantize_row_q8_k's arithmetic in SSE4.1 (i#1198: the scalar form
+    // was a visible share of a CPU prefill), with its bits:
+    // - amax by _mm_max_ps with the running max second, which skips a
+    //   NaN as `ax > amax` does; max is then the first x whose |x| is
+    //   amax, the value the scalar's strict > keeps;
+    // - nearest_int as the same float trick (add 1.5 * 2^23, keep the
+    //   mantissa bits, take 2^22 off), so the same int for every p, NaN
+    //   masked to 0; min(127, v) by _mm_min_epi32;
+    // - the int8 cast keeps the low byte: masked to 0..255 and packed
+    //   unsigned, so no saturation.
+    const __m128 sign = _mm_set1_ps(-0.0f);
+    const __m128 magic = _mm_set1_ps(12582912.0f);
+    const __m128i mant = _mm_set1_epi32(0x007fffff);
+    const __m128i bias = _mm_set1_epi32(0x00400000);
+    const __m128i i127 = _mm_set1_epi32(127);
+    const __m128i lowb = _mm_set1_epi32(0xff);
+    const std::size_t nb = x.size() / 256;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const float* xb = x.data() + i * 256;
+        std::int8_t* q = qs + i * 256;
+        __m128 m = _mm_setzero_ps();
+        for (int j = 0; j < 256; j += 4) {
+            m = _mm_max_ps(_mm_andnot_ps(sign, _mm_loadu_ps(xb + j)), m);
+        }
+        m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(1, 0, 3, 2)));
+        m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(2, 3, 0, 1)));
+        const float amax = _mm_cvtss_f32(m);
+        if (amax == 0.0f) {
+            d[i] = 0.0f;
+            std::memset(q, 0, 256);
+            std::memset(bsums + i * 16, 0, 16 * sizeof(std::int16_t));
+            continue;
+        }
+        float max = 0.0f;
+        for (int j = 0; j < 256; ++j) {
+            if (std::fabs(xb[j]) == amax) {
+                max = xb[j];
+                break;
+            }
+        }
+        const float iscale = -127.0f / max;
+        const __m128 vs = _mm_set1_ps(iscale);
+        for (int j = 0; j < 256; j += 16) {
+            __m128i v[4];
+            for (int k = 0; k < 4; ++k) {
+                const __m128 p = _mm_mul_ps(vs, _mm_loadu_ps(xb + j + 4 * k));
+                const __m128i ok = _mm_castps_si128(_mm_cmpord_ps(p, p));
+                __m128i n = _mm_castps_si128(_mm_add_ps(p, magic));
+                n = _mm_sub_epi32(_mm_and_si128(n, mant), bias);
+                n = _mm_and_si128(_mm_min_epi32(n, i127), ok);
+                v[k] = _mm_and_si128(n, lowb);
+            }
+            const __m128i a = _mm_packus_epi32(v[0], v[1]);
+            const __m128i b = _mm_packus_epi32(v[2], v[3]);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(q + j),
+                             _mm_packus_epi16(a, b));
+        }
+        for (int g = 0; g < 16; ++g) {
+            int sum = 0;
+            for (int k = 0; k < 16; ++k) {
+                sum += q[g * 16 + k];
+            }
+            bsums[i * 16 + g] = static_cast<std::int16_t>(sum);
+        }
+        d[i] = 1.0f / iscale;
+    }
     if (shuffle) {
         const __m128i il = lane_pairs_mask();
         for (std::size_t i = 0; i < x.size(); i += 16) {
@@ -2354,6 +2420,11 @@ void quantize_q8k_sse4(std::span<const float> x, bool shuffle, float* d,
 }
 
 }  // namespace
+
+void quantize_activation_q8k_sse4(std::span<const float> x, float* d,
+                                  std::int8_t* qs, std::int16_t* bsums) {
+    quantize_q8k_sse4(x, false, d, qs, bsums);
+}
 
 #if defined(LOCUS_SSE4_AVX_VARIANT)
 bool matvec_q8k_llama_avx(const Mat& w, std::span<const float> x,

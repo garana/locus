@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -197,9 +198,17 @@ TEST_CASE("cuda device matvecs equal matvec_cuda", "[cuda][device]") {
             REQUIRE(cuda_dev_finish());
             REQUIRE(same_bits(dout.get(), ref));
         }
-        // 13 tokens too: the Q4_K and Q6_K prefill tile (8 tokens a
-        // warp, i#1195) then ends in a partial tile, as 37 rows do.
-        for (const std::uint32_t nb : {n, 13u}) {
+        // 13 and 31 tokens too: the Q4_K and Q6_K prefill tile (8 tokens
+        // a warp, i#1195) then ends in a partial tile, as 37 rows do.
+        // From 32 tokens the tile types run a GEMM (dequantize plus
+        // cuBLAS, i#1200) where cuBLAS is built in: its own sum order,
+        // so close to the per-token kernel, not its bits (the random
+        // rows cancel to small sums, so about 1e-4 apart; a wrong
+        // dequantize would be about 1 apart).
+        const bool gemm_type = type == TensorType::kQ4_K ||
+                               type == TensorType::kQ6_K ||
+                               type == TensorType::kQ8_0;
+        for (const std::uint32_t nb : {n, 13u, 31u}) {
             INFO("tokens " << nb);
             const std::vector<float> xb(x.begin(),
                                         x.begin() + std::size_t{nb} * cols);
@@ -208,8 +217,57 @@ TEST_CASE("cuda device matvecs equal matvec_cuda", "[cuda][device]") {
             Dev dx(xb), dout(want.size()), scratch(std::size_t{rows} * 32);
             REQUIRE(cuda_dev_matvec_batch(m, dx.p, dout.p, nb, scratch.p));
             REQUIRE(cuda_dev_finish());
-            REQUIRE(same_bits(dout.get(), want));
+            const auto got = dout.get();
+            if (gemm_type && nb >= 32) {
+                for (std::size_t i = 0; i < got.size(); ++i) {
+                    REQUIRE(got[i] ==
+                            Catch::Approx(want[i]).epsilon(1e-3).margin(1e-3));
+                }
+            } else {
+                REQUIRE(same_bits(got, want));
+            }
         }
+    }
+    cuda_pool_reset();
+}
+
+TEST_CASE("cuda prefill GEMMs on two threads keep their own weights",
+          "[cuda][device]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no usable CUDA device");
+    }
+    // i#1200: each GEMM dequantizes its weight into its own call's
+    // scratch, so two threads at once (two engines) each get their own
+    // product, the bits of a run alone. With one shared buffer, one
+    // thread's GEMM could read the other's weight.
+    constexpr std::uint32_t rows = 256, cols = 8 * 256, n = 48;
+    const auto x = random_floats(std::size_t{n} * cols, 21);
+    std::vector<std::vector<std::byte>> wb;
+    std::vector<std::vector<float>> alone(2);
+    for (std::uint32_t k = 0; k < 2; ++k) {
+        wb.push_back(quant_rows(TensorType::kQ4_K, rows, cols, 30 + k));
+    }
+    const auto run = [&](std::uint32_t k) {
+        const Mat m{TensorType::kQ4_K, wb[k].data(), rows, cols};
+        Dev dx(x), dout(std::size_t{n} * rows),
+            scratch(std::size_t{rows} * 32);
+        bool ok = cuda_dev_matvec_batch(m, dx.p, dout.p, n, scratch.p) &&
+                  cuda_dev_finish();
+        return ok ? dout.get() : std::vector<float>{};
+    };
+    for (std::uint32_t k = 0; k < 2; ++k) {
+        alone[k] = run(k);
+        REQUIRE(alone[k].size() == std::size_t{n} * rows);
+    }
+    REQUIRE_FALSE(same_bits(alone[0], alone[1]));  // two distinct weights
+    for (int rep = 0; rep < 20; ++rep) {
+        std::vector<float> got[2];
+        std::thread t1([&] { got[1] = run(1); });
+        got[0] = run(0);
+        t1.join();
+        INFO("rep " << rep);
+        REQUIRE(same_bits(got[0], alone[0]));
+        REQUIRE(same_bits(got[1], alone[1]));
     }
     cuda_pool_reset();
 }

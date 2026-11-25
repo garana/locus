@@ -755,6 +755,47 @@ TEST_CASE("bench: cuda iq matvec", "[.][bench][cuda]") {
     SUCCEED();
 }
 
+// i#1198: the CPU prefill attention proper for one layer of Qwen2.5
+// (14 query heads, 2 KV heads, head size 64) over 512 tokens, in the
+// CPU prefill's 64-token chunks and in one 512-token call; best of 5.
+TEST_CASE("bench: qwen2.5 prefill attention, 512 tokens", "[.][bench]") {
+    constexpr std::uint32_t heads = 14, kv_heads = 2, hd = 64, n_pos = 512,
+                            group = heads / kv_heads;
+    constexpr std::size_t kv_dim = std::size_t{kv_heads} * hd;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    std::vector<float> k(std::size_t{n_pos} * kv_dim),
+        v(std::size_t{n_pos} * kv_dim), q(std::size_t{n_pos} * heads * hd),
+        out(std::size_t{n_pos} * heads * hd);
+    for (auto* buf : {&k, &v, &q}) {
+        for (auto& x : *buf) {
+            x = d(rng);
+        }
+    }
+    for (const std::uint32_t chunk : {64u, 512u}) {
+        double best = 1e9;
+        for (int rep = 0; rep < 5; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (std::uint32_t base = 0; base < n_pos; base += chunk) {
+                const std::uint32_t n = std::min(chunk, n_pos - base);
+                const std::size_t off = std::size_t{base} * heads * hd;
+                locus::model::gqa_attend_batch(
+                    q.data() + off, out.data() + off,
+                    std::size_t{heads} * hd, n, base, heads, hd, group,
+                    0.125f,
+                    [&](std::uint32_t p) { return k.data() + p * kv_dim; },
+                    [&](std::uint32_t p) { return v.data() + p * kv_dim; });
+            }
+            best = std::min(best, std::chrono::duration<double>(
+                                      std::chrono::steady_clock::now() - t0)
+                                      .count());
+        }
+        WARN("qwen2.5 attention, one layer, 512 tokens, chunk " << chunk
+             << ": " << best * 1e3 << " ms");
+    }
+    SUCCEED();
+}
+
 // i#701: the CPU prefill attention proper (scores, softmax, value sums;
 // no projections) for one layer of Llama 3.2 1B (32 query heads, 8 KV
 // heads, head size 64) over a whole prompt, in the 64-token chunks the

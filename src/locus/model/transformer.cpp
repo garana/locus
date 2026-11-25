@@ -1359,6 +1359,12 @@ std::uint32_t TransformerModel::prefill_chunk() const {
         if (backend_->ops.cpu && backend::sgemm_prefill_on()) {
             return backend::kSgemmPrefillChunk;
         }
+        // CUDA's prefill GEMM dequantizes every weight a chunk too
+        // (i#1200): at 64 tokens a 511-token prompt dequantized each one
+        // 8 times, and cuBLAS took its small tiles.
+        if (backend_->name == "cuda" && backend::cuda_prefill_gemm_on()) {
+            return 512;
+        }
         // A batched custom layer over many experts (kolibri1: 384, 6 a
         // token) groups each chunk's picks per expert: at 64 tokens an
         // expert gets one or two, so it takes a bigger chunk (i#739).

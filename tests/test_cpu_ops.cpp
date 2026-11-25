@@ -1285,7 +1285,7 @@ TEST_CASE("matvec_cuda matches the scalar reference for K-/IQ-quants",
 // where it runs in 32-token slices. Not arch-guarded: gated at
 // runtime on a usable CUDA device.
 TEST_CASE("matvec_batch_cuda Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL/IQ4_XS "
-          "byte-identical to per-token matvec_cuda (R11)",
+          "matches per-token matvec_cuda (R11; exact below the GEMM)",
           "[ops][batch][cuda]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
@@ -1361,13 +1361,134 @@ TEST_CASE("matvec_batch_cuda Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL/IQ4_XS "
                                 {&ref, 1});
                     INFO("type " << static_cast<int>(t) << " n " << n
                                  << " row " << r << " tok " << tk);
-                    REQUIRE(got[static_cast<std::size_t>(r) * n + tk] ==
-                            ref);  // exact
+                    // From 32 tokens Q4_K, Q6_K and Q8_0 run a GEMM
+                    // (i#1200, where cuBLAS is built in): its own sum
+                    // order, so close, not exact. The random rows sum
+                    // terms near 1 to results near 0.1 (Q6_K's int8
+                    // scales), so the order moves them by about 1e-4;
+                    // a wrong dequantize would by about 1.
+                    const bool gemm =
+                        n >= 32 && (t == TensorType::kQ4_K ||
+                                    t == TensorType::kQ6_K ||
+                                    t == TensorType::kQ8_0);
+                    const float g = got[static_cast<std::size_t>(r) * n + tk];
+                    if (gemm) {
+                        REQUIRE(g == Catch::Approx(ref).epsilon(1e-3).margin(
+                                         1e-3));
+                    } else {
+                        REQUIRE(g == ref);  // exact
+                    }
                 }
             }
         }
     }
 }
+
+/**
+ * Two-block (512-float) rows for checking a SIMD activation quantizer
+ * against the scalar one: random rows (several scales), an all-zero
+ * row (the d = 0 path), rows built so that x * iscale lands exactly on
+ * k + 0.5 (the round-half-to-even ties where a different rounding would
+ * show), and NaN rows (the scalar max scans skip them).
+ */
+[[maybe_unused]] std::vector<std::vector<float>> quantizer_edge_rows() {
+    std::mt19937 rng(107);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    std::vector<std::vector<float>> rows;
+    for (const float s : {1.0f, 1e-3f, 37.5f}) {
+        std::vector<float> r(512);
+        for (auto& v : r) {
+            v = ud(rng) * s;
+        }
+        rows.push_back(r);
+    }
+    rows.emplace_back(512, 0.0f);  // an all-zero block takes the d = 0 path
+    {
+        // Q8_K: max = -127 gives iscale = 1, so x = k + 0.5 is a tie.
+        // Block 2 puts its maximum in the middle (first occurrence).
+        std::vector<float> r(512);
+        for (int j = 0; j < 256; ++j) {
+            r[j] = j == 0 ? -127.0f : static_cast<float>(j % 120) - 60.5f;
+        }
+        for (int j = 256; j < 512; ++j) {
+            r[j] = j == 400 ? 99.0f : (j == 450 ? -99.0f : 0.25f * (j % 7));
+        }
+        rows.push_back(r);
+        // Q8_0: amax 127 gives d = 1, id = 1, so x = k + 0.5 is a tie.
+        std::vector<float> t(512);
+        for (int j = 0; j < 512; ++j) {
+            t[j] = j % 32 == 0 ? 127.0f : static_cast<float>(j % 50) - 24.5f;
+        }
+        rows.push_back(t);
+    }
+    {
+        // NaN: one in a block, one at index 0, and a whole NaN block;
+        // the scalar max scans skip them.
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> r = rows[0];
+        r[5] = nan;
+        r[256] = nan;
+        rows.push_back(r);
+        std::vector<float> all(512, nan);
+        for (int j = 256; j < 512; ++j) {
+            all[j] = rows[1][j];
+        }
+        rows.push_back(all);
+        // A NaN with payload bits (i#473): nearest_int's bit trick would
+        // turn them into a nonzero quant; both paths give 0.
+        std::vector<float> pay = rows[0];
+        pay[17] = std::bit_cast<float>(0x7fc12345u);
+        pay[300] = std::bit_cast<float>(0xffc0abcdu);
+        rows.push_back(pay);
+    }
+    return rows;
+}
+
+#if defined(__x86_64__)
+// i#1198: the SSE4.1 Q8_K quantize (and its AVX build on an AVX CPU)
+// gives the scalar's bits on the edge rows, plus two x86-only rows: a
+// block whose largest |x| is a denormal (iscale overflows to inf, so
+// nearest_int sees inf and NaN products: the scalar keeps an int's low
+// byte, not a saturated one), and a block whose largest |x| comes twice
+// with both signs (the first one's sign is kept).
+TEST_CASE("sse4 q8k quantize is bit-identical to the scalar",
+          "[ops][sse4][q8k]") {
+    auto rows = quantizer_edge_rows();
+    std::vector<float> e(512, 0.0f);
+    e[3] = 1e-45f;  // the smallest denormal: -127 / x overflows
+    e[7] = -1e-45f;
+    e[300] = 0.5f;  // block 2: |x| 2.0 twice, the negative one first
+    e[301] = -2.0f;
+    e[302] = 2.0f;
+    e[400] = 1.25f;
+    rows.push_back(e);
+    using Q = void (*)(std::span<const float>, float*, std::int8_t*,
+                       std::int16_t*);
+    std::vector<std::pair<const char*, Q>> impls = {
+        {"sse4", &quantize_activation_q8k_sse4}};
+#if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
+    if (locus::sys::detect().avx) {
+        impls.emplace_back("sse4_avx",
+                           &sse4_avx::quantize_activation_q8k_sse4);
+    }
+#endif
+    for (std::size_t ri = 0; ri < rows.size(); ++ri) {
+        const std::span<const float> x(rows[ri]);
+        std::vector<float> da(2), db(2);
+        std::vector<std::int8_t> qa(512), qb(512);
+        std::vector<std::int16_t> sa(32), sb(32);
+        quantize_activation_q8k(x, da.data(), qa.data(), sa.data());
+        for (const auto& [name, fn] : impls) {
+            INFO("row " << ri << " " << name);
+            fn(x, db.data(), qb.data(), sb.data());
+            REQUIRE(std::memcmp(da.data(), db.data(), 2 * sizeof(float)) ==
+                    0);
+            REQUIRE(qa == qb);
+            REQUIRE(sa == sb);
+        }
+    }
+}
+#endif
 
 #if defined(__aarch64__)
 TEST_CASE("matvec_batch_neon is byte-identical to per-token neon",
@@ -1584,58 +1705,7 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
 
 TEST_CASE("neon activation quantizers are bit-identical to the scalar",
           "[ops][neon][q8k]") {
-    // Random rows (several scales, zeros), plus rows built so that
-    // x * iscale lands exactly on k + 0.5: the round-half-to-even ties
-    // where a different rounding would show.
-    std::mt19937 rng(107);
-    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
-    std::vector<std::vector<float>> rows;
-    for (const float s : {1.0f, 1e-3f, 37.5f}) {
-        std::vector<float> r(512);
-        for (auto& v : r) {
-            v = ud(rng) * s;
-        }
-        rows.push_back(r);
-    }
-    rows.emplace_back(512, 0.0f);  // an all-zero block takes the d = 0 path
-    {
-        // Q8_K: max = -127 gives iscale = 1, so x = k + 0.5 is a tie.
-        // Block 2 puts its maximum in the middle (first occurrence).
-        std::vector<float> r(512);
-        for (int j = 0; j < 256; ++j) {
-            r[j] = j == 0 ? -127.0f : static_cast<float>(j % 120) - 60.5f;
-        }
-        for (int j = 256; j < 512; ++j) {
-            r[j] = j == 400 ? 99.0f : (j == 450 ? -99.0f : 0.25f * (j % 7));
-        }
-        rows.push_back(r);
-        // Q8_0: amax 127 gives d = 1, id = 1, so x = k + 0.5 is a tie.
-        std::vector<float> t(512);
-        for (int j = 0; j < 512; ++j) {
-            t[j] = j % 32 == 0 ? 127.0f : static_cast<float>(j % 50) - 24.5f;
-        }
-        rows.push_back(t);
-    }
-    {
-        // NaN: one in a block, one at index 0, and a whole NaN block;
-        // the scalar max scans skip them.
-        const float nan = std::numeric_limits<float>::quiet_NaN();
-        std::vector<float> r = rows[0];
-        r[5] = nan;
-        r[256] = nan;
-        rows.push_back(r);
-        std::vector<float> all(512, nan);
-        for (int j = 256; j < 512; ++j) {
-            all[j] = rows[1][j];
-        }
-        rows.push_back(all);
-        // A NaN with payload bits (i#473): nearest_int's bit trick would
-        // turn them into a nonzero quant; both paths give 0.
-        std::vector<float> pay = rows[0];
-        pay[17] = std::bit_cast<float>(0x7fc12345u);
-        pay[300] = std::bit_cast<float>(0xffc0abcdu);
-        rows.push_back(pay);
-    }
+    const auto rows = quantizer_edge_rows();
     for (std::size_t ri = 0; ri < rows.size(); ++ri) {
         INFO("row " << ri);
         const std::span<const float> x(rows[ri]);
@@ -2692,4 +2762,72 @@ TEST_CASE("sgemm_batch matches the scalar matvec within rounding",
     check(Mat{TensorType::kQ8_0, small.data(), rows, cols}, 40);
     const auto large = q8(600, 8192);
     check(Mat{TensorType::kQ8_0, large.data(), 600, 8192}, 33);
+}
+
+// i#1198: the activation quantize runs in SSE2 on x86-64; it must give
+// the scalar form's bits: random blocks, a zero block, NaN and inf
+// inputs, products on a .5 tie (round to even), tiny values, an amax
+// near 1e-38 (1 / d overflows, so x * id is +-inf) and one of 1e-45.
+TEST_CASE("quantize_activation_q8_0 gives the scalar form's bits", "[ops]") {
+    const auto scalar = [](const float* xb, float& d_out, std::int8_t* qs) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            amax = std::max(amax, std::fabs(xb[j]));
+        }
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        d_out = f16_to_f32(f32_to_f16(d));
+        for (int j = 0; j < 32; ++j) {
+            const float v = xb[j] * id;
+            qs[j] = std::isnan(v)
+                        ? 0
+                        : static_cast<std::int8_t>(std::nearbyint(v));
+        }
+    };
+    constexpr std::size_t nb = 64;
+    std::vector<float> x(nb * 32);
+    std::mt19937 rng(41);
+    std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    for (int j = 0; j < 32; ++j) {
+        x[32 + j] = 0.0f;                        // block 1: zeros
+        x[64 + j] = static_cast<float>(j) - 16;  // block 2
+        x[96 + j] = 1e-30f * dist(rng);          // block 3: tiny
+    }
+    x[64] = 127.0f;  // block 2: id is 1, so x * id is x exactly
+    x[64 + 5] = 2.5f;
+    x[64 + 6] = -3.5f;
+    x[64 + 7] = 0.5f;
+    x[128 + 3] = nan;   // block 4: one NaN among values
+    x[160 + 9] = inf;   // block 5: inf, so id is 0 and inf * 0 is NaN
+    x[160 + 10] = -inf;
+    for (int j = 0; j < 32; ++j) {
+        x[192 + j] = nan;  // block 6: all NaN
+        // Block 7: amax about 1e-38, so 1 / d overflows to inf and each
+        // nonzero x * id is +-inf (the cast keeps the low byte).
+        x[224 + j] = 1e-38f * dist(rng);
+        // Block 8: amax 1e-45, so d rounds to 0 and id is 0.
+        x[256 + j] = j % 2 == 0 ? 1e-45f : -1e-45f;
+    }
+    std::vector<float> d(nb), want_d(nb);
+    std::vector<std::int8_t> qs(nb * 32), want_qs(nb * 32);
+    quantize_activation_q8_0(x, d.data(), qs.data());
+    for (std::size_t b = 0; b < nb; ++b) {
+        scalar(x.data() + b * 32, want_d[b], want_qs.data() + b * 32);
+    }
+    for (std::size_t b = 0; b < nb; ++b) {
+        INFO("block " << b);
+        REQUIRE(std::bit_cast<std::uint32_t>(d[b]) ==
+                std::bit_cast<std::uint32_t>(want_d[b]));
+        for (int j = 0; j < 32; ++j) {
+            REQUIRE(qs[b * 32 + j] == want_qs[b * 32 + j]);
+        }
+    }
+    REQUIRE(qs[64 + 5] == 2);   // 2.5 rounds to even
+    REQUIRE(qs[64 + 6] == -4);  // -3.5 rounds to even
+    REQUIRE(qs[64 + 7] == 0);
 }
