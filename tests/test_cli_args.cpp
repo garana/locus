@@ -651,3 +651,29 @@ TEST_CASE("remote-experts values parse as HOST:PORT=LO:HI", "[cli]") {
         REQUIRE(WEXITSTATUS(rc) == 2);
     }
 }
+
+TEST_CASE("locus-run's warmup is the prompt reversed, or one token "
+          "with a disk prefix tier",
+          "[cli]") {
+    const std::vector<int> ids = {5, 6, 7, 8};
+    std::array<const char*, 2> plain = {"prog", "m.gguf"};
+    const auto a = locus_tools::parse_backend_args(
+        static_cast<int>(plain.size()), const_cast<char**>(plain.data()));
+    // Same length, so the same prefill path; no shared prefix.
+    REQUIRE(locus_tools::warmup_prompt(ids, a) ==
+            std::vector<int>{8, 7, 6, 5});
+    REQUIRE(locus_tools::warmup_prompt(std::vector<int>{}, a).empty());
+
+    // A disk tier would get the warmup's full blocks at exit: one
+    // token fills none.
+    std::array<const char*, 4> disk = {"prog", "--prefix-cache-dir", "/x",
+                                       "m.gguf"};
+    const auto b = locus_tools::parse_backend_args(
+        static_cast<int>(disk.size()), const_cast<char**>(disk.data()));
+    REQUIRE(locus_tools::warmup_prompt(ids, b) == std::vector<int>{5});
+    std::array<const char*, 4> helper = {"prog", "--prefix-cache-helper",
+                                         "/bin/h", "m.gguf"};
+    const auto c = locus_tools::parse_backend_args(
+        static_cast<int>(helper.size()), const_cast<char**>(helper.data()));
+    REQUIRE(locus_tools::warmup_prompt(ids, c) == std::vector<int>{5});
+}

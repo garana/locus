@@ -352,9 +352,11 @@ inline constexpr const char* kCommonHelp =
     "                     umask 077; head -c 32 /dev/urandom > ep.key\n"
     "  --timing         locus-run: print prefill and decode\n"
     "                   tok/s to stderr\n"
-    "  --warmup         locus-run: run a throwaway 1-token\n"
-    "                   request first (weight uploads, pipeline\n"
-    "                   warm-up) so --timing excludes them\n"
+    "  --warmup         locus-run: run the prompt reversed as a\n"
+    "                   throwaway request first (weight uploads,\n"
+    "                   pipeline warm-up) so --timing excludes them;\n"
+    "                   with a disk prefix tier, its first token\n"
+    "                   only, so nothing of it is written there\n"
     "  -h, --help       show this help and exit\n"
     "\n"
     "environment:\n"
@@ -906,6 +908,28 @@ inline std::string prefix_cache_error(const BackendArgs& a) {
                "--prefix-cache-helper";
     }
     return {};
+}
+
+/**
+ * locus-run's --warmup request. It is the prompt reversed: the same
+ * length, so the same prefill path, and no prefix the timed run could
+ * reuse. With a disk prefix tier it is the first token alone, so no
+ * full block of it enters the cache and is written to disk at exit.
+ * @param ids The prompt's tokens.
+ * @param a The parsed flags (the disk tier's).
+ * @returns The tokens to submit as the warmup (empty for an empty
+ *     prompt).
+ */
+template <typename T>
+std::vector<T> warmup_prompt(const std::vector<T>& ids,
+                             const BackendArgs& a) {
+    if (ids.empty()) {
+        return {};
+    }
+    if (!a.prefix_cache_dir.empty() || !a.prefix_cache_helper.empty()) {
+        return {ids.front()};
+    }
+    return std::vector<T>(ids.rbegin(), ids.rend());
 }
 
 /**
