@@ -21,6 +21,11 @@ description: Build and run the locus Catch2 unit tests. Use after
   (gitignored under tests/models/; tests SKIP if absent). Larger
   optional models (llama-3.2-1b Q8_0/Q4_K_M, deepseek-v2-lite)
   enable more goldens; [deepseek] alone takes ~2 min of CPU.
+- On the x86 host with the GTX 750 Ti (docs/HOSTS.md), run every
+  test and tool with `VK_LOADER_DRIVERS_DISABLE='*'`: Vulkan compute
+  on that card faulted (Xid 13) and froze the host, so its runs leave
+  Vulkan to the Apple and Pi hosts. A Vulkan section running there is
+  a bug in the setup: stop the run.
 - Every new component gets its own `tests/test_<name>.cpp`,
   registered in `tests/CMakeLists.txt`, using the vendored Catch2
   (`#include "catch_amalgamated.hpp"`).
