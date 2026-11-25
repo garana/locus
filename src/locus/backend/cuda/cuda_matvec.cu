@@ -1514,11 +1514,11 @@ __device__ inline float iq4_nl_block_dot(float d, const float vlo[16],
 /**
  * One IQ4_NL block is 18 bytes (d f16 + qs[16]), 32 weights: element i
  * is the low nibble of qs[i] and element 16 + i the high nibble, each
- * through the kvalues codebook. One warp per row, laid out as
- * matvec_q8_0_warp_kernel: lane L takes blocks L, L + 32, ...; each
- * pass the warp copies its 32 consecutive blocks (576 bytes, as 16-bit
- * words: blocks are only 2-byte aligned) into shared memory with
- * coalesced reads. Each lane sums its block as the scalar does
+ * through the kvalues codebook. One warp per row: lane L takes blocks
+ * L, L + 32, ...; each pass the warp copies its row's 32 consecutive
+ * blocks (576 bytes, as 16-bit words: blocks are only 2-byte aligned)
+ * into shared memory, consecutive lanes reading consecutive words so
+ * the reads coalesce. Each lane sums its block as the scalar does
  * (d times the sum over i of kv[lo] * x[i] + kv[hi] * x[i + 16]), and
  * the warp sums the lanes, so the result matches the CPU only to
  * rounding. Launch with 32 * kWarpRows threads per block.
