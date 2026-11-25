@@ -274,11 +274,8 @@ int main(int argc, char** argv) {
         if (args.warmup && !ids.empty()) {
             // Throwaway request: first-touch weight uploads, pipeline
             // warm-up and the batched prefill's scratch land here, not
-            // in the timed run. The prompt reversed: the same length,
-            // so the same prefill path, and no prefix the timed run
-            // could reuse.
-            std::vector<locus::tok::TokenId> rev(ids.rbegin(), ids.rend());
-            engine.submit(rev, 1);
+            // in the timed run (warmup_prompt says which tokens).
+            engine.submit(locus_tools::warmup_prompt(ids, args), 1);
             engine.run_to_completion();
         }
         const std::uint32_t conc = std::max(1u, args.concurrent);
