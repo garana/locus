@@ -267,9 +267,11 @@ BatchScratch& batch_scratch() {
 
 constexpr std::uint32_t kPrefillChunk = 256;
 constexpr std::uint32_t kPrefillChunkStep = 2048;
-// Below this many tokens a chunk runs a GPU forward a token: no matmul
-// gain at that size, and short chunks (a speculative verify) keep the
-// per-token forward's bits.
+// Below this many tokens an all_logits chunk (a speculative verify)
+// runs a GPU forward a token, so it keeps the per-token forward's bits.
+// A prompt chunk takes the batch from 2 tokens: a forward a token costs
+// a decode step each (about 4.4 ms on Llama 3.2 1B, M4 Max), the batch
+// 17 to 24 ms for 4 to 29 tokens.
 constexpr std::uint32_t kPrefillMin = 32;
 
 }  // namespace
@@ -1518,7 +1520,7 @@ bool TransformerModel::metal_forward_batch(
     // moe_route's threadgroup: a thread an expert, whole simdgroups.
     const std::uint32_t route_group =
         std::max(32u, (hp_.n_expert + 31) / 32 * 32);
-    if (n < kPrefillMin || (any_moe && !gpu_route) ||
+    if (n < (all_logits ? kPrefillMin : 2) || (any_moe && !gpu_route) ||
         !metal_forward_supported() ||
         cache.quantized() ||
         base + n > kAttnMaxPos || base + n > hp_.n_ctx ||
