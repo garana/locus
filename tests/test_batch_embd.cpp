@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -92,7 +93,21 @@ TEST_CASE("forward_batch with input embeddings equals per-position forward",
             REQUIRE(cP.ensure_capacity(sP, m));
             std::vector<float> last(V);
             model.forward_batch(toks, cP, sP, wP, last, false, embd);
-            REQUIRE(last == want[m - 1]);
+            if (be.name == "metal") {
+                // Metal's batched prefill takes a prompt chunk from 2
+                // tokens: token-exact, not bit-exact, to the per-token
+                // forward (matmul and matvec add in other orders).
+                const auto& w = want[m - 1];
+                REQUIRE(std::max_element(last.begin(), last.end()) -
+                            last.begin() ==
+                        std::max_element(w.begin(), w.end()) - w.begin());
+                for (std::uint32_t r = 0; r < V; ++r) {
+                    REQUIRE(std::abs(last[r] - w[r]) <=
+                            1e-3f * std::max(1.0f, std::abs(w[r])));
+                }
+            } else {
+                REQUIRE(last == want[m - 1]);
+            }
 
             // Misuse: a wrong embd length; an out-of-vocab id without an
             // embedding (an id under an embedding is ignored).

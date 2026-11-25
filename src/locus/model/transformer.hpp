@@ -1012,9 +1012,9 @@ class TransformerModel {
      *     token, else n_embd floats used instead.
      * @returns false, before any state changes, when it cannot run
      *     (what metal_forward declines, a context past 4096 positions,
-     *     or fewer than 32 tokens, which keep the per-token bits: a
-     *     speculative verify); the caller then runs the tokens one at a
-     *     time.
+     *     a single token, or an all_logits chunk of fewer than 32
+     *     tokens, which keeps the per-token bits: a speculative
+     *     verify); the caller then runs the tokens one at a time.
      */
     bool metal_forward_batch(std::span<const tok::TokenId> toks,
                              std::span<const float* const> embd,
