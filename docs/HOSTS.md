@@ -202,9 +202,10 @@ Recommended: no flags; leave `--kv-type` at f32 and `--engines` at 1.
   or 506 tokens, decode 127 tokens after "1, 2, 3, 4, 5,". bitcoind and
   other processes left about 1.8 GB free, and the prefill runs vary up
   to 20% (Qwen2.5 71 to 89).
-- Prefill trails llama.cpp at 0.35x to 0.66x by default (#1076); on
-  Q8_0, `LOCUS_CPU_FAST=1` brought it to 0.56x (#1076, an older run).
-  Decode leads it by 15% to 39%; the decode columns differ in setup:
+- At the medians, prefill trails llama.cpp at 0.35x to 0.66x by
+  default (#1076); on Q8_0, `LOCUS_CPU_FAST=1` brought it to 0.56x
+  (#1076, an older run). Decode leads it by 15% to 39% at the medians
+  (15% to 45% over the runs); the decode columns differ in setup:
   locus decodes after its prompt, llama-bench's tg128 from an empty
   context.
 - On V3D, the 1B Q8_0 prefill is killed out of memory (4 GB shared with
