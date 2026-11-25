@@ -58,11 +58,14 @@ bool cuda_dev_rmsnorm(const float*, const float*, float, float*,
     return false;
 }
 bool cuda_dev_rope(float*, const float*, std::uint32_t, std::uint32_t,
-                   std::size_t, std::uint32_t) {
+                   std::size_t, std::uint32_t, bool) {
     return false;
 }
 bool cuda_dev_silu_mul(float*, const float*, std::size_t) { return false; }
 bool cuda_dev_add(float*, const float*, std::size_t) { return false; }
+bool cuda_dev_add_rows(float*, const float*, std::size_t, std::uint32_t) {
+    return false;
+}
 void* cuda_dev_alloc_bytes(std::size_t) { return nullptr; }
 void cuda_dev_free_bytes(void*) {}
 bool cuda_dev_upload_bytes(void*, const void*, std::size_t) { return false; }
