@@ -3588,27 +3588,33 @@ bool launch_gemm(gguf::TensorType type, const std::uint8_t* w,
         !has_tile_kernel(type)) {
         return false;
     }
-    // One handle and one dequantize buffer for the process, grown to the
-    // widest weight; the default stream orders their uses.
-    static cublasHandle_t handle = [] {
-        cublasHandle_t h = nullptr;
-        return cublasCreate(&h) == CUBLAS_STATUS_SUCCESS ? h : nullptr;
-    }();
-    static float* deq = nullptr;
-    static std::size_t deq_bytes = 0;
+    // One cuBLAS handle per device (cuBLAS takes one handle from several
+    // threads, not across devices), made once under a lock.
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cublasHandle_t handle = nullptr;
+    {
+        static std::mutex mu;
+        static std::unordered_map<int, cublasHandle_t> handles;
+        std::lock_guard<std::mutex> lk(mu);
+        auto [it, fresh] = handles.try_emplace(dev, nullptr);
+        if (fresh && cublasCreate(&it->second) != CUBLAS_STATUS_SUCCESS) {
+            it->second = nullptr;
+        }
+        handle = it->second;
+    }
     if (handle == nullptr) {
         return false;
     }
-    if (bytes > deq_bytes) {
-        if (deq != nullptr) {
-            cudaFree(deq);
-        }
-        deq = nullptr;
-        deq_bytes = 0;
-        if (!cuda_ok(cudaMalloc(&deq, bytes))) {
-            return false;
-        }
-        deq_bytes = bytes;
+    // The dequantized weight in this call's own scratch set (i#1200): a
+    // concurrent call, or one on another device, leases another, so no
+    // thread dequantizes into the buffer another's GEMM is about to
+    // read. Held across both launches; a later user of the set queues
+    // behind them on the device's default stream.
+    ScratchLease lease;
+    auto* deq = static_cast<float*>(lease.get(0, bytes));
+    if (deq == nullptr) {
+        return false;
     }
     const std::uint32_t nsb = cols / 256;
     const std::size_t sbs = std::size_t{rows} * nsb;

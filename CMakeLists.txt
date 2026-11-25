@@ -677,6 +677,14 @@ if(CMAKE_CUDA_COMPILER_ID)
     string(APPEND LOCUS_BUILD_CONFIG
         "cuda ${CMAKE_CUDA_COMPILER_ID} ${CMAKE_CUDA_COMPILER_VERSION}\n"
         "cuda_flags ${CMAKE_CUDA_FLAGS}\n")
+    # Whether CUDA prefill chunks of 32+ tokens run cuBLAS's GEMM, whose
+    # K/V bits differ from the tile's (i#1200): a target definition, so
+    # the flags above do not show it.
+    if(TARGET CUDA::cublas)
+        string(APPEND LOCUS_BUILD_CONFIG "cublas on ${CUDAToolkit_VERSION}\n")
+    else()
+        string(APPEND LOCUS_BUILD_CONFIG "cublas off\n")
+    endif()
 endif()
 foreach(tool IN ITEMS GLSLANG_VALIDATOR GLSLC)
     if(${tool})
