@@ -271,3 +271,38 @@ TEST_CASE("cuda prefill GEMMs on two threads keep their own weights",
     }
     cuda_pool_reset();
 }
+
+// i#1197: the Q8_0 decode kernel takes two rows a warp and copies a
+// pass with 16-byte loads when a row is 16-byte aligned, 16-bit ones
+// when not, and a short loop for a last pass under 32 blocks. 7 rows
+// leave the last warp one row; 25 to 64 blocks a row give rows of both
+// alignments (34 bytes a block) and full and short passes. Each row
+// must be the bits of that row alone, and match the CPU to rounding.
+TEST_CASE("cuda q8_0 matvec rows are the bits of each row alone",
+          "[cuda][device]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no usable CUDA device");
+    }
+    constexpr std::uint32_t rows = 7;
+    for (const std::uint32_t nblk : {25u, 33u, 40u, 64u}) {
+        const std::uint32_t cols = nblk * 32;
+        DYNAMIC_SECTION("blocks " << nblk) {
+            const auto w = quant_rows(TensorType::kQ8_0, rows, cols, nblk);
+            const auto x = random_floats(cols, 3);
+            const Mat m{TensorType::kQ8_0, w.data(), rows, cols};
+            cuda_pool_reset();
+            std::vector<float> got(rows), cpu(rows);
+            matvec_cuda(m, x, got);
+            matvec(m, x, cpu);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                std::vector<float> one(1);
+                matvec_cuda(mat_rows(m, r, 1), x, one);
+                REQUIRE(std::bit_cast<std::uint32_t>(one[0]) ==
+                        std::bit_cast<std::uint32_t>(got[r]));
+                REQUIRE(got[r] ==
+                        Catch::Approx(cpu[r]).epsilon(1e-4).margin(1e-4));
+            }
+            cuda_pool_reset();
+        }
+    }
+}

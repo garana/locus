@@ -129,7 +129,7 @@ Automatic: the CPU backend `sse4` (its AVX build). locus does not move
 to CUDA by itself: pass `--backend cuda`.
 
 Recommended: `--backend cuda` for dense models that fit in 2 GB (1.7x
-to 2.2x the CPU's decode, 9.7x to 12x its prefill); the CPU default
+to 3.2x the CPU's decode, 9.7x to 12x its prefill); the CPU default
 for larger ones.
 
 | workload                         | default (CPU) | llama.cpp CPU | `--backend cuda` | llama.cpp CUDA | source      |
@@ -137,9 +137,9 @@ for larger ones.
 | prefill 512, Llama 3.2 1B Q4_K_M | 31.9          | 46.2          | 381.5            | 499.9          | #412, #1200 |
 | decode, Llama 3.2 1B Q4_K_M      | 16.1          | 17.8          | 27.9             | 31.7           | #412, #411  |
 | prefill 512, Llama 3.2 1B Q8_0   | 38.4          | 44.0          | 400.9            | 500.1          | #412, #1200 |
-| decode, Llama 3.2 1B Q8_0        | 11.6          | 11.9          | 25.8             | 36.2           | #412, #411  |
+| decode, Llama 3.2 1B Q8_0        | 11.6          | 11.9          | 37.5             | 36.2           | #412, #1197 |
 | prefill 512, Qwen2.5-0.5B Q8_0   | 86.7          | 115.3         | 843.9            | 1195.6         | #412, #1200 |
-| decode, Qwen2.5-0.5B Q8_0        | 25.9          | 27.9          | 53.1             | 80.9           | #412, #1196 |
+| decode, Qwen2.5-0.5B Q8_0        | 25.9          | 27.9          | 55.7             | 80.9           | #412, #1197 |
 | prefill 512, Orpheus 3B Q4_K_M   | 12.4          | 15.9          | 32.1             | does not load  | #412, #1200 |
 | decode, Orpheus 3B Q4_K_M        | 6.5           | 7.0           | 1.6              | does not load  | #412, #1196 |
 | prefill 512, Qwen1.5-MoE Q4_K_M  | 14.2          | 20.1          | does not fit     | not run        | #412        |
@@ -157,9 +157,10 @@ for larger ones.
   8.5.
 - On CUDA, prefill is at 0.71x to 0.80x of llama.cpp: chunks of 32
   tokens or more run as a cuBLAS GEMM (#1200; its rows on main
-  c65a89b9 plus that change). Decode is at 0.88x on Q4_K_M, 0.71x on
-  Q8_0 (#1197) and 0.66x on Qwen2.5. The Qwen2.5 and Orpheus decode
-  rows are of #1196 (Qwen2 on the one-submit forward).
+  c65a89b9 plus that change). Decode is at 0.88x on Q4_K_M, 1.04x on
+  Q8_0 and 0.69x on Qwen2.5: the Q8_0 decode kernel takes two rows a
+  warp (#1197; its rows on main 098a2590 plus that change). Qwen2.5
+  runs on the one-submit forward since #1196; Orpheus per op (below).
 - Orpheus (1.94 GB of weights) does not fit the 2 GB card: llama.cpp
   fails to load it, and locus runs it per op, paging its weights
   (slower than the CPU). The one-submit forward declines a model whose

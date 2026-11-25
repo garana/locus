@@ -724,7 +724,9 @@ TEST_CASE("bench: cuda iq matvec", "[.][bench][cuda]") {
         v = dist(rng);
     }
     const int iters = 50;
-    for (const Q& q : {Q{TT::kIQ4_XS, "IQ4_XS", 256, 136},
+    for (const Q& q : {Q{TT::kQ8_0, "Q8_0", 32, 34},
+                       Q{TT::kQ4_K, "Q4_K", 256, 144},
+                       Q{TT::kIQ4_XS, "IQ4_XS", 256, 136},
                        Q{TT::kIQ4_NL, "IQ4_NL", 32, 18},
                        Q{TT::kIQ3_XXS, "IQ3_XXS", 256, 98},
                        Q{TT::kIQ3_S, "IQ3_S", 256, 110},
@@ -747,7 +749,8 @@ TEST_CASE("bench: cuda iq matvec", "[.][bench][cuda]") {
         cuda_pool_reset();
         const double ns = time_matvec(&matvec_cuda, m, x, out, iters);
         WARN("cuda " << q.name << " 4096x4096: " << ns / 1000.0
-                     << " us per matvec");
+                     << " us per matvec, "
+                     << static_cast<double>(w.size()) / ns << " GB/s");
     }
     SUCCEED();
 }

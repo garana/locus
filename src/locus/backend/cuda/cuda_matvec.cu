@@ -1334,77 +1334,139 @@ __global__ void matvec_q6_k_warp_kernel(const std::uint8_t* w,
     }
 }
 
-/** @returns d times the dot of a Q8_0 block (17 16-bit words in shared
- *  memory: d, then the 32 int8 quants) with the 32 floats at xb
- *  (16-byte aligned), in the order of the Q8_0 kernels. */
-__device__ inline float q8_0_block_dot(const std::uint16_t* blk16,
-                                       const float* xb) {
-    const float d = __half2float(__ushort_as_half(blk16[0]));
-    const auto* x4 = reinterpret_cast<const float4*>(xb);
-    float bacc = 0.0f;
-    for (int k = 0; k < 8; ++k) {
-        const float4 xv = __ldg(x4 + k);
-        const std::uint16_t lo = blk16[1 + 2 * k];
-        const std::uint16_t hi = blk16[2 + 2 * k];
-        const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
-        const std::int8_t q[4] = {static_cast<std::int8_t>(lo & 0xff),
-                                  static_cast<std::int8_t>(lo >> 8),
-                                  static_cast<std::int8_t>(hi & 0xff),
-                                  static_cast<std::int8_t>(hi >> 8)};
-        for (int g = 0; g < 4; ++g) {
-            bacc += static_cast<float>(q[g]) * xs[g];
+/**
+ * Copies one pass of a Q8_0 row (nb blocks of 34 bytes from src, 16-bit
+ * words) into the warp's shared slice dst (16-byte aligned). A full
+ * pass is 1088 bytes, a multiple of 16, so when the row starts 16-byte
+ * aligned every pass does and the copy takes 68 16-byte loads. Each
+ * lane issues all of its loads before any store (i#1197): a loop of
+ * load-then-store kept one load in flight per warp.
+ */
+__device__ inline void q8_0_copy_pass(const std::uint16_t* src,
+                                      std::uint16_t* dst, std::uint32_t nb,
+                                      bool aligned16, std::uint32_t lane) {
+    if (nb == 32 && aligned16) {
+        const auto* s4 = reinterpret_cast<const uint4*>(src);
+        auto* d4 = reinterpret_cast<uint4*>(dst);
+        const uint4 a = __ldg(s4 + lane);
+        const uint4 b = __ldg(s4 + 32 + lane);
+        uint4 c{};
+        if (lane < 4) {
+            c = __ldg(s4 + 64 + lane);
+        }
+        d4[lane] = a;
+        d4[32 + lane] = b;
+        if (lane < 4) {
+            d4[64 + lane] = c;
+        }
+    } else if (nb == 32) {
+        std::uint16_t v[17];
+#pragma unroll
+        for (int k = 0; k < 17; ++k) {
+            v[k] = __ldg(src + lane + 32 * k);
+        }
+#pragma unroll
+        for (int k = 0; k < 17; ++k) {
+            dst[lane + 32 * k] = v[k];
+        }
+    } else {
+        for (std::uint32_t i = lane; i < nb * 17; i += 32) {
+            dst[i] = __ldg(src + i);
         }
     }
-    return d * bacc;
+}
+
+/** d times the dot of each of two Q8_0 blocks (rows; 17 16-bit words in
+ *  shared memory each: d, then the 32 int8 quants) with the 32 floats
+ *  at xb (16-byte aligned), in the order of the Q8_0 kernels: x is
+ *  loaded once for both, and neither row's sum depends on the other. */
+__device__ inline void q8_0_block_dot2(const std::uint16_t* blk0,
+                                       const std::uint16_t* blk1,
+                                       const float* xb, float& out0,
+                                       float& out1) {
+    const auto* x4 = reinterpret_cast<const float4*>(xb);
+    float acc[2] = {0.0f, 0.0f};
+    const std::uint16_t* blks[2] = {blk0, blk1};
+    for (int k = 0; k < 8; ++k) {
+        const float4 xv = __ldg(x4 + k);
+        const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+        for (int r = 0; r < 2; ++r) {
+            const std::uint16_t lo = blks[r][1 + 2 * k];
+            const std::uint16_t hi = blks[r][2 + 2 * k];
+            const std::int8_t q[4] = {static_cast<std::int8_t>(lo & 0xff),
+                                      static_cast<std::int8_t>(lo >> 8),
+                                      static_cast<std::int8_t>(hi & 0xff),
+                                      static_cast<std::int8_t>(hi >> 8)};
+            for (int g = 0; g < 4; ++g) {
+                acc[r] += static_cast<float>(q[g]) * xs[g];
+            }
+        }
+    }
+    out0 = __half2float(__ushort_as_half(blk0[0])) * acc[0];
+    out1 = __half2float(__ushort_as_half(blk1[0])) * acc[1];
 }
 
 /**
  * One Q8_0 block is 34 bytes: f16 scale + 32 int8 quants. One warp
- * per row: lane L takes blocks L, L + 32, .... Each pass, the warp
- * copies its 32 consecutive blocks (1088 contiguous bytes, as 16-bit
- * words: blocks are only 2-byte aligned) into shared memory with
- * consecutive lanes reading consecutive words, so the reads coalesce.
- * Each block is summed as the scalar does (d times the sum of
- * q[g] * x[g], g in order), each lane accumulates its blocks, and the
- * warp sums the lanes.
+ * per two rows (i#1197: each x load serves both): lane L takes blocks
+ * L, L + 32, ... of each. Each pass, the warp copies the rows' 32
+ * consecutive blocks (1088 contiguous bytes each; blocks are only
+ * 2-byte aligned) into shared memory with coalesced reads
+ * (q8_0_copy_pass). Each block is summed as the scalar does (d times
+ * the sum of q[g] * x[g], g in order), each lane accumulates its
+ * blocks, and the warp sums the lanes: a row's arithmetic does not
+ * depend on its partner row, so it is the bits of one warp per row.
  * The summation order across blocks is not the scalar one, so the
  * result matches the CPU only to rounding. Launch with 32 * kWarpRows
- * threads per block.
+ * threads per block and ceil(rows / (2 * kWarpRows)) blocks.
  */
 __global__ void matvec_q8_0_warp_kernel(const std::uint8_t* w,
                                         const float* x, float* out,
                                         std::uint32_t rows,
                                         std::uint32_t cols) {
     const std::uint32_t lane = threadIdx.x % 32;
-    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
-    if (r >= rows) {
+    const std::uint32_t r0 = 2 * (blockIdx.x * kWarpRows + threadIdx.x / 32);
+    if (r0 >= rows) {
         return;  // a whole warp leaves together: no partial shuffles
     }
-    // One pass covers 32 blocks (544 16-bit words); the warp copies
-    // them into its own slice of shared memory with consecutive lanes
-    // reading consecutive words, so the global reads coalesce fully.
-    __shared__ std::uint16_t sw[kWarpRows][32 * 17];
-    std::uint16_t* mine = sw[threadIdx.x / 32];
+    // The second row, or the first again when rows is odd (its result
+    // is not stored).
+    const bool two = r0 + 1 < rows;
+    const std::uint32_t r1 = two ? r0 + 1 : r0;
+    __shared__ __align__(16) std::uint16_t sw[kWarpRows][2][32 * 17];
+    std::uint16_t* mine0 = sw[threadIdx.x / 32][0];
+    std::uint16_t* mine1 = sw[threadIdx.x / 32][1];
     const std::uint32_t nblk = cols / 32;
-    const auto* row16 = reinterpret_cast<const std::uint16_t*>(
-        w + static_cast<std::size_t>(r) * nblk * 34);
-    float acc = 0.0f;
+    const auto* row0 = reinterpret_cast<const std::uint16_t*>(
+        w + static_cast<std::size_t>(r0) * nblk * 34);
+    const auto* row1 = reinterpret_cast<const std::uint16_t*>(
+        w + static_cast<std::size_t>(r1) * nblk * 34);
+    const bool al0 = (reinterpret_cast<std::uintptr_t>(row0) & 15) == 0;
+    const bool al1 = (reinterpret_cast<std::uintptr_t>(row1) & 15) == 0;
+    float acc0 = 0.0f, acc1 = 0.0f;
     for (std::uint32_t b0 = 0; b0 < nblk; b0 += 32) {
         const std::uint32_t nb = min(32u, nblk - b0);
-        for (std::uint32_t i = lane; i < nb * 17; i += 32) {
-            mine[i] = __ldg(row16 + static_cast<std::size_t>(b0) * 17 + i);
-        }
+        const std::size_t off = static_cast<std::size_t>(b0) * 17;
+        q8_0_copy_pass(row0 + off, mine0, nb, al0, lane);
+        q8_0_copy_pass(row1 + off, mine1, nb, al1, lane);
         __syncwarp();
         if (lane < nb) {
             const std::uint32_t b = b0 + lane;
-            acc += q8_0_block_dot(mine + lane * 17,
-                                  x + static_cast<std::size_t>(b) * 32);
+            float d0, d1;
+            q8_0_block_dot2(mine0 + lane * 17, mine1 + lane * 17,
+                            x + static_cast<std::size_t>(b) * 32, d0, d1);
+            acc0 += d0;
+            acc1 += d1;
         }
-        __syncwarp();  // the next pass overwrites this warp's slice
+        __syncwarp();  // the next pass overwrites this warp's slices
     }
-    acc = warp_sum(acc);
+    acc0 = warp_sum(acc0);
+    acc1 = warp_sum(acc1);
     if (lane == 0) {
-        out[r] = acc;
+        out[r0] = acc0;
+        if (two) {
+            out[r1] = acc1;
+        }
     }
 }
 
@@ -1455,11 +1517,11 @@ __device__ inline float iq4_nl_block_dot(float d, const float vlo[16],
 /**
  * One IQ4_NL block is 18 bytes (d f16 + qs[16]), 32 weights: element i
  * is the low nibble of qs[i] and element 16 + i the high nibble, each
- * through the kvalues codebook. One warp per row, laid out as
- * matvec_q8_0_warp_kernel: lane L takes blocks L, L + 32, ...; each
- * pass the warp copies its 32 consecutive blocks (576 bytes, as 16-bit
- * words: blocks are only 2-byte aligned) into shared memory with
- * coalesced reads. Each lane sums its block as the scalar does
+ * through the kvalues codebook. One warp per row: lane L takes blocks
+ * L, L + 32, ...; each pass the warp copies its row's 32 consecutive
+ * blocks (576 bytes, as 16-bit words: blocks are only 2-byte aligned)
+ * into shared memory, consecutive lanes reading consecutive words so
+ * the reads coalesce. Each lane sums its block as the scalar does
  * (d times the sum over i of kv[lo] * x[i] + kv[hi] * x[i + 16]), and
  * the warp sums the lanes, so the result matches the CPU only to
  * rounding. Launch with 32 * kWarpRows threads per block.
@@ -2326,10 +2388,10 @@ __global__ void matvec_tile_smem_kernel(const std::uint8_t* w,
 /**
  * The prefill tile for Q8_0 (i#1195): R rows by T tokens a warp. A
  * pass stages 32 blocks of each of the R rows in shared memory, as the
- * per-token kernel stages one row's; lane l then takes block b0 + l
+ * per-token kernel stages its rows'; lane l then takes block b0 + l
  * of every row, loads each token's 32 activations of that block once
  * and adds them into all R rows' block sums. Each block sum runs the
- * products in q8_0_block_dot's order and is added as d * sum, and the
+ * products in q8_0_block_dot2's order and is added as d * sum, and the
  * warp sums the lanes the same way, so the result is byte-identical
  * to the per-token kernel. Token-major output, all n tokens a launch.
  */
@@ -3219,7 +3281,8 @@ void launch_kernel(Kind kind, const void* dw,
             break;
         case Kind::kQ8_0:
             matvec_q8_0_warp_kernel<<<
-                (rows + kWarpRows - 1) / kWarpRows, 32 * kWarpRows>>>(
+                (rows + 2 * kWarpRows - 1) / (2 * kWarpRows),
+                32 * kWarpRows>>>(
                 dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kQ4_K:
