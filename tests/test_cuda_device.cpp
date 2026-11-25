@@ -197,9 +197,17 @@ TEST_CASE("cuda device matvecs equal matvec_cuda", "[cuda][device]") {
             REQUIRE(cuda_dev_finish());
             REQUIRE(same_bits(dout.get(), ref));
         }
-        // 13 tokens too: the Q4_K and Q6_K prefill tile (8 tokens a
-        // warp, i#1195) then ends in a partial tile, as 37 rows do.
-        for (const std::uint32_t nb : {n, 13u}) {
+        // 13 and 31 tokens too: the Q4_K and Q6_K prefill tile (8 tokens
+        // a warp, i#1195) then ends in a partial tile, as 37 rows do.
+        // From 32 tokens the tile types run a GEMM (dequantize plus
+        // cuBLAS, i#1200) where cuBLAS is built in: its own sum order,
+        // so close to the per-token kernel, not its bits (the random
+        // rows cancel to small sums, so about 1e-4 apart; a wrong
+        // dequantize would be about 1 apart).
+        const bool gemm_type = type == TensorType::kQ4_K ||
+                               type == TensorType::kQ6_K ||
+                               type == TensorType::kQ8_0;
+        for (const std::uint32_t nb : {n, 13u, 31u}) {
             INFO("tokens " << nb);
             const std::vector<float> xb(x.begin(),
                                         x.begin() + std::size_t{nb} * cols);
@@ -208,7 +216,15 @@ TEST_CASE("cuda device matvecs equal matvec_cuda", "[cuda][device]") {
             Dev dx(xb), dout(want.size()), scratch(std::size_t{rows} * 32);
             REQUIRE(cuda_dev_matvec_batch(m, dx.p, dout.p, nb, scratch.p));
             REQUIRE(cuda_dev_finish());
-            REQUIRE(same_bits(dout.get(), want));
+            const auto got = dout.get();
+            if (gemm_type && nb >= 32) {
+                for (std::size_t i = 0; i < got.size(); ++i) {
+                    REQUIRE(got[i] ==
+                            Catch::Approx(want[i]).epsilon(1e-3).margin(1e-3));
+                }
+            } else {
+                REQUIRE(same_bits(got, want));
+            }
         }
     }
     cuda_pool_reset();

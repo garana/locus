@@ -28,6 +28,7 @@ void cuda_prefetch(const Mat&) {}
 void cuda_evict(const Mat&) {}
 
 std::size_t cuda_pool_budget() { return 0; }
+bool cuda_prefill_gemm_on() { return false; }
 
 void* cuda_kv_mirror_alloc(std::size_t) { return nullptr; }
 

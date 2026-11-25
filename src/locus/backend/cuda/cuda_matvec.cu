@@ -15,6 +15,9 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#ifdef LOCUS_HAS_CUBLAS
+#include <cublas_v2.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -3509,9 +3512,145 @@ bool has_tile_kernel(gguf::TensorType type) {
            type == gguf::TensorType::kQ6_K || type == gguf::TensorType::kQ8_0;
 }
 
+/** A K-quant weight (TileQ4K, TileQ6K) dequantized to f32, row-major:
+ *  one warp per (row, super-block), each lane writing the 8 values the
+ *  per-token kernel decodes for it. Launch with 128 threads a block. */
+template <class Q>
+__global__ void dequant_ksb_kernel(const std::uint8_t* w, float* dst,
+                                   std::uint32_t rows, std::uint32_t nsb) {
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::size_t idx =
+        std::size_t{blockIdx.x} * (blockDim.x / 32) + threadIdx.x / 32;
+    if (idx >= std::size_t{rows} * nsb) {
+        return;
+    }
+    float lo[4], hi[4];
+    const std::uint32_t e = Q::values(w + idx * Q::kBytes, lane, lo, hi);
+    float* d = dst + idx * 256;  // row r's super-block b: (r * nsb + b)
+    for (int k = 0; k < 4; ++k) {
+        d[e + k] = lo[k];
+        d[e + Q::kHi + k] = hi[k];
+    }
+}
+
+/** A Q8_0 weight dequantized to f32 (d * q), one thread per value. */
+__global__ void dequant_q8_0_kernel(const std::uint8_t* w, float* dst,
+                                    std::size_t n) {
+    const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const std::uint8_t* blk = w + (i / 32) * 34;
+    std::uint16_t dh;
+    memcpy(&dh, blk, 2);
+    const float d = __half2float(__ushort_as_half(dh));
+    dst[i] = d * static_cast<float>(static_cast<std::int8_t>(blk[2 + i % 32]));
+}
+
+}  // namespace
+
+bool cuda_prefill_gemm_on() {
+#ifdef LOCUS_HAS_CUBLAS
+    static const bool on = [] {
+        const char* e = std::getenv("LOCUS_CUDA_GEMM");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    return on;
+#else
+    return false;
+#endif
+}
+
+namespace {
+
+/** The fewest tokens a prefill matmul runs as a GEMM (i#1200), as
+ *  Metal's kPrefillMin: below it the tile keeps the per-token bits. */
+constexpr std::uint32_t kGemmMinTokens = 32;
+/** The largest dequantized weight the GEMM stages (bytes): a bigger one
+ *  (a 128k-vocabulary head is about 1 GB) keeps the tile. */
+constexpr std::size_t kGemmMaxBytes = std::size_t{256} << 20;
+
+/**
+ * The prefill matmul of n >= kGemmMinTokens tokens as dequantize plus
+ * cuBLAS sgemm (i#1200): llama.cpp's path on this GPU, far faster than
+ * the tile, with its own sum order, so not the per-token kernel's bits.
+ * LOCUS_CUDA_GEMM=0 turns it off (a numeric mode: the disk prefix key
+ * holds it). Same layouts as launch_tile.
+ * @returns false, launching nothing, when the GEMM does not apply.
+ */
+bool launch_gemm(gguf::TensorType type, const std::uint8_t* w,
+                 const float* x, float* out, std::uint32_t rows,
+                 std::uint32_t cols, std::uint32_t n) {
+#ifdef LOCUS_HAS_CUBLAS
+    const std::size_t bytes = std::size_t{rows} * cols * sizeof(float);
+    if (!cuda_prefill_gemm_on() || n < kGemmMinTokens ||
+        bytes > kGemmMaxBytes ||
+        !has_tile_kernel(type)) {
+        return false;
+    }
+    // One handle and one dequantize buffer for the process, grown to the
+    // widest weight; the default stream orders their uses.
+    static cublasHandle_t handle = [] {
+        cublasHandle_t h = nullptr;
+        return cublasCreate(&h) == CUBLAS_STATUS_SUCCESS ? h : nullptr;
+    }();
+    static float* deq = nullptr;
+    static std::size_t deq_bytes = 0;
+    if (handle == nullptr) {
+        return false;
+    }
+    if (bytes > deq_bytes) {
+        if (deq != nullptr) {
+            cudaFree(deq);
+        }
+        deq = nullptr;
+        deq_bytes = 0;
+        if (!cuda_ok(cudaMalloc(&deq, bytes))) {
+            return false;
+        }
+        deq_bytes = bytes;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t sbs = std::size_t{rows} * nsb;
+    switch (type) {
+        case gguf::TensorType::kQ4_K:
+            dequant_ksb_kernel<TileQ4K>
+                <<<static_cast<unsigned>((sbs + 3) / 4), 128>>>(w, deq, rows,
+                                                                nsb);
+            break;
+        case gguf::TensorType::kQ6_K:
+            dequant_ksb_kernel<TileQ6K>
+                <<<static_cast<unsigned>((sbs + 3) / 4), 128>>>(w, deq, rows,
+                                                                nsb);
+            break;
+        default: {  // kQ8_0
+            const std::size_t vals = std::size_t{rows} * cols;
+            dequant_q8_0_kernel<<<static_cast<unsigned>((vals + 255) / 256),
+                                  256>>>(w, deq, vals);
+            break;
+        }
+    }
+    // Row-major W (rows x cols) is column-major W^T, and token-major x
+    // (n x cols) column-major x^T: out^T = W x^T, rows x n column-major,
+    // is the token-major out.
+    const float one = 1.0f, zero = 0.0f;
+    return cuda_ok(cudaGetLastError()) &&
+           cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                       static_cast<int>(rows), static_cast<int>(n),
+                       static_cast<int>(cols), &one, deq,
+                       static_cast<int>(cols), x, static_cast<int>(cols),
+                       &zero, out, static_cast<int>(rows)) ==
+               CUBLAS_STATUS_SUCCESS;
+#else
+    (void)type, (void)w, (void)x, (void)out, (void)rows, (void)cols, (void)n;
+    return false;
+#endif
+}
+
 /**
  * Launches the prefill tile kernel of `type` (has_tile_kernel) on the
- * default stream: all n tokens in one launch.
+ * default stream: all n tokens in one launch. A chunk of at least
+ * kGemmMinTokens tokens goes to launch_gemm instead, where it applies.
  * @param x n tokens, token-major (token t at t * cols).
  * @param out n * rows floats, token-major (out[t * rows + r]).
  * @returns false, launching nothing, for a type with no tile kernel.
@@ -3519,6 +3658,9 @@ bool has_tile_kernel(gguf::TensorType type) {
 bool launch_tile(gguf::TensorType type, const std::uint8_t* w,
                  const float* x, float* out, std::uint32_t rows,
                  std::uint32_t cols, std::uint32_t n) {
+    if (launch_gemm(type, w, x, out, rows, cols, n)) {
+        return true;
+    }
     // 4 rows by 8 tokens a warp was the fastest of 2 to 8 rows by 4 to
     // 16 tokens on a GTX 750 Ti (Llama 3.2 1B Q4_K_M, 511 tokens: 116.6
     // tok/s; 4 x 16 94.7, 8 x 8 104.2).

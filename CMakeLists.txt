@@ -639,6 +639,17 @@ if(CUDAToolkit_FOUND)
     target_link_libraries(locus PRIVATE CUDA::cudart)
     message(STATUS
         "locus CUDA: found (${CUDAToolkit_VERSION}), sm_50")
+    # cuBLAS, a CUDA toolkit library (nothing vendored): the prefill GEMM
+    # of chunks of 32 tokens or more (i#1200). Without it, CUDA prefill
+    # runs the tile kernels.
+    if(TARGET CUDA::cublas)
+        target_link_libraries(locus PRIVATE CUDA::cublas)
+        target_compile_definitions(locus PRIVATE LOCUS_HAS_CUBLAS=1)
+        message(STATUS "locus CUDA: cuBLAS found, prefill GEMM on")
+    else()
+        message(STATUS
+            "locus CUDA: cuBLAS not found, prefill on the tile kernels")
+    endif()
 else()
     message(STATUS "locus CUDA: not found, GPU backend disabled")
 endif()

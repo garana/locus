@@ -370,7 +370,10 @@ The areas built after the MVP:
   e8e6c7a), under the same MIT notice (`third_party/ggml/LICENSE`).
 - No FetchContent and no network at configure or build time.
 - Optional system dependencies, found at configure time: the Vulkan
-  loader and a shader compiler, the CUDA toolkit.
+  loader and a shader compiler, the CUDA toolkit. On CUDA builds, the
+  toolkit's cuBLAS too (nothing vendored): it runs the prefill GEMM of
+  chunks of 32 tokens or more (#1200); a toolkit without it builds the
+  CUDA backend with the tile kernels only, and configure says so.
 
 ## 7. Weight streaming (R8)
 
@@ -852,7 +855,8 @@ guarding the default path.
   step waits for the disk instead of a long recompute later (i#642).
   Prefix hits, in RAM and on disk, are exact only up to the prefill's
   chunking: after a hit of k tokens the rest is chunked from k, and on
-  Metal and Vulkan other chunks give other last bits of KV than a fresh
+  Metal, Vulkan and CUDA (whose chunks of 32 tokens or more run a cuBLAS
+  GEMM, #1200) other chunks give other last bits of KV than a fresh
   prefill of the same prompt (within batched prefill's tolerance of the
   per-token forward, i#730). Where a prefill resumes depends on what
   was cached before, so no key can hold it (#1189). The neon backend's

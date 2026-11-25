@@ -27,7 +27,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   with chat templates (the GGUF's, or `--chat-template NAME` for a GGUF
   that has none).
 - **Backends:** neon, avx2, sse4 and scalar on the CPU; vulkan (the
-  whole forward pass on the GPU); cuda (matvec on the GPU); metal
+  whole forward pass on the GPU); cuda (the whole forward pass on the
+  GPU for dense models that fit, prefill through cuBLAS); metal
   (Apple GPUs: #10).
 - **Serving:** continuous batching; a paged KV cache with
   copy-on-write prefix sharing; f32, f16, q8 or q4 KV.
