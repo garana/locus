@@ -15,6 +15,9 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#ifdef LOCUS_HAS_CUBLAS
+#include <cublas_v2.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -2201,7 +2204,7 @@ __device__ inline float lane_dot8_x(float acc, const float vlo[4],
     return acc;
 }
 
-/** The Q4_K super-block for matvec_tile_kernel: the per-token kernel's
+/** The Q4_K super-block for matvec_tile_smem_kernel: the per-token kernel's
  *  lane values, at x offset 64 j + c and its high half 32 floats on. */
 struct TileQ4K {
     static constexpr std::uint32_t kBytes = 144;
@@ -2214,7 +2217,7 @@ struct TileQ4K {
     }
 };
 
-/** The Q6_K super-block for matvec_tile_kernel: the per-token kernel's
+/** The Q6_K super-block for matvec_tile_smem_kernel: the per-token kernel's
  *  lane values, at the x offset it returns and 64 floats on. */
 struct TileQ6K {
     static constexpr std::uint32_t kBytes = 210;
@@ -2227,26 +2230,29 @@ struct TileQ6K {
 };
 
 /**
- * Prefill tile for a K-quant Q (TileQ4K, TileQ6K; i#1195): each warp
- * computes R rows by T tokens, so one load of a token's activations
- * serves R rows (the batch kernel loads them once per row, and its
- * speed is bound by those loads) and one decode of a row's weights
- * serves T tokens. Per (row, token) the lane runs the per-token
- * kernel's products in its order and the warp sums the lanes the same
- * way, so the result is byte-identical to the per-token kernel. One
- * launch covers all n tokens (grid.y tiles them) and writes the
- * token-major output (out[t * rows + r]) directly. Launch with
- * 32 * kWarpRows threads per block.
+ * Prefill tile for a K-quant Q (TileQ4K, TileQ6K; i#1195, i#1200):
+ * each warp computes R rows by T tokens, so one load of a token's
+ * activations serves R rows and one decode of a row's weights serves T
+ * tokens. Per super-block the block's threads stage the T tokens' 256
+ * floats in shared memory once, and every warp reads them from there
+ * (each warp loading them from global memory bound the speed). Per
+ * (row, token) the lane runs the per-token kernel's products in its
+ * order and the warp sums the lanes the same way, so the result is
+ * byte-identical to the per-token kernel. One launch covers all n
+ * tokens (grid.y tiles them) and writes the token-major output
+ * (out[t * rows + r]) directly. A warp past the last row stays to load
+ * and to sync, and stores nothing. Launch with 32 * W threads per
+ * block, W warps of R rows each.
  */
-template <std::uint32_t R, std::uint32_t T, class Q>
-__global__ void matvec_tile_kernel(const std::uint8_t* w, const float* x,
-                                   float* out, std::uint32_t rows,
-                                   std::uint32_t cols, std::uint32_t n) {
+template <std::uint32_t R, std::uint32_t T, std::uint32_t W, class Q>
+__global__ void matvec_tile_smem_kernel(const std::uint8_t* w,
+                                        const float* x, float* out,
+                                        std::uint32_t rows,
+                                        std::uint32_t cols, std::uint32_t n) {
+    __shared__ float4 xs[T][64];  // T tokens by 256 floats
     const std::uint32_t lane = threadIdx.x % 32;
-    const std::uint32_t r0 = (blockIdx.x * kWarpRows + threadIdx.x / 32) * R;
-    if (r0 >= rows) {
-        return;  // a whole warp leaves together: no partial shuffles
-    }
+    const std::uint32_t r0 = (blockIdx.x * W + threadIdx.x / 32) * R;
+    const bool active = r0 < rows;
     const std::uint32_t t0 = blockIdx.y * T;
     const std::uint32_t nsb = cols / 256;
     const std::uint8_t* row[R];
@@ -2265,30 +2271,45 @@ __global__ void matvec_tile_kernel(const std::uint8_t* w, const float* x,
         }
     }
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        float vlo[R][4], vhi[R][4];
-        std::uint32_t e = 0;  // the lane's x offset: the same in every row
-#pragma unroll
-        for (std::uint32_t i = 0; i < R; ++i) {
-            e = Q::values(row[i] + static_cast<std::size_t>(b) * Q::kBytes,
-                          lane, vlo[i], vhi[i]);
+        // Stage: T x 64 float4, a token past n as zeros (never read).
+        for (std::uint32_t k = threadIdx.x; k < T * 64; k += 32 * W) {
+            const std::uint32_t t = k / 64, c = k % 64;
+            xs[t][c] = t0 + t < n
+                           ? __ldg(reinterpret_cast<const float4*>(
+                                       x + static_cast<std::size_t>(t0 + t) *
+                                               cols +
+                                       static_cast<std::size_t>(b) * 256) +
+                                   c)
+                           : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
-#pragma unroll
-        for (std::uint32_t t = 0; t < T; ++t) {
-            if (t0 + t >= n) {
-                continue;
-            }
-            const float* xb = x + static_cast<std::size_t>(t0 + t) * cols +
-                              static_cast<std::size_t>(b) * 256 + e;
-            const float4 lo = __ldg(reinterpret_cast<const float4*>(xb));
-            const float4 hi =
-                __ldg(reinterpret_cast<const float4*>(xb + Q::kHi));
-            const float xl[4] = {lo.x, lo.y, lo.z, lo.w};
-            const float xh[4] = {hi.x, hi.y, hi.z, hi.w};
+        __syncthreads();
+        if (active) {
+            float vlo[R][4], vhi[R][4];
+            std::uint32_t e = 0;  // the lane's x offset, as in every row
 #pragma unroll
             for (std::uint32_t i = 0; i < R; ++i) {
-                acc[i][t] = lane_dot8_x(acc[i][t], vlo[i], vhi[i], xl, xh);
+                e = Q::values(row[i] + static_cast<std::size_t>(b) * Q::kBytes,
+                              lane, vlo[i], vhi[i]);
+            }
+#pragma unroll
+            for (std::uint32_t t = 0; t < T; ++t) {
+                if (t0 + t >= n) {
+                    continue;
+                }
+                const float4 lo = xs[t][e / 4];
+                const float4 hi = xs[t][(e + Q::kHi) / 4];
+                const float xl[4] = {lo.x, lo.y, lo.z, lo.w};
+                const float xh[4] = {hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+                for (std::uint32_t i = 0; i < R; ++i) {
+                    acc[i][t] = lane_dot8_x(acc[i][t], vlo[i], vhi[i], xl, xh);
+                }
             }
         }
+        __syncthreads();  // the next super-block overwrites xs
+    }
+    if (!active) {
+        return;  // after the last barrier: no sync is skipped
     }
 #pragma unroll
     for (std::uint32_t i = 0; i < R; ++i) {
@@ -2303,7 +2324,7 @@ __global__ void matvec_tile_kernel(const std::uint8_t* w, const float* x,
 }
 
 /**
- * matvec_tile_kernel for Q8_0 (i#1195): R rows by T tokens a warp. A
+ * The prefill tile for Q8_0 (i#1195): R rows by T tokens a warp. A
  * pass stages 32 blocks of each of the R rows in shared memory, as the
  * per-token kernel stages one row's; lane l then takes block b0 + l
  * of every row, loads each token's 32 activations of that block once
@@ -3491,9 +3512,153 @@ bool has_tile_kernel(gguf::TensorType type) {
            type == gguf::TensorType::kQ6_K || type == gguf::TensorType::kQ8_0;
 }
 
+/** A K-quant weight (TileQ4K, TileQ6K) dequantized to f32, row-major:
+ *  one warp per (row, super-block), each lane writing the 8 values the
+ *  per-token kernel decodes for it. Launch with 128 threads a block. */
+template <class Q>
+__global__ void dequant_ksb_kernel(const std::uint8_t* w, float* dst,
+                                   std::uint32_t rows, std::uint32_t nsb) {
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::size_t idx =
+        std::size_t{blockIdx.x} * (blockDim.x / 32) + threadIdx.x / 32;
+    if (idx >= std::size_t{rows} * nsb) {
+        return;
+    }
+    float lo[4], hi[4];
+    const std::uint32_t e = Q::values(w + idx * Q::kBytes, lane, lo, hi);
+    float* d = dst + idx * 256;  // row r's super-block b: (r * nsb + b)
+    for (int k = 0; k < 4; ++k) {
+        d[e + k] = lo[k];
+        d[e + Q::kHi + k] = hi[k];
+    }
+}
+
+/** A Q8_0 weight dequantized to f32 (d * q), one thread per value. */
+__global__ void dequant_q8_0_kernel(const std::uint8_t* w, float* dst,
+                                    std::size_t n) {
+    const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const std::uint8_t* blk = w + (i / 32) * 34;
+    std::uint16_t dh;
+    memcpy(&dh, blk, 2);
+    const float d = __half2float(__ushort_as_half(dh));
+    dst[i] = d * static_cast<float>(static_cast<std::int8_t>(blk[2 + i % 32]));
+}
+
+}  // namespace
+
+bool cuda_prefill_gemm_on() {
+#ifdef LOCUS_HAS_CUBLAS
+    static const bool on = [] {
+        const char* e = std::getenv("LOCUS_CUDA_GEMM");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    return on;
+#else
+    return false;
+#endif
+}
+
+namespace {
+
+/** The fewest tokens a prefill matmul runs as a GEMM (i#1200), as
+ *  Metal's kPrefillMin: below it the tile keeps the per-token bits. */
+constexpr std::uint32_t kGemmMinTokens = 32;
+/** The largest dequantized weight the GEMM stages (bytes): a bigger one
+ *  (a 128k-vocabulary head is about 1 GB) keeps the tile. */
+constexpr std::size_t kGemmMaxBytes = std::size_t{256} << 20;
+
+/**
+ * The prefill matmul of n >= kGemmMinTokens tokens as dequantize plus
+ * cuBLAS sgemm (i#1200): llama.cpp's path on this GPU, far faster than
+ * the tile, with its own sum order, so not the per-token kernel's bits.
+ * LOCUS_CUDA_GEMM=0 turns it off (a numeric mode: the disk prefix key
+ * holds it). Same layouts as launch_tile.
+ * @returns false when the GEMM does not apply (launching nothing), or
+ *     when cublasSgemm fails after the dequantize ran; either way the
+ *     caller's tile kernel then writes all of out.
+ */
+bool launch_gemm(gguf::TensorType type, const std::uint8_t* w,
+                 const float* x, float* out, std::uint32_t rows,
+                 std::uint32_t cols, std::uint32_t n) {
+#ifdef LOCUS_HAS_CUBLAS
+    const std::size_t bytes = std::size_t{rows} * cols * sizeof(float);
+    if (!cuda_prefill_gemm_on() || n < kGemmMinTokens ||
+        bytes > kGemmMaxBytes ||
+        !has_tile_kernel(type)) {
+        return false;
+    }
+    // One cuBLAS handle per device (cuBLAS takes one handle from several
+    // threads, not across devices), made once under a lock.
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cublasHandle_t handle = nullptr;
+    {
+        static std::mutex mu;
+        static std::unordered_map<int, cublasHandle_t> handles;
+        std::lock_guard<std::mutex> lk(mu);
+        auto [it, fresh] = handles.try_emplace(dev, nullptr);
+        if (fresh && cublasCreate(&it->second) != CUBLAS_STATUS_SUCCESS) {
+            it->second = nullptr;
+        }
+        handle = it->second;
+    }
+    if (handle == nullptr) {
+        return false;
+    }
+    // The dequantized weight in this call's own scratch set (i#1200): a
+    // concurrent call, or one on another device, leases another, so no
+    // thread dequantizes into the buffer another's GEMM is about to
+    // read. Held across both launches; a later user of the set queues
+    // behind them on the device's default stream.
+    ScratchLease lease;
+    auto* deq = static_cast<float*>(lease.get(0, bytes));
+    if (deq == nullptr) {
+        return false;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t sbs = std::size_t{rows} * nsb;
+    switch (type) {
+        case gguf::TensorType::kQ4_K:
+            dequant_ksb_kernel<TileQ4K>
+                <<<static_cast<unsigned>((sbs + 3) / 4), 128>>>(w, deq, rows,
+                                                                nsb);
+            break;
+        case gguf::TensorType::kQ6_K:
+            dequant_ksb_kernel<TileQ6K>
+                <<<static_cast<unsigned>((sbs + 3) / 4), 128>>>(w, deq, rows,
+                                                                nsb);
+            break;
+        default: {  // kQ8_0
+            const std::size_t vals = std::size_t{rows} * cols;
+            dequant_q8_0_kernel<<<static_cast<unsigned>((vals + 255) / 256),
+                                  256>>>(w, deq, vals);
+            break;
+        }
+    }
+    // Row-major W (rows x cols) is column-major W^T, and token-major x
+    // (n x cols) column-major x^T: out^T = W x^T, rows x n column-major,
+    // is the token-major out.
+    const float one = 1.0f, zero = 0.0f;
+    return cuda_ok(cudaGetLastError()) &&
+           cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                       static_cast<int>(rows), static_cast<int>(n),
+                       static_cast<int>(cols), &one, deq,
+                       static_cast<int>(cols), x, static_cast<int>(cols),
+                       &zero, out, static_cast<int>(rows)) ==
+               CUBLAS_STATUS_SUCCESS;
+#else
+    (void)type, (void)w, (void)x, (void)out, (void)rows, (void)cols, (void)n;
+    return false;
+#endif
+}
+
 /**
  * Launches the prefill tile kernel of `type` (has_tile_kernel) on the
- * default stream: all n tokens in one launch.
+ * default stream: all n tokens in one launch. A chunk of at least
+ * kGemmMinTokens tokens goes to launch_gemm instead, where it applies.
  * @param x n tokens, token-major (token t at t * cols).
  * @param out n * rows floats, token-major (out[t * rows + r]).
  * @returns false, launching nothing, for a type with no tile kernel.
@@ -3501,20 +3666,26 @@ bool has_tile_kernel(gguf::TensorType type) {
 bool launch_tile(gguf::TensorType type, const std::uint8_t* w,
                  const float* x, float* out, std::uint32_t rows,
                  std::uint32_t cols, std::uint32_t n) {
+    if (launch_gemm(type, w, x, out, rows, cols, n)) {
+        return true;
+    }
     // 4 rows by 8 tokens a warp was the fastest of 2 to 8 rows by 4 to
     // 16 tokens on a GTX 750 Ti (Llama 3.2 1B Q4_K_M, 511 tokens: 116.6
     // tok/s; 4 x 16 94.7, 8 x 8 104.2).
     constexpr std::uint32_t R = 4, T = 8;
     const dim3 grid((rows + kWarpRows * R - 1) / (kWarpRows * R),
                     (n + T - 1) / T);
+    // Q4_K and Q6_K stage each super-block's activations in shared
+    // memory, 4 warps a block (i#1200): 125.8 to 159.1 tok/s on the same
+    // prefill; 8 warps a block gave 148.2.
     switch (type) {
         case gguf::TensorType::kQ4_K:
-            matvec_tile_kernel<R, T, TileQ4K><<<grid, 32 * kWarpRows>>>(
-                w, x, out, rows, cols, n);
+            matvec_tile_smem_kernel<R, T, kWarpRows, TileQ4K>
+                <<<grid, 32 * kWarpRows>>>(w, x, out, rows, cols, n);
             return true;
         case gguf::TensorType::kQ6_K:
-            matvec_tile_kernel<R, T, TileQ6K><<<grid, 32 * kWarpRows>>>(
-                w, x, out, rows, cols, n);
+            matvec_tile_smem_kernel<R, T, kWarpRows, TileQ6K>
+                <<<grid, 32 * kWarpRows>>>(w, x, out, rows, cols, n);
             return true;
         case gguf::TensorType::kQ8_0:
             matvec_tile_q8_0_kernel<R, T><<<grid, 32 * kWarpRows>>>(

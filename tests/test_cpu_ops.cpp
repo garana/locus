@@ -1285,7 +1285,7 @@ TEST_CASE("matvec_cuda matches the scalar reference for K-/IQ-quants",
 // where it runs in 32-token slices. Not arch-guarded: gated at
 // runtime on a usable CUDA device.
 TEST_CASE("matvec_batch_cuda Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL/IQ4_XS "
-          "byte-identical to per-token matvec_cuda (R11)",
+          "matches per-token matvec_cuda (R11; exact below the GEMM)",
           "[ops][batch][cuda]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
@@ -1361,8 +1361,23 @@ TEST_CASE("matvec_batch_cuda Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL/IQ4_XS "
                                 {&ref, 1});
                     INFO("type " << static_cast<int>(t) << " n " << n
                                  << " row " << r << " tok " << tk);
-                    REQUIRE(got[static_cast<std::size_t>(r) * n + tk] ==
-                            ref);  // exact
+                    // From 32 tokens Q4_K, Q6_K and Q8_0 run a GEMM
+                    // (i#1200, where cuBLAS is built in): its own sum
+                    // order, so close, not exact. The random rows sum
+                    // terms near 1 to results near 0.1 (Q6_K's int8
+                    // scales), so the order moves them by about 1e-4;
+                    // a wrong dequantize would by about 1.
+                    const bool gemm =
+                        n >= 32 && (t == TensorType::kQ4_K ||
+                                    t == TensorType::kQ6_K ||
+                                    t == TensorType::kQ8_0);
+                    const float g = got[static_cast<std::size_t>(r) * n + tk];
+                    if (gemm) {
+                        REQUIRE(g == Catch::Approx(ref).epsilon(1e-3).margin(
+                                         1e-3));
+                    } else {
+                        REQUIRE(g == ref);  // exact
+                    }
                 }
             }
         }

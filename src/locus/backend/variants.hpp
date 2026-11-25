@@ -544,6 +544,13 @@ void cuda_evict(const Mat& w);
 std::size_t cuda_pool_budget();
 
 /**
+ * @returns Whether CUDA prefill chunks of 32 tokens or more run as a
+ *     dequantize plus cuBLAS GEMM (i#1200): a build with cuBLAS, and
+ *     LOCUS_CUDA_GEMM not 0; false on non-CUDA builds.
+ */
+bool cuda_prefill_gemm_on();
+
+/**
  * Device mirror of a host F32 KV pool (Ops.kv_mirror_*, i#466).
  * cuda_kv_mirror_alloc returns `n_floats` zeroed device floats, outside
  * the weight pool's budget, or nullptr when they do not fit (and always
