@@ -2201,7 +2201,7 @@ __device__ inline float lane_dot8_x(float acc, const float vlo[4],
     return acc;
 }
 
-/** The Q4_K super-block for matvec_tile_kernel: the per-token kernel's
+/** The Q4_K super-block for matvec_tile_smem_kernel: the per-token kernel's
  *  lane values, at x offset 64 j + c and its high half 32 floats on. */
 struct TileQ4K {
     static constexpr std::uint32_t kBytes = 144;
@@ -2214,7 +2214,7 @@ struct TileQ4K {
     }
 };
 
-/** The Q6_K super-block for matvec_tile_kernel: the per-token kernel's
+/** The Q6_K super-block for matvec_tile_smem_kernel: the per-token kernel's
  *  lane values, at the x offset it returns and 64 floats on. */
 struct TileQ6K {
     static constexpr std::uint32_t kBytes = 210;
@@ -2227,26 +2227,29 @@ struct TileQ6K {
 };
 
 /**
- * Prefill tile for a K-quant Q (TileQ4K, TileQ6K; i#1195): each warp
- * computes R rows by T tokens, so one load of a token's activations
- * serves R rows (the batch kernel loads them once per row, and its
- * speed is bound by those loads) and one decode of a row's weights
- * serves T tokens. Per (row, token) the lane runs the per-token
- * kernel's products in its order and the warp sums the lanes the same
- * way, so the result is byte-identical to the per-token kernel. One
- * launch covers all n tokens (grid.y tiles them) and writes the
- * token-major output (out[t * rows + r]) directly. Launch with
- * 32 * kWarpRows threads per block.
+ * Prefill tile for a K-quant Q (TileQ4K, TileQ6K; i#1195, i#1200):
+ * each warp computes R rows by T tokens, so one load of a token's
+ * activations serves R rows and one decode of a row's weights serves T
+ * tokens. Per super-block the block's threads stage the T tokens' 256
+ * floats in shared memory once, and every warp reads them from there
+ * (each warp loading them from global memory bound the speed). Per
+ * (row, token) the lane runs the per-token kernel's products in its
+ * order and the warp sums the lanes the same way, so the result is
+ * byte-identical to the per-token kernel. One launch covers all n
+ * tokens (grid.y tiles them) and writes the token-major output
+ * (out[t * rows + r]) directly. A warp past the last row stays to load
+ * and to sync, and stores nothing. Launch with 32 * W threads per
+ * block, W warps of R rows each.
  */
-template <std::uint32_t R, std::uint32_t T, class Q>
-__global__ void matvec_tile_kernel(const std::uint8_t* w, const float* x,
-                                   float* out, std::uint32_t rows,
-                                   std::uint32_t cols, std::uint32_t n) {
+template <std::uint32_t R, std::uint32_t T, std::uint32_t W, class Q>
+__global__ void matvec_tile_smem_kernel(const std::uint8_t* w,
+                                        const float* x, float* out,
+                                        std::uint32_t rows,
+                                        std::uint32_t cols, std::uint32_t n) {
+    __shared__ float4 xs[T][64];  // T tokens by 256 floats
     const std::uint32_t lane = threadIdx.x % 32;
-    const std::uint32_t r0 = (blockIdx.x * kWarpRows + threadIdx.x / 32) * R;
-    if (r0 >= rows) {
-        return;  // a whole warp leaves together: no partial shuffles
-    }
+    const std::uint32_t r0 = (blockIdx.x * W + threadIdx.x / 32) * R;
+    const bool active = r0 < rows;
     const std::uint32_t t0 = blockIdx.y * T;
     const std::uint32_t nsb = cols / 256;
     const std::uint8_t* row[R];
@@ -2265,30 +2268,45 @@ __global__ void matvec_tile_kernel(const std::uint8_t* w, const float* x,
         }
     }
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        float vlo[R][4], vhi[R][4];
-        std::uint32_t e = 0;  // the lane's x offset: the same in every row
-#pragma unroll
-        for (std::uint32_t i = 0; i < R; ++i) {
-            e = Q::values(row[i] + static_cast<std::size_t>(b) * Q::kBytes,
-                          lane, vlo[i], vhi[i]);
+        // Stage: T x 64 float4, a token past n as zeros (never read).
+        for (std::uint32_t k = threadIdx.x; k < T * 64; k += 32 * W) {
+            const std::uint32_t t = k / 64, c = k % 64;
+            xs[t][c] = t0 + t < n
+                           ? __ldg(reinterpret_cast<const float4*>(
+                                       x + static_cast<std::size_t>(t0 + t) *
+                                               cols +
+                                       static_cast<std::size_t>(b) * 256) +
+                                   c)
+                           : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
-#pragma unroll
-        for (std::uint32_t t = 0; t < T; ++t) {
-            if (t0 + t >= n) {
-                continue;
-            }
-            const float* xb = x + static_cast<std::size_t>(t0 + t) * cols +
-                              static_cast<std::size_t>(b) * 256 + e;
-            const float4 lo = __ldg(reinterpret_cast<const float4*>(xb));
-            const float4 hi =
-                __ldg(reinterpret_cast<const float4*>(xb + Q::kHi));
-            const float xl[4] = {lo.x, lo.y, lo.z, lo.w};
-            const float xh[4] = {hi.x, hi.y, hi.z, hi.w};
+        __syncthreads();
+        if (active) {
+            float vlo[R][4], vhi[R][4];
+            std::uint32_t e = 0;  // the lane's x offset, as in every row
 #pragma unroll
             for (std::uint32_t i = 0; i < R; ++i) {
-                acc[i][t] = lane_dot8_x(acc[i][t], vlo[i], vhi[i], xl, xh);
+                e = Q::values(row[i] + static_cast<std::size_t>(b) * Q::kBytes,
+                              lane, vlo[i], vhi[i]);
+            }
+#pragma unroll
+            for (std::uint32_t t = 0; t < T; ++t) {
+                if (t0 + t >= n) {
+                    continue;
+                }
+                const float4 lo = xs[t][e / 4];
+                const float4 hi = xs[t][(e + Q::kHi) / 4];
+                const float xl[4] = {lo.x, lo.y, lo.z, lo.w};
+                const float xh[4] = {hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+                for (std::uint32_t i = 0; i < R; ++i) {
+                    acc[i][t] = lane_dot8_x(acc[i][t], vlo[i], vhi[i], xl, xh);
+                }
             }
         }
+        __syncthreads();  // the next super-block overwrites xs
+    }
+    if (!active) {
+        return;  // after the last barrier: no sync is skipped
     }
 #pragma unroll
     for (std::uint32_t i = 0; i < R; ++i) {
@@ -2303,7 +2321,7 @@ __global__ void matvec_tile_kernel(const std::uint8_t* w, const float* x,
 }
 
 /**
- * matvec_tile_kernel for Q8_0 (i#1195): R rows by T tokens a warp. A
+ * The prefill tile for Q8_0 (i#1195): R rows by T tokens a warp. A
  * pass stages 32 blocks of each of the R rows in shared memory, as the
  * per-token kernel stages one row's; lane l then takes block b0 + l
  * of every row, loads each token's 32 activations of that block once
@@ -3507,14 +3525,17 @@ bool launch_tile(gguf::TensorType type, const std::uint8_t* w,
     constexpr std::uint32_t R = 4, T = 8;
     const dim3 grid((rows + kWarpRows * R - 1) / (kWarpRows * R),
                     (n + T - 1) / T);
+    // Q4_K and Q6_K stage each super-block's activations in shared
+    // memory, 4 warps a block (i#1200): 125.8 to 159.1 tok/s on the same
+    // prefill; 8 warps a block gave 148.2.
     switch (type) {
         case gguf::TensorType::kQ4_K:
-            matvec_tile_kernel<R, T, TileQ4K><<<grid, 32 * kWarpRows>>>(
-                w, x, out, rows, cols, n);
+            matvec_tile_smem_kernel<R, T, kWarpRows, TileQ4K>
+                <<<grid, 32 * kWarpRows>>>(w, x, out, rows, cols, n);
             return true;
         case gguf::TensorType::kQ6_K:
-            matvec_tile_kernel<R, T, TileQ6K><<<grid, 32 * kWarpRows>>>(
-                w, x, out, rows, cols, n);
+            matvec_tile_smem_kernel<R, T, kWarpRows, TileQ6K>
+                <<<grid, 32 * kWarpRows>>>(w, x, out, rows, cols, n);
             return true;
         case gguf::TensorType::kQ8_0:
             matvec_tile_q8_0_kernel<R, T><<<grid, 32 * kWarpRows>>>(
