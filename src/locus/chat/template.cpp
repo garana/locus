@@ -28,10 +28,12 @@ std::string_view trim(std::string_view s) {
 constexpr ChatTemplate::Family kFamilies[] = {
     ChatTemplate::Family::kPlain,         ChatTemplate::Family::kLlama2,
     ChatTemplate::Family::kLlama2Sys,     ChatTemplate::Family::kLlama2SysBos,
-    ChatTemplate::Family::kLlama2SysStrip, ChatTemplate::Family::kLlama3,
-    ChatTemplate::Family::kChatML,        ChatTemplate::Family::kZephyr,
-    ChatTemplate::Family::kDeepSeek,      ChatTemplate::Family::kDeepSeek2,
-    ChatTemplate::Family::kDeepSeekCoder};
+    ChatTemplate::Family::kLlama2SysStrip, ChatTemplate::Family::kMistralV1,
+    ChatTemplate::Family::kMistralV3,     ChatTemplate::Family::kMistralV3Tekken,
+    ChatTemplate::Family::kMistralV7,     ChatTemplate::Family::kMistralV7Tekken,
+    ChatTemplate::Family::kLlama3,        ChatTemplate::Family::kChatML,
+    ChatTemplate::Family::kZephyr,        ChatTemplate::Family::kDeepSeek,
+    ChatTemplate::Family::kDeepSeek2,     ChatTemplate::Family::kDeepSeekCoder};
 
 }  // namespace
 
@@ -46,7 +48,9 @@ std::optional<ChatTemplate> ChatTemplate::from_name(std::string_view name) {
 
 std::string_view ChatTemplate::names() {
     return "plain, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, "
-           "llama3, chatml, zephyr, deepseek, deepseek2, deepseek-coder";
+           "mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, "
+           "mistral-v7-tekken, llama3, chatml, zephyr, deepseek, deepseek2, "
+           "deepseek-coder";
 }
 
 ChatTemplate ChatTemplate::from_gguf(const gguf::GgufFile& g) {
@@ -65,6 +69,23 @@ ChatTemplate ChatTemplate::from_gguf(const gguf::GgufFile& g) {
         return ChatTemplate(Family::kChatML);
     }
     if (has("[INST]")) {
+        // llama.cpp's Mistral families come first in its [INST] branch
+        // (i#1204): [SYSTEM_PROMPT] is v7; the official v1 and v3
+        // templates are told by ' [INST] ' + system_message or
+        // [AVAILABLE_TOOLS], then v1 by " [INST]", v3-tekken by
+        // "[INST]" in double quotes, else v3.
+        if (has("[SYSTEM_PROMPT]")) {
+            return ChatTemplate(Family::kMistralV7);
+        }
+        if (has("' [INST] ' + system_message") || has("[AVAILABLE_TOOLS]")) {
+            if (has(" [INST]")) {
+                return ChatTemplate(Family::kMistralV1);
+            }
+            if (has("\"[INST]\"")) {
+                return ChatTemplate(Family::kMistralV3Tekken);
+            }
+            return ChatTemplate(Family::kMistralV3);
+        }
         // llama.cpp's Llama 2 variant rules, in its order (i#1152).
         if (has("content.strip()")) {
             return ChatTemplate(Family::kLlama2SysStrip);
@@ -188,6 +209,73 @@ ChatTemplate::Prompt ChatTemplate::render(
             }
             break;
         }
+        case Family::kMistralV7:
+        case Family::kMistralV7Tekken: {
+            // llama.cpp's LLM_CHAT_TEMPLATE_MISTRAL_V7*, string for
+            // string: v7 puts a space after each opening marker and
+            // before assistant text, v7-tekken none; any role but
+            // system and user renders as assistant, as there.
+            const std::string_view sp =
+                family_ == Family::kMistralV7 ? " " : "";
+            for (const Message& m : messages) {
+                if (m.role == "system") {
+                    out += "[SYSTEM_PROMPT]";
+                    out += sp;
+                    put(m.content);
+                    out += "[/SYSTEM_PROMPT]";
+                } else if (m.role == "user") {
+                    out += "[INST]";
+                    out += sp;
+                    put(m.content);
+                    out += "[/INST]";
+                } else {
+                    out += sp;
+                    put(m.content);
+                    out += "</s>";
+                }
+            }
+            break;
+        }
+        case Family::kMistralV1:
+        case Family::kMistralV3:
+        case Family::kMistralV3Tekken: {
+            // llama.cpp's LLM_CHAT_TEMPLATE_MISTRAL_V1 / V3 / V3_TEKKEN,
+            // string for string: v1 puts a space before [INST] and
+            // [/INST], v3-tekken none after [INST] nor before assistant
+            // text, v3 trims assistant text. System text opens the turn,
+            // followed by a blank line; an assistant turn ends with </s>
+            // and the next message opens a new [INST]. As for Llama 2,
+            // the model answers after [/INST]: no assistant header.
+            const bool v1 = family_ == Family::kMistralV1;
+            const std::string_view lead = v1 ? " " : "";
+            const std::string_view trail =
+                family_ == Family::kMistralV3Tekken ? "" : " ";
+            const bool trim_assistant = family_ == Family::kMistralV3;
+            bool inside = false;
+            for (const Message& m : messages) {
+                if (!inside) {
+                    out += lead;
+                    out += "[INST]";
+                    out += trail;
+                    inside = true;
+                }
+                if (m.role == "system") {
+                    put(m.content);
+                    out += "\n\n";
+                } else if (m.role == "user") {
+                    put(m.content);
+                    out += lead;
+                    out += "[/INST]";
+                } else {
+                    out += trail;
+                    put(trim_assistant ? trim(m.content)
+                                       : std::string_view(m.content));
+                    out += "</s>";
+                    inside = false;
+                }
+            }
+            break;
+        }
         case Family::kDeepSeek: {
             for (const Message& m : messages) {
                 if (m.role == "user") {
@@ -265,6 +353,11 @@ std::string_view ChatTemplate::name() const {
         case Family::kLlama2Sys: return "llama2-sys";
         case Family::kLlama2SysBos: return "llama2-sys-bos";
         case Family::kLlama2SysStrip: return "llama2-sys-strip";
+        case Family::kMistralV1: return "mistral-v1";
+        case Family::kMistralV3: return "mistral-v3";
+        case Family::kMistralV3Tekken: return "mistral-v3-tekken";
+        case Family::kMistralV7: return "mistral-v7";
+        case Family::kMistralV7Tekken: return "mistral-v7-tekken";
         case Family::kLlama3: return "llama3";
         case Family::kChatML: return "chatml";
         case Family::kZephyr: return "zephyr";
