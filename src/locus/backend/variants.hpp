@@ -155,8 +155,13 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
 void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n);
 
+/** quantize_activation_q8k in SSE4.1, bit-identical to it (the same
+ *  operations and rounding; qs in the plain order). */
+void quantize_activation_q8k_sse4(std::span<const float> x, float* d,
+                                  std::int8_t* qs, std::int16_t* bsums);
+
 /**
- * The four SSE4 entry points above, compiled again with AVX
+ * The five SSE4 entry points above, compiled again with AVX
  * (matvec_sse4_avx.cpp) for CPUs with AVX but not AVX2. Bit-identical
  * to the SSE4 ones; the registry uses them when sys::detect() reports
  * AVX.
@@ -171,6 +176,8 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
 void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n);
+void quantize_activation_q8k_sse4(std::span<const float> x, float* d,
+                                  std::int8_t* qs, std::int16_t* bsums);
 /**
  * One token through llama.cpp's x86 __AVX__ Q4_K / Q6_K rows (i#801):
  * its float order, not the scalar kernel's, so matvec_sse4_q8k takes it

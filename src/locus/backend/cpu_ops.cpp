@@ -11,6 +11,10 @@
 
 #include "locus/sys/thread_pool.hpp"
 
+#if defined(__x86_64__) && defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 namespace locus::backend {
 
 namespace {
@@ -2120,39 +2124,74 @@ struct BlockQ8_0Act {
 };
 
 /**
- * ggml's quantize_row_q8_0 (its NEON form): d = amax / 127 rounded to
- * f16; quants round x / d (with 1 / d from the unrounded d) to nearest
- * even.
+ * One block of ggml's quantize_row_q8_0 (its NEON form): d = amax / 127
+ * rounded to f16 into *d_out; the 32 quants round x / d (with 1 / d from
+ * the unrounded d) to nearest even into qs. A NaN product quantizes to
+ * 0 (converting it to an integer is undefined; arm64 gives 0, x86
+ * INT_MIN), as the NEON path; a NaN x is skipped by the max.
+ *
+ * On x86-64 the block runs in SSE2 (i#1198: the scalar form was 8.6% of
+ * a CPU prefill): _mm_max_ps with the running max second skips a NaN as
+ * std::max does, the multiply is the same, and _mm_cvtps_epi32 rounds to
+ * nearest even under the default rounding mode as std::nearbyint does,
+ * so the bits are the scalar form's.
  */
+inline void quantize_block32_act(const float* xb, float* d_out,
+                                 std::int8_t* qs) {
+#if defined(__x86_64__) && defined(__SSE2__)
+    const __m128 sign = _mm_set1_ps(-0.0f);
+    __m128 v[8];
+    __m128 m = _mm_setzero_ps();
+    for (int i = 0; i < 8; ++i) {
+        v[i] = _mm_loadu_ps(xb + 4 * i);
+        m = _mm_max_ps(_mm_andnot_ps(sign, v[i]), m);
+    }
+    m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(1, 0, 3, 2)));
+    m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(2, 3, 0, 1)));
+    const float amax = _mm_cvtss_f32(m);
+#else
+    float amax = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+        amax = std::max(amax, std::fabs(xb[j]));
+    }
+#endif
+    const float d = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    *d_out = f16_to_f32(f32_to_f16(d));
+#if defined(__x86_64__) && defined(__SSE2__)
+    const __m128 vid = _mm_set1_ps(id);
+    __m128i q[8];
+    for (int i = 0; i < 8; ++i) {
+        const __m128 p = _mm_mul_ps(v[i], vid);
+        const __m128i ok = _mm_castps_si128(_mm_cmpord_ps(p, p));
+        q[i] = _mm_and_si128(_mm_cvtps_epi32(p), ok);
+    }
+    for (int h = 0; h < 2; ++h) {
+        const __m128i a = _mm_packs_epi32(q[4 * h], q[4 * h + 1]);
+        const __m128i b = _mm_packs_epi32(q[4 * h + 2], q[4 * h + 3]);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(qs + 16 * h),
+                         _mm_packs_epi16(a, b));
+    }
+#else
+    for (int j = 0; j < 32; ++j) {
+        const float v = xb[j] * id;
+        qs[j] = std::isnan(v) ? 0
+                              : static_cast<std::int8_t>(std::nearbyint(v));
+    }
+#endif
+}
+
+/** ggml's quantize_row_q8_0 over n / 32 blocks (quantize_block32_act). */
 void quantize_row_q8_0_act(const float* x, BlockQ8_0Act* y, std::size_t n) {
     for (std::size_t b = 0; b < n / 32; ++b) {
-        const float* xb = x + b * 32;
-        float amax = 0.0f;
-        for (int j = 0; j < 32; ++j) {
-            amax = std::max(amax, std::fabs(xb[j]));
-        }
-        const float d = amax / 127.0f;
-        const float id = d != 0.0f ? 1.0f / d : 0.0f;
-        y[b].d = f16_to_f32(f32_to_f16(d));
-        for (int j = 0; j < 32; ++j) {
-            // A NaN quantizes to 0 (converting it to an integer is
-            // undefined; arm64 gives 0, x86 INT_MIN), as the NEON path.
-            const float v = xb[j] * id;
-            y[b].qs[j] = std::isnan(v)
-                             ? 0
-                             : static_cast<std::int8_t>(std::nearbyint(v));
-        }
+        quantize_block32_act(x + b * 32, &y[b].d, y[b].qs);
     }
 }
 
 void quantize_activation_q8_0(std::span<const float> x, float* d,
                               std::int8_t* qs) {
-    const std::size_t nb = x.size() / 32;
-    std::vector<BlockQ8_0Act> tmp(nb);
-    quantize_row_q8_0_act(x.data(), tmp.data(), x.size());
-    for (std::size_t b = 0; b < nb; ++b) {
-        d[b] = tmp[b].d;
-        std::memcpy(qs + b * 32, tmp[b].qs, 32);
+    for (std::size_t b = 0; b < x.size() / 32; ++b) {
+        quantize_block32_act(x.data() + b * 32, d + b, qs + b * 32);
     }
 }
 
