@@ -2973,7 +2973,8 @@ class WeightPool {
             std::size_t free_b = 0, total_b = 0;
             budget_ = cuda_ok(cudaMemGetInfo(&free_b, &total_b))
                           ? free_b / 5 * 4  // ~80% of free VRAM
-                          : (std::size_t{512} << 20);        }
+                          : (std::size_t{512} << 20);
+        }
     }
 
     /** Reserves room (evicting LRU) then cudaMallocs `bytes`; nullptr
