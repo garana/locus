@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 
+#include "locus/backend/metal/context.hpp"
 #include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/engine/compute_digest.hpp"
@@ -69,11 +70,18 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
     // (i#664), and asking here would settle it before the KV pool.
     // Debug and offload switches read from the environment that pick
     // other kernels or another expert split: their raw values.
-    for (const char* var : {"LOCUS_BATCH_DEQUANT", "LOCUS_MOE_HYBRID",
-                            "LOCUS_MOE_HYBRID_SLOTS", "LOCUS_VK_CPU_ROUTE",
-                            "LOCUS_GPU_POOL_MB", "LOCUS_MOE_STATS",
-                            "LOCUS_CUDA_FORWARD", "LOCUS_CUDA_GEMM",
-                            "LOCUS_CPU_FAST"}) {
+    for (const char* var :
+         {"LOCUS_BATCH_DEQUANT", "LOCUS_MOE_HYBRID", "LOCUS_MOE_HYBRID_SLOTS",
+          "LOCUS_VK_CPU_ROUTE", "LOCUS_GPU_POOL_MB", "LOCUS_MOE_STATS",
+          "LOCUS_CUDA_FORWARD", "LOCUS_CUDA_GEMM", "LOCUS_CPU_FAST",
+          // Metal: the forward itself, and the switches that pick its
+          // kernels.
+          "LOCUS_METAL_FORWARD", "LOCUS_METAL_ATTN_TILED",
+          "LOCUS_METAL_ATTN_MMA", "LOCUS_METAL_ATTN_SPLIT",
+          "LOCUS_METAL_ATTN_PASSES", "LOCUS_METAL_MULTI",
+          "LOCUS_METAL_NORM_FOLD", "LOCUS_METAL_NORM_ROPE",
+          "LOCUS_METAL_ROPE_EPILOGUE", "LOCUS_METAL_MOE_MM",
+          "LOCUS_METAL_MOE_ROUTE", "LOCUS_METAL_Q6K"}) {
         const char* v = std::getenv(var);
         const std::string s = v != nullptr ? std::string("=") + v : "";
         o = fnv(fnv(o, var, std::strlen(var)), s.data(), s.size());
@@ -88,6 +96,15 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
         // Batch-invariant decode: a lone sequence's K / V from
         // metal_forward_multi, not metal_forward (i#1184).
         o = fnv(o, m.metal_batch_invariant());
+        // The GPU forward or the per-op path (with f32 or f16 K / V
+        // alike), and the device: its kernels pick their layout by GPU
+        // family (the Q6_K matvec, the decode norm fold).
+        o = fnv(o, m.metal_forward_supported());
+        if (backend::metal::Context::usable()) {
+            const std::string& dev =
+                backend::metal::Context::get().device_name();
+            o = fnv(o, dev.data(), dev.size());
+        }
     } else if (be == "cuda") {
         const std::string dev = backend::cuda_device_name();
         o = fnv(o, dev.data(), dev.size());

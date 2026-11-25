@@ -12,6 +12,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -151,6 +152,9 @@ namespace {
 struct Scratch {
     Context::Buffer x, xb, q, att, gate, up, logits, cs, scores, blocks;
     Context::Buffer parts;  // attn_split's per-part sums
+    // A half pool (kv-type f16): this position's K and V rows as floats,
+    // and each layer's K row offset for kv_scatter_f16.
+    Context::Buffer kf, vf, krows;
     // MoE: the router logits (and the shared expert's gate logit after
     // them), and one expert's output.
     Context::Buffer router, eout, route;
@@ -171,6 +175,47 @@ Scratch& scratch() {
 template <typename T>
 std::span<const std::byte> bytes_of(const T& v) {
     return std::as_bytes(std::span<const T>(&v, 1));
+}
+
+/** @returns whether the GPU forward takes this cache's KV type: f32, or
+ *  f16 (--kv-type f16: the f32 layout in halves). */
+bool kv_type_ok(const kv::PagedKvCache& c) {
+    const kv::KvType t = c.geometry().kv_type;
+    return t == kv::KvType::kF32 || t == kv::KvType::kF16;
+}
+
+/** @returns whether the pool holds halves (the kernels' _f16 forms). */
+bool kv_half(const kv::PagedKvCache& c) {
+    return c.geometry().kv_type == kv::KvType::kF16;
+}
+
+/** @returns the Metal buffer of the cache's pool, or nullptr. */
+const Context::Buffer* kv_pool_buffer(const kv::PagedKvCache& c) {
+    return backend::metal::kv_buffer(
+        kv_half(c) ? reinterpret_cast<const float*>(c.qpool_data())
+                   : c.pool_data());
+}
+
+/** @returns the element offset of (seq, layer, pos)'s K row in the pool
+ *  (its V row is layer_floats() / 2 further), as kernels.metal's kv_row
+ *  computes it; an f32 or f16 pool alike. */
+std::uint64_t kv_row_off(const kv::PagedKvCache& c,
+                         const kv::PagedKvCache::Seq& seq,
+                         std::uint32_t layer, std::uint32_t pos) {
+    const auto& g = c.geometry();
+    return std::uint64_t{seq.blocks[pos / g.block_tokens]} *
+               c.block_floats() +
+           c.layer_offset(layer) +
+           std::uint64_t{pos % g.block_tokens} * g.kv_dim;
+}
+
+/** @returns the kernel `name`, or its _f16 form for a half pool. */
+std::string kv_kernel(std::string_view name, bool half) {
+    std::string k(name);
+    if (half) {
+        k += "_f16";
+    }
+    return k;
 }
 
 // The kernels' parameter blocks (kernels.metal).
@@ -816,7 +861,7 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                                      std::span<float> logits,
                                      LogitRows rows_out) const {
     using namespace backend;
-    if (!metal_forward_supported() || cache.quantized()) {
+    if (!metal_forward_supported() || !kv_type_ok(cache)) {
         return false;
     }
     if (embd == nullptr &&
@@ -857,10 +902,11 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
     const std::uint32_t n_parts = (n_pos + kAttnGroup - 1) / kAttnGroup;
 
     std::lock_guard lk(metal::device_mutex());
-    const Context::Buffer* pool = metal::kv_buffer(cache.pool_data());
+    const Context::Buffer* pool = kv_pool_buffer(cache);
     if (pool == nullptr) {
         return false;  // not a Metal pool
     }
+    const bool half = kv_half(cache);
     try {
         Context& ctx = Context::get();
         Scratch& s = scratch();
@@ -905,12 +951,24 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         std::copy_n(seq.blocks.begin(), n_blocks,
                     static_cast<std::uint32_t*>(s.blocks.data));
 
-        // This position's K and V rows, as floats into the pool.
-        const auto* base = cache.pool_data();
+        // This position's K and V rows: element offsets into the pool.
         const auto row_of = [&](std::uint32_t l, bool v) {
-            const float* p = v ? cache.v(seq, l, pos) : cache.k(seq, l, pos);
-            return static_cast<std::uint64_t>(p - base);
+            return kv_row_off(cache, seq, l, pos) +
+                   (v ? cache.layer_floats() / 2 : 0);
         };
+        // An f32 pool takes the K and V rows straight from their
+        // matvecs; a half pool gets them as floats in kf / vf (bias,
+        // norm and RoPE there), then rounded in by kv_scatter_f16.
+        if (half) {
+            const std::size_t kvd_b = std::size_t{KV} * hd * 4;
+            Scratch::grow(ctx, s.kf, kvd_b);
+            Scratch::grow(ctx, s.vf, kvd_b);
+            Scratch::grow(ctx, s.krows, std::size_t{L} * 8);
+            auto* kr = static_cast<std::uint64_t*>(s.krows.data);
+            for (std::uint32_t l = 0; l < L; ++l) {
+                kr[l] = row_of(l, false);
+            }
+        }
 
         // Routing on the GPU (moe_route) when the kernel covers the
         // arch's selection: no group-limited routing, at most 1024
@@ -987,6 +1045,11 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 const Layer& lay = layers_[l];
                 const std::uint64_t krow = row_of(l, false);
                 const std::uint64_t vrow = row_of(l, true);
+                // Where K and V are written: the pool rows, or kf / vf.
+                const Context::Buffer& kdst = half ? s.kf : *pool;
+                const Context::Buffer& vdst = half ? s.vf : *pool;
+                const std::uint64_t koff = half ? 0 : krow;
+                const std::uint64_t voff = half ? 0 : vrow;
                 // The attention's RMSNorm in the q / k / v matvecs when
                 // all three take it, else rmsnorm_f32 into xb first.
                 const bool fold_attn = fold_ok({&lay.wq, &lay.wk, &lay.wv});
@@ -1012,19 +1075,19 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     mvf_must(lay.wq, qin, s.q, 0, nf);
                 }
                 ctx.overlap_next();
-                const bool rk = fuse && mvf(lay.wk, qin, *pool, krow, nr);
+                const bool rk = fuse && mvf(lay.wk, qin, kdst, koff, nr);
                 if (!rk) {
-                    mvf_must(lay.wk, qin, *pool, krow, nf);
+                    mvf_must(lay.wk, qin, kdst, koff, nf);
                 }
                 ctx.overlap_next();
-                mvf_must(lay.wv, qin, *pool, vrow, nf);
+                mvf_must(lay.wv, qin, vdst, voff, nf);
                 if (lay.has_qkv_bias()) {
                     // qwen2: the biases, which may overlap, then RoPE.
                     r.bias(s.q, 0, lay.wq_bias, 1, 0);
                     ctx.overlap_next();
-                    r.bias(*pool, krow, lay.wk_bias, 1, 0);
+                    r.bias(kdst, koff, lay.wk_bias, 1, 0);
                     ctx.overlap_next();
-                    r.bias(*pool, vrow, lay.wv_bias, 1, 0);
+                    r.bias(vdst, voff, lay.wv_bias, 1, 0);
                 }
                 const bool qk_norm_rope = lay.has_qk_norm() && norm_rope;
                 if (qk_norm_rope) {
@@ -1032,12 +1095,12 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     // dispatch each (overlapping).
                     head_norm_rope(s.q, 0, H, lay.attn_q_norm);
                     ctx.overlap_next();
-                    head_norm_rope(*pool, krow, KV, lay.attn_k_norm);
+                    head_norm_rope(kdst, koff, KV, lay.attn_k_norm);
                 } else if (lay.has_qk_norm()) {
                     // qwen3: the per-head q / k norms (overlapping).
                     r.head_norm(s.q, 0, H, lay.attn_q_norm, 1, 0);
                     ctx.overlap_next();
-                    r.head_norm(*pool, krow, KV, lay.attn_k_norm, 1, 0);
+                    r.head_norm(kdst, koff, KV, lay.attn_k_norm, 1, 0);
                 }
                 if (!rq && !qk_norm_rope) {
                     r.rope(s.q, 0, H);
@@ -1046,7 +1109,18 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     if (!rq) {
                         ctx.overlap_next();
                     }
-                    r.rope(*pool, krow, KV);
+                    r.rope(kdst, koff, KV);
+                }
+                if (half) {
+                    // K and V, done, rounded into the pool's halves.
+                    const ScatterParams sp{cache.layer_floats() / 2, 1,
+                                           KV * hd};
+                    const Context::Arg sa[] = {{&s.kf, 0},
+                                               {&s.vf, 0},
+                                               {pool, 0},
+                                               {&s.krows, std::size_t{l} * 8}};
+                    ctx.dispatch("kv_scatter_f16", sa, bytes_of(sp), KV * hd,
+                                 256);
                 }
                 const AttnParams ap{cache.block_floats(),
                                     cache.layer_offset(l),
@@ -1062,30 +1136,32 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     const AttnSplitParams spp{ap, n_parts};
                     const Context::Arg pa[] = {
                         {&s.q, 0}, {pool, 0}, {&s.blocks, 0}, {&s.parts, 0}};
-                    ctx.dispatch("attn_split", pa, bytes_of(spp),
-                                 H * n_parts * kAttnGroup, kAttnGroup);
+                    ctx.dispatch(kv_kernel("attn_split", half), pa,
+                                 bytes_of(spp), H * n_parts * kAttnGroup,
+                                 kAttnGroup);
                     const Context::Arg ma[] = {{&s.parts, 0}, {&s.att, 0}};
                     ctx.dispatch("attn_merge", ma, bytes_of(spp), H * hd, 64);
                 } else if (fused_attn) {
                     // One kernel, one threadgroup a head.
                     const Context::Arg fa[] = {
                         {&s.q, 0}, {pool, 0}, {&s.blocks, 0}, {&s.att, 0}};
-                    ctx.dispatch("attn_fused", fa, bytes_of(ap),
-                                 H * kAttnGroup, kAttnGroup);
+                    ctx.dispatch(kv_kernel("attn_fused", half), fa,
+                                 bytes_of(ap), H * kAttnGroup, kAttnGroup);
                 } else {
                     const Context::Arg sa[] = {{&s.q, 0},
                                                {pool, 0},
                                                {&s.blocks, 0},
                                                {&s.scores, 0}};
-                    ctx.dispatch("attn_scores", sa, bytes_of(ap), H * n_pos,
-                                 64);
+                    ctx.dispatch(kv_kernel("attn_scores", half), sa,
+                                 bytes_of(ap), H * n_pos, 64);
                     // One threadgroup a head (H groups of kNormGroup).
                     const Context::Arg sm[] = {{&s.scores, 0}};
                     ctx.dispatch("attn_softmax", sm, bytes_of(ap),
                                  H * kNormGroup, kNormGroup);
                     const Context::Arg va[] = {
                         {&s.scores, 0}, {pool, 0}, {&s.blocks, 0}, {&s.att, 0}};
-                    ctx.dispatch("attn_values", va, bytes_of(ap), H * hd, 64);
+                    ctx.dispatch(kv_kernel("attn_values", half), va,
+                                 bytes_of(ap), H * hd, 64);
                 }
                 r.mv(lay.wo, s.att, s.x, 0, true);
                 // A dense FFN's RMSNorm in gate / up likewise; a MoE layer
@@ -1163,7 +1239,7 @@ bool TransformerModel::metal_forward_multi(
     const char* multi_env = std::getenv("LOCUS_METAL_MULTI");
     if ((multi_env != nullptr && std::string_view(multi_env) == "0") ||
         n == 0 || n > kMultiMax || seqs.size() != n ||
-        !metal_forward_supported() || cache.quantized() ||
+        !metal_forward_supported() || !kv_type_ok(cache) ||
         logits.size() < std::size_t{n} * V) {
         return false;
     }
@@ -1204,10 +1280,11 @@ bool TransformerModel::metal_forward_multi(
     }
 
     std::lock_guard lk(metal::device_mutex());
-    const Context::Buffer* pool = metal::kv_buffer(cache.pool_data());
+    const Context::Buffer* pool = kv_pool_buffer(cache);
     if (pool == nullptr) {
         return false;  // not a Metal pool
     }
+    const bool half = kv_half(cache);
     try {
         Context& ctx = Context::get();
         MultiScratch& s = multi_scratch();
@@ -1238,7 +1315,6 @@ bool TransformerModel::metal_forward_multi(
         auto* cs = static_cast<float*>(s.cs.data);
         auto* blocks = static_cast<std::uint32_t*>(s.blocks.data);
         auto* rows = static_cast<std::uint64_t*>(s.rows.data);
-        const float* base = cache.pool_data();
         for (std::uint32_t c = 0; c < n; ++c) {
             ops().dequant_row(embd_, static_cast<std::uint32_t>(toks[c]),
                               {x + std::size_t{c} * E, E});
@@ -1249,8 +1325,8 @@ bool TransformerModel::metal_forward_multi(
                         blocks + blk_at[c]);
             // Row (l, c): sequence c's K row at its position in layer l.
             for (std::uint32_t l = 0; l < L; ++l) {
-                rows[std::size_t{l} * n + c] = static_cast<std::uint64_t>(
-                    cache.k(*seqs[c], l, pos[c]) - base);
+                rows[std::size_t{l} * n + c] =
+                    kv_row_off(cache, *seqs[c], l, pos[c]);
             }
         }
 
@@ -1360,7 +1436,8 @@ bool TransformerModel::metal_forward_multi(
                 // (as metal_forward); rows write theirs to k / v, then
                 // kv_scatter copies each into its own sequence's. The
                 // same kernels either way, so the same bits.
-                const bool direct = n == 1;
+                // A half pool takes them through kv_scatter_f16 always.
+                const bool direct = n == 1 && !half;
                 const std::uint64_t krow = rows[std::size_t{l} * n];
                 const std::uint64_t vrow =
                     krow + cache.layer_floats() / 2;
@@ -1400,7 +1477,8 @@ bool TransformerModel::metal_forward_multi(
                     const Context::Arg sa[] = {
                         {&s.k, 0}, {&s.v, 0}, {pool, 0},
                         {&s.rows, std::size_t{l} * n * 8}};
-                    ctx.dispatch("kv_scatter", sa, bytes_of(sp),
+                    ctx.dispatch(kv_kernel("kv_scatter", half), sa,
+                                 bytes_of(sp),
                                  static_cast<std::uint32_t>(n * kvd), 256);
                 }
                 // Each sequence's attention over its own blocks, as
@@ -1429,8 +1507,9 @@ bool TransformerModel::metal_forward_multi(
                                                    {pool, 0},
                                                    {&s.blocks, bo},
                                                    {&s.parts, po}};
-                        ctx.dispatch("attn_split", pa, bytes_of(spp),
-                                     H * parts * kAttnGroup, kAttnGroup);
+                        ctx.dispatch(kv_kernel("attn_split", half), pa,
+                                     bytes_of(spp), H * parts * kAttnGroup,
+                                     kAttnGroup);
                         const Context::Arg ma[] = {{&s.parts, po},
                                                    {&s.att, qo}};
                         ctx.dispatch("attn_merge", ma, bytes_of(spp), H * hd,
@@ -1440,15 +1519,16 @@ bool TransformerModel::metal_forward_multi(
                                                    {pool, 0},
                                                    {&s.blocks, bo},
                                                    {&s.att, qo}};
-                        ctx.dispatch("attn_fused", fa, bytes_of(ap),
-                                     H * kAttnGroup, kAttnGroup);
+                        ctx.dispatch(kv_kernel("attn_fused", half), fa,
+                                     bytes_of(ap), H * kAttnGroup,
+                                     kAttnGroup);
                     } else {
                         const Context::Arg sca[] = {{&s.q, qo},
                                                     {pool, 0},
                                                     {&s.blocks, bo},
                                                     {&s.scores, so}};
-                        ctx.dispatch("attn_scores", sca, bytes_of(ap),
-                                     H * np, 64);
+                        ctx.dispatch(kv_kernel("attn_scores", half), sca,
+                                     bytes_of(ap), H * np, 64);
                         const Context::Arg sm[] = {{&s.scores, so}};
                         ctx.dispatch("attn_softmax", sm, bytes_of(ap),
                                      H * kNormGroup, kNormGroup);
@@ -1456,8 +1536,8 @@ bool TransformerModel::metal_forward_multi(
                                                    {pool, 0},
                                                    {&s.blocks, bo},
                                                    {&s.att, qo}};
-                        ctx.dispatch("attn_values", va, bytes_of(ap),
-                                     H * hd, 64);
+                        ctx.dispatch(kv_kernel("attn_values", half), va,
+                                     bytes_of(ap), H * hd, 64);
                     }
                 }
                 mm(lay.wo, s.att, static_cast<std::uint32_t>(qd), s.x, 0, E,
@@ -1522,7 +1602,7 @@ bool TransformerModel::metal_forward_batch(
         std::max(32u, (hp_.n_expert + 31) / 32 * 32);
     if (n < (all_logits ? kPrefillMin : 2) || (any_moe && !gpu_route) ||
         !metal_forward_supported() ||
-        cache.quantized() ||
+        !kv_type_ok(cache) ||
         base + n > kAttnMaxPos || base + n > hp_.n_ctx ||
         base + n > cache.capacity(seq) || hd > kAttnGroup ||
         kAttnGroup % hd != 0 || (!embd.empty() && embd.size() != n) ||
@@ -1552,10 +1632,11 @@ bool TransformerModel::metal_forward_batch(
     const std::uint32_t bt = cache.geometry().block_tokens;
 
     std::lock_guard lk(metal::device_mutex());
-    const Context::Buffer* pool = metal::kv_buffer(cache.pool_data());
+    const Context::Buffer* pool = kv_pool_buffer(cache);
     if (pool == nullptr) {
         return false;
     }
+    const bool half = kv_half(cache);
     try {
         Context& ctx = Context::get();
         BatchScratch& s = batch_scratch();
@@ -1571,7 +1652,6 @@ bool TransformerModel::metal_forward_batch(
         const std::uint32_t NR = hp_.n_expert + 1;  // a token's logits
         std::copy_n(seq.blocks.begin(), n_blocks,
                     static_cast<std::uint32_t*>(s.blocks.data));
-        const float* pool_base = cache.pool_data();
         // The experts as grouped matmuls (LOCUS_METAL_MOE_MM=0: a matvec
         // slot each, for tests).
         const char* mm_env = std::getenv("LOCUS_METAL_MOE_MM");
@@ -1604,8 +1684,7 @@ bool TransformerModel::metal_forward_batch(
                                 {cs + std::size_t{t} * hd, hd});
                 for (std::uint32_t l = 0; l < L; ++l) {
                     rows[std::size_t{l} * m + t] =
-                        static_cast<std::uint64_t>(cache.k(seq, l, pos) -
-                                                   pool_base);
+                        kv_row_off(cache, seq, l, pos);
                 }
             }
             run_batch(ctx, [&] {
@@ -1654,7 +1733,8 @@ bool TransformerModel::metal_forward_batch(
                         {&s.v, 0},
                         {pool, 0},
                         {&s.rows, std::size_t{l} * m * 8}};
-                    ctx.dispatch("kv_scatter", sa, bytes_of(sp),
+                    ctx.dispatch(kv_kernel("kv_scatter", half), sa,
+                                 bytes_of(sp),
                                  m * static_cast<std::uint32_t>(kvd), 256);
                     // n_pos carries the sub-chunk's token count.
                     const AttnRowsParams ap{
@@ -1668,15 +1748,18 @@ bool TransformerModel::metal_forward_batch(
                     if (mma_attn) {
                         // 64 queries of a head a threadgroup, on the
                         // simdgroup matrices.
-                        ctx.dispatch("attn_rows_mma", aa, bytes_of(ap),
-                                     ((m + 63) / 64) * H * 256, 256);
+                        ctx.dispatch(kv_kernel("attn_rows_mma", half), aa,
+                                     bytes_of(ap), ((m + 63) / 64) * H * 256,
+                                     256);
                     } else if (tiled_attn) {
                         // 8 queries of a head a threadgroup, K / V staged.
-                        ctx.dispatch("attn_rows_tiled", aa, bytes_of(ap),
-                                     ((m + 7) / 8) * H * 256, 256);
+                        ctx.dispatch(kv_kernel("attn_rows_tiled", half), aa,
+                                     bytes_of(ap), ((m + 7) / 8) * H * 256,
+                                     256);
                     } else {
-                        ctx.dispatch("attn_rows", aa, bytes_of(ap),
-                                     m * H * kAttnGroup, kAttnGroup);
+                        ctx.dispatch(kv_kernel("attn_rows", half), aa,
+                                     bytes_of(ap), m * H * kAttnGroup,
+                                     kAttnGroup);
                     }
                     r.mm(lay.wo, s.att, static_cast<std::uint32_t>(qd), s.x, E,
                        true, m);

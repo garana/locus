@@ -31,6 +31,7 @@
 #include "locus/backend/metal/seq.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/engine/disk_prefix_key.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
@@ -1985,6 +1986,250 @@ TEST_CASE("metal decode over several sequences tracks one at a time",
     if (ran == 0) {
         SKIP("no test models");
     }
+}
+
+// i#1074: --kv-type f16 on Metal. The GPU forward (prefill, decode and
+// several sequences at once) reads and writes the pool as halves; it
+// tracks the CPU's f16 path (the per-op one, whose codec rounds to the
+// same halves), and the pool's bytes hold the CPU codec's layout.
+TEST_CASE("metal f16 KV tracks the CPU's f16 path", "[metal][e2e]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    using locus::kv::KvType;
+    using locus::kv::PagedKvCache;
+    struct Mode {
+        Mode() { locus::backend::metal::set_batch_invariant(false); }
+        ~Mode() { locus::backend::metal::reset_batch_invariant(); }
+    } const mode;
+    int ran = 0;
+    for (const char* name :
+         {"llama-3.2-1b-q8_0.gguf", "llama-3.2-1b-q4_k_m.gguf",
+          "qwen2.5-0.5b-instruct-q8_0.gguf"}) {
+        const std::string path =
+            std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
+        if (!std::filesystem::exists(path)) {
+            WARN(path << " absent: skipped");
+            continue;
+        }
+        ++ran;
+        CAPTURE(name);
+        auto g = locus::gguf::GgufFile::open(path);
+        auto model = locus::model::TransformerModel::load(g);
+        model.use_q8k_activations(false);  // the f32 CPU reference
+        const auto tok = locus::tok::tokenizer_from_gguf(g);
+        const std::uint32_t nv = model.hparams().n_vocab;
+        // Past 512 positions, so the next token's decode takes the
+        // split attention.
+        std::string text;
+        for (int i = 0; i < 60; ++i) {
+            text += "The quick brown fox jumps over the lazy dog. ";
+        }
+        const auto ids = tok->encode(text, true);
+        REQUIRE(ids.size() > 512);
+        const auto close = [&](std::span<const float> a,
+                               std::span<const float> b) {
+            CHECK(locus::model::argmax(a) == locus::model::argmax(b));
+            float worst = 0.0f, scale = 0.0f;
+            for (std::size_t r = 0; r < a.size(); ++r) {
+                worst = std::max(worst, std::abs(a[r] - b[r]));
+                scale = std::max(scale, std::abs(b[r]));
+            }
+            CHECK(worst <= 0.01f * scale);
+        };
+        // The prompt, then one decode step: (prompt logits, next logits).
+        const auto run = [&](std::string_view be, KvType kt) {
+            model.use_backend(*locus::backend::find_backend(be));
+            auto cache = model.make_cache(0, kt);
+            REQUIRE(cache.geometry().kv_type == kt);
+            auto ws = model.make_workspace();
+            PagedKvCache::Seq seq;
+            REQUIRE(cache.ensure_capacity(
+                seq, static_cast<std::uint32_t>(ids.size()) + 1));
+            std::vector<float> lg(nv), next(nv);
+            model.forward_batch(ids, cache, seq, ws, lg);
+            model.forward(locus::model::argmax(std::span<const float>(lg)),
+                          cache, seq, ws, next);
+            cache.release(seq);
+            return std::pair(lg, next);
+        };
+        const auto cpu = run(locus::backend::backends().front().name,
+                             KvType::kF16);
+        const std::uint64_t before =
+            locus::model::TransformerModel::metal_forward_tokens();
+        const auto gpu = run("metal", KvType::kF16);
+        // The prompt and the next token ran on the GPU forward.
+        CHECK(locus::model::TransformerModel::metal_forward_tokens() -
+                  before ==
+              ids.size() + 1);
+        close(gpu.first, cpu.first);
+        close(gpu.second, cpu.second);
+        // And f16 tracks f32 on the GPU (rounding K / V only).
+        const auto f32 = run("metal", KvType::kF32);
+        close(gpu.second, f32.second);
+
+        // The GPU's halves sit where the CPU codec reads them: a short
+        // prompt's K and V rows, read back with load_row, are the f32
+        // run's rows rounded (one row a layer, at the last position).
+        {
+            model.use_backend(*locus::backend::find_backend("metal"));
+            const auto few = tok->encode("Roses are red,", true);
+            const auto last = static_cast<std::uint32_t>(few.size() - 1);
+            auto c32 = model.make_cache(0, KvType::kF32);
+            auto c16 = model.make_cache(0, KvType::kF16);
+            auto ws = model.make_workspace();
+            PagedKvCache::Seq s32, s16;
+            REQUIRE(c32.ensure_capacity(s32, last + 1));
+            REQUIRE(c16.ensure_capacity(s16, last + 1));
+            std::vector<float> lg(nv);
+            model.forward_batch(few, c32, s32, ws, lg);
+            model.forward_batch(few, c16, s16, ws, lg);
+            const std::uint32_t kvd = c32.geometry().kv_dim;
+            std::vector<float> a(kvd), b(kvd);
+            for (std::uint32_t l = 0; l < model.hparams().n_layers; ++l) {
+                for (const bool v : {false, true}) {
+                    CAPTURE(l, v);
+                    c32.load_row(s32, l, last, v, a);
+                    c16.load_row(s16, l, last, v, b);
+                    float worst = 0.0f, scale = 0.0f;
+                    for (std::uint32_t i = 0; i < kvd; ++i) {
+                        worst = std::max(worst, std::abs(a[i] - b[i]));
+                        scale = std::max(scale, std::abs(a[i]));
+                    }
+                    // Half rounding (2^-11 relative) and the two runs'
+                    // own differences in the layers before.
+                    CHECK(worst <= 0.02f * scale);
+                }
+            }
+            c32.release(s32);
+            c16.release(s16);
+        }
+
+        // Three sequences decoded at once track one at a time, f16.
+        model.use_backend(*locus::backend::find_backend("metal"));
+        const std::vector<std::string> texts{
+            "Hello", "Once upon a time, in a land far away,", text};
+        const auto decode = [&](bool together) {
+            auto cache = model.make_cache(0, KvType::kF16);
+            auto ws = model.make_workspace();
+            std::vector<PagedKvCache::Seq> seqs(texts.size());
+            std::vector<PagedKvCache::Seq*> ptrs;
+            std::vector<locus::tok::TokenId> next;
+            std::vector<float> lg(nv);
+            for (std::size_t c = 0; c < texts.size(); ++c) {
+                const auto t = tok->encode(texts[c], true);
+                REQUIRE(cache.ensure_capacity(
+                    seqs[c], static_cast<std::uint32_t>(t.size()) + 1));
+                model.forward_batch(t, cache, seqs[c], ws, lg);
+                next.push_back(
+                    locus::model::argmax(std::span<const float>(lg)));
+                ptrs.push_back(&seqs[c]);
+            }
+            std::vector<float> out(texts.size() * nv);
+            if (together) {
+                model.forward_batch_decode(next, cache, ptrs, ws, out);
+            } else {
+                for (std::size_t c = 0; c < texts.size(); ++c) {
+                    model.forward(next[c], cache, seqs[c], ws,
+                                  {out.data() + c * nv, nv});
+                }
+            }
+            for (auto& sq : seqs) {
+                cache.release(sq);
+            }
+            return out;
+        };
+        const auto one = decode(false);
+        const std::uint64_t mb =
+            locus::model::TransformerModel::metal_multi_tokens();
+        const auto many = decode(true);
+        CHECK(locus::model::TransformerModel::metal_multi_tokens() - mb ==
+              texts.size());
+        for (std::size_t c = 0; c < texts.size(); ++c) {
+            CAPTURE(c);
+            close(std::span<const float>(many).subspan(c * nv, nv),
+                  std::span<const float>(one).subspan(c * nv, nv));
+        }
+    }
+    if (ran == 0) {
+        SKIP("no test models");
+    }
+}
+
+// i#1074: a Metal run's disk prefix key names its KV type, so an f16
+// run's file is not an f32 run's, nor the reverse; and the switches
+// that send it to the per-op path (LOCUS_METAL_FORWARD=0) or to other
+// kernels, so a per-op f16 file is not the GPU forward's.
+TEST_CASE("metal disk prefix key: the KV type and the forward's switches",
+          "[metal][disk_prefix]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    const std::string path =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/llama-3.2-1b-q8_0.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("llama-3.2-1b-q8_0.gguf absent");
+    }
+    using locus::engine::DiskKey;
+    using locus::engine::DiskPrefixStore;
+    using locus::kv::KvType;
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("metal"));
+    const auto key = [&](KvType t, std::size_t& bb) {
+        return locus::engine::disk_key_for(g, path, model, t, bb);
+    };
+    std::size_t bb16 = 0, bb32 = 0;
+    const DiskKey k16 = key(KvType::kF16, bb16);
+    const DiskKey k32 = key(KvType::kF32, bb32);
+    REQUIRE(k16.kv_type == KvType::kF16);
+    REQUIRE(k32.kv_type == KvType::kF32);
+    REQUIRE(bb16 * 2 == bb32);  // the same layout, in halves
+
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("locus-metal-key-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::vector<locus::tok::TokenId> prompt(40);
+    for (std::size_t i = 0; i < prompt.size(); ++i) {
+        prompt[i] = static_cast<locus::tok::TokenId>(100 + i);
+    }
+    const std::uint32_t nb = 2;  // 32 of the 40 tokens (16 a block)
+    // A file written under `w` (blocks of wb bytes) is found under `w`
+    // and not under `r`.
+    const auto misses = [&](const DiskKey& w, std::size_t wb,
+                            const DiskKey& r, std::size_t rb) {
+        std::filesystem::remove_all(dir);
+        std::vector<std::vector<std::uint8_t>> blk(
+            nb, std::vector<std::uint8_t>(wb, 7));
+        std::vector<const std::uint8_t*> src;
+        for (const auto& b : blk) {
+            src.push_back(b.data());
+        }
+        {
+            DiskPrefixStore s(dir, w, wb, std::uint64_t{1} << 30);
+            REQUIRE(s.write(prompt, nb, src));
+            REQUIRE(s.find(prompt) == nb);
+        }
+        DiskPrefixStore s(dir, r, rb, std::uint64_t{1} << 30);
+        return s.find(prompt) == 0;
+    };
+    CHECK(misses(k16, bb16, k32, bb32));
+    CHECK(misses(k32, bb32, k16, bb16));
+
+    // Each switch that picks the per-op path or other kernels.
+    for (const char* var :
+         {"LOCUS_METAL_FORWARD", "LOCUS_METAL_ATTN_MMA",
+          "LOCUS_METAL_ATTN_SPLIT", "LOCUS_METAL_MULTI",
+          "LOCUS_METAL_NORM_FOLD"}) {
+        CAPTURE(var);
+        setenv(var, "0", 1);
+        std::size_t bb = 0;
+        const DiskKey off = key(KvType::kF16, bb);
+        unsetenv(var);
+        CHECK(off.overrides != k16.overrides);
+        CHECK(misses(off, bb, k16, bb16));
+    }
+    std::filesystem::remove_all(dir);
 }
 
 // i#1184: decode tokens / s over N sequences, one forward for all
