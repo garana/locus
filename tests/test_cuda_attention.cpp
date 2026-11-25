@@ -109,6 +109,34 @@ TEST_CASE("cuda attention over the KV mirror matches the host",
         }
     }
 
+    // Every group from 1 to 8 on the same KV (i#1196: Qwen2.5-0.5B's is
+    // 7, Llama 3.2 3B's 3): the device matches the host.
+    for (std::uint32_t grp = 1; grp <= 8; ++grp) {
+        INFO("group " << grp);
+        locus::model::Hparams hg = hp;
+        hg.n_heads = n_kv * grp;
+        const std::size_t w = std::size_t{hg.n_heads} * hd;
+        std::vector<float> qg(w), og(w), rg(w);
+        for (auto& v : qg) {
+            v = ud(rng);
+        }
+        REQUIRE(locus::model::device_gqa_attend(cuda.ops, cache, seq, layer,
+                                                hg, n_pos - 1, 1, qg.data(),
+                                                og.data(), w));
+        locus::model::gqa_attend(
+            qg.data(), rg.data(), hg.n_heads, hd, grp, n_pos - 1,
+            hg.kq_scale,
+            [&](std::uint32_t t) -> const float* {
+                return cache.k(seq, layer, t);
+            },
+            [&](std::uint32_t t) -> const float* {
+                return cache.v(seq, layer, t);
+            });
+        for (std::size_t j = 0; j < w; ++j) {
+            REQUIRE(og[j] == Catch::Approx(rg[j]).epsilon(1e-5).margin(1e-5));
+        }
+    }
+
     // Two sequences in one launch (batch decode): each query gets the
     // bits of its own single-sequence launch.
     Seq seq2;
@@ -208,6 +236,82 @@ TEST_CASE("cuda attention: prefill and decode give the same logits",
         top = std::max(top, std::fabs(cpu[i]));
     }
     CHECK(worst <= 1e-3f * top);
+}
+
+TEST_CASE("cuda forward runs qwen2 on the GPU path, prefill equal to decode",
+          "[cuda][attention][mirror][qwen]") {
+    // Qwen2's attention (q / k / v biases, NEOX RoPE) takes the
+    // one-submit forward (i#1196): the device stage moves and the per-op
+    // attention stage does not; a prefill gives the bits of decode
+    // steps; both stay close to the CPU's forward.
+    const auto* cuda = locus::backend::find_backend("cuda");
+    if (cuda == nullptr || !cuda->available) {
+        SKIP("no usable CUDA backend");
+    }
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/qwen2.5-0.5b-instruct-q8_0.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP(path + " absent");
+    }
+    using locus::model::Stage;
+    auto g = locus::gguf::GgufFile::open(path);
+    REQUIRE(g.get_string("general.architecture") == "qwen2");
+    auto model = locus::model::TransformerModel::load(g);
+    const std::uint32_t nv = model.hparams().n_vocab;
+    const std::vector<locus::tok::TokenId> prompt{
+        9707, 11, 1246, 525, 498, 3351, 30, 576, 6722, 315, 9625, 374};
+    const auto n = static_cast<std::uint32_t>(prompt.size());
+    model.use_backend(*cuda);
+    auto ws = model.make_workspace();
+    const auto* sm = model.stage_metrics();
+    REQUIRE(sm != nullptr);
+    const std::uint64_t dev0 = sm->stage_ns(Stage::kDevice);
+    const std::uint64_t att0 = sm->stage_ns(Stage::kAttention);
+    std::vector<float> all(std::size_t{n} * nv);
+    {
+        auto cache = model.make_cache(8);
+        REQUIRE(cache.mirror_data() != nullptr);
+        Seq s;
+        REQUIRE(cache.ensure_capacity(s, n));
+        model.forward_batch(prompt, cache, s, ws, all, true);
+    }
+    std::vector<float> step(std::size_t{n} * nv);
+    {
+        auto cache = model.make_cache(8);
+        Seq s;
+        REQUIRE(cache.ensure_capacity(s, n));
+        for (std::uint32_t t = 0; t < n; ++t) {
+            model.forward(prompt[t], cache, s, ws,
+                          {step.data() + std::size_t{t} * nv, nv});
+        }
+    }
+    CHECK(sm->stage_ns(Stage::kDevice) > dev0);
+    CHECK(sm->stage_ns(Stage::kAttention) == att0);
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        INFO("position " << i / nv << " logit " << i % nv);
+        REQUIRE(same_bits(all[i], step[i]));
+    }
+
+    // The CPU on f32 activations, as the CUDA forward computes: its
+    // default Q8 activations put the logits about 1.3 apart (of 23).
+    model.use_backend(locus::backend::best_backend());
+    model.use_q8k_activations(false);
+    std::vector<float> cpu(std::size_t{n} * nv);
+    {
+        auto cache = model.make_cache(8);
+        Seq s;
+        REQUIRE(cache.ensure_capacity(s, n));
+        model.forward_batch(prompt, cache, s, ws, cpu, true);
+    }
+    float worst = 0.0f, top = 0.0f;
+    for (std::size_t i = 0; i < cpu.size(); ++i) {
+        worst = std::max(worst, std::fabs(cpu[i] - all[i]));
+        top = std::max(top, std::fabs(cpu[i]));
+    }
+    CHECK(worst <= 1e-4f * top);  // measured 4.7e-5 of 23
+    // Its 640 MB of weights would stay in the 2 GB card's pool and
+    // leave the next test's KV mirror no room.
+    locus::backend::cuda_pool_reset();
 }
 
 TEST_CASE("cuda forward with a head row range keeps the GPU path and the "

@@ -622,14 +622,19 @@ bool cuda_dev_rmsnorm(const float* dx, const float* dw, float eps,
 /**
  * rope_norm on `tokens` rows of n_heads * hd floats, stride floats apart,
  * from host-computed (cos, sin) pairs: hd / 2 per token in dcs.
+ * @param neox Rotate rope_neox_yarn's pairs (x[i], x[i + hd/2]) instead
+ *     of (x[2i], x[2i + 1]), from rope_neox_table's pairs (i#1196).
  */
 bool cuda_dev_rope(float* dx, const float* dcs, std::uint32_t n_heads,
                    std::uint32_t hd, std::size_t stride,
-                   std::uint32_t tokens);
+                   std::uint32_t tokens, bool neox = false);
 /** dg = silu(dg) * du over n floats. */
 bool cuda_dev_silu_mul(float* dg, const float* du, std::size_t n);
 /** dx += dy over n floats. */
 bool cuda_dev_add(float* dx, const float* dy, std::size_t n);
+/** dx[t * width + i] += db[i] for `tokens` rows: a projection's bias. */
+bool cuda_dev_add_rows(float* dx, const float* db, std::size_t width,
+                       std::uint32_t tokens);
 /** Raw device bytes, for the forward's integer tables. */
 void* cuda_dev_alloc_bytes(std::size_t bytes);
 void cuda_dev_free_bytes(void* p);

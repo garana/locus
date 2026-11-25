@@ -788,9 +788,12 @@ kv::PagedKvCache TransformerModel::make_cache(
     kv::PagedKvCache cache(geom);
     // A device mirror of the host pool when the backend keeps one
     // (CUDA, i#466); none when it does not fit on the device. Plain
-    // attention only: it writes just the (layer, pos) rows the forwards
+    // attention, and qwen2's where the CUDA forward takes the model
+    // (i#1196): their host paths write just the (layer, pos) rows they
     // sync after each attention.
-    if (kv_type == kv::KvType::kF32 && spec_->plain_attention &&
+    if (kv_type == kv::KvType::kF32 &&
+        (spec_->plain_attention ||
+         (spec_->qwen2_attention && cuda_forward_supported())) &&
         backend_->ops.kv_mirror_alloc != nullptr) {
         void* dev = backend_->ops.kv_mirror_alloc(
             kv::PagedKvCache::pool_floats(geom));

@@ -755,6 +755,9 @@ void qwen2moe_attention(const TransformerModel& m,
         add_bias({krow, kv_dim}, lay.wk_bias);
         add_bias({vrow, kv_dim}, lay.wv_bias);
         rope({krow, kv_dim}, hp.n_kv_heads);
+        // The device KV mirror (CUDA, i#1196) follows the host rows: a
+        // later GPU step reads it.
+        cache.sync_rows(seq, l, pos, 1);
     }
     auto krow_at = [&](std::uint32_t t) -> const float* {
         return kbase ? kbase + static_cast<std::size_t>(t) * k_stride
