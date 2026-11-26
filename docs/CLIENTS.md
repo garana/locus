@@ -412,8 +412,9 @@ calling. Reliable agent use therefore needs a capable instruct model.
 - Guards: with `--guard-model` or `--guard`, each guard judges each
   `/v1/chat/completions`, `/v1/completions` (its prompt as one user
   turn), `/v1/messages` and `/v1/responses` request first, in order;
-  Llama Guard 3 judges the last user turn, with the earlier user and
-  assistant turns as context; Prompt Guard (`kind=prompt-guard`), an
+  Llama Guard 3 and Qwen3Guard (`kind=qwen3-guard`) judge the last user
+  turn, with the earlier user and assistant turns as context (Qwen3Guard
+  also the system turn); Prompt Guard (`kind=prompt-guard`), an
   encoder classifier (`kind=classifier`) and a linear head on an
   embedding model (`kind=linear-head`) score every user turn and
   every tool result of the request, each in windows of its context, for the labels the operator picked, but
