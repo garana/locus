@@ -594,7 +594,8 @@ TEST_CASE("a Qwen3Guard prompt is its GGUF template's text", "[guard]") {
     // The user-turn branch: its head literal, then `set template` (the
     // tail); both hold real newlines in this GGUF.
     const std::string head = jinja_literal(t, "{{- \"", "\" -}}");
-    const std::string tail = jinja_literal(t, "{%- set template = \"", "\" -%}");
+    const std::string tail =
+        jinja_literal(t, "{%- set template = \"", "\" -%}");
     REQUIRE(head.rfind("<|im_start|>user\n# Task:", 0) == 0);
     REQUIRE(tail.find("<END CONVERSATION>") != std::string::npos);
     const auto p = locus::server::qwen3_guard_prompt(

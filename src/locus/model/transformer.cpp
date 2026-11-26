@@ -1637,7 +1637,8 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
     std::vector<float> qb, kb, vb, ab;
     if (plain) {
-        qb.resize(static_cast<std::size_t>(n) * std::max<std::size_t>(q_dim, E));
+        qb.resize(static_cast<std::size_t>(n) *
+                  std::max<std::size_t>(q_dim, E));
         kb.resize(static_cast<std::size_t>(n) * kv_dim);
         vb.resize(kb.size());
         ab.resize(static_cast<std::size_t>(n) * q_dim);  // attention out

@@ -221,11 +221,6 @@ TEST_CASE("vulkan forward_batch with input embeddings tracks the CPU",
     cX.release(sX);
 }
 
-// i#671: qwen2-family attention (q / k / v biases, NEOX rope, M-RoPE)
-// batches its projections in forward_batch, as llama's does. Without
-// M-RoPE positions a chunk equals one forward() per position bit for bit
-// (forward() runs qwen2moe_attention per token); with them too, each
-// position's (t, h, w) set in the workspace for its forward().
 // i#1106: dense qwen3 batches its projections in forward_batch, with the
 // per-head q / k norms and q wider than the residual; a chunk equals one
 // forward() per position (qwen3moe_attention per token) bit for bit.
@@ -267,6 +262,11 @@ TEST_CASE("qwen3 forward_batch equals per-position forward",
     cB.release(sB);
 }
 
+// i#671: qwen2-family attention (q / k / v biases, NEOX rope, M-RoPE)
+// batches its projections in forward_batch, as llama's does. Without
+// M-RoPE positions a chunk equals one forward() per position bit for bit
+// (forward() runs qwen2moe_attention per token); with them too, each
+// position's (t, h, w) set in the workspace for its forward().
 TEST_CASE("qwen2 forward_batch equals per-position forward",
           "[model][batch]") {
     for (const char* arch : {"qwen2", "qwen2vl"}) {
