@@ -80,7 +80,11 @@ Correctness first, then CPU throughput, then GPU.
   counts and the usage stats. It holds no tensor memory, so it is
   unit-tested alone and shared by every backend.
 - The pool can hold f32, f16, q8 or q4 rows (R14). On Vulkan the pool
-  is GPU-mapped, so attention reads K and V where they are written.
+  is GPU-mapped, so attention reads K and V where they are written. On
+  Metal it is a shared buffer, and the GPU forward takes f32 (the
+  default) or f16 (`--kv-type f16`: K and V rounded to halves as
+  written, read back as float; half the attention's reads); q8 and q4
+  run the per-op path there.
 
 ### 4.2 Scheduler (continuous batching)
 

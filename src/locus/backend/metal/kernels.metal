@@ -970,26 +970,58 @@ inline ulong kv_row(constant AttnParams& p, device const uint* blocks,
                              p.head_dim;
 }
 
+// The KV pool holds float (kv-type f32) or half (f16) elements at the
+// same offsets; the attention kernels take either as KT and read it as
+// float. kv4(pool, off, i) is the i-th float4 of the row at off (off a
+// multiple of 4); kvp4 the four at off, any alignment.
+inline float4 kv4(device const float* p, ulong off, uint i) {
+    return ((device const float4*)(p + off))[i];
+}
+inline float4 kv4(device const half* p, ulong off, uint i) {
+    return float4(((device const half4*)(p + off))[i]);
+}
+inline float4 kvp4(device const float* p, ulong off) {
+    return float4(*(device const packed_float4*)(p + off));
+}
+inline float4 kvp4(device const half* p, ulong off) {
+    return float4(*(device const packed_half4*)(p + off));
+}
+
 // scores[h * n_pos + t] = kq_scale * dot(q_h, k_t): one thread each.
+template <typename KT>
+inline void attn_scores_t(device const float* q, device const KT* pool,
+                          device const uint* blocks, device float* scores,
+                          constant AttnParams& p, uint g) {
+    if (g >= p.n_heads * p.n_pos) {
+        return;
+    }
+    const uint h = g / p.n_pos, t = g % p.n_pos;
+    const uint kvh = h / (p.n_heads / p.n_kv_heads);
+    const ulong kr = kv_row(p, blocks, t) + kvh * p.head_dim;
+    device const float4* qh = (device const float4*)(q + h * p.head_dim);
+    float s = 0.0f;
+    for (uint i = 0; i < p.head_dim / 4; ++i) {
+        s += dot(qh[i], kv4(pool, kr, i));
+    }
+    scores[g] = s * p.kq_scale;
+}
+
 kernel void attn_scores(device const float* q [[buffer(0)]],
                         device const float* pool [[buffer(1)]],
                         device const uint* blocks [[buffer(2)]],
                         device float* scores [[buffer(3)]],
                         constant AttnParams& p [[buffer(4)]],
                         uint g [[thread_position_in_grid]]) {
-    if (g >= p.n_heads * p.n_pos) {
-        return;
-    }
-    const uint h = g / p.n_pos, t = g % p.n_pos;
-    const uint kvh = h / (p.n_heads / p.n_kv_heads);
-    device const float4* k = (device const float4*)(
-        pool + kv_row(p, blocks, t) + kvh * p.head_dim);
-    device const float4* qh = (device const float4*)(q + h * p.head_dim);
-    float s = 0.0f;
-    for (uint i = 0; i < p.head_dim / 4; ++i) {
-        s += dot(qh[i], k[i]);
-    }
-    scores[g] = s * p.kq_scale;
+    attn_scores_t(q, pool, blocks, scores, p, g);
+}
+
+kernel void attn_scores_f16(device const float* q [[buffer(0)]],
+                            device const half* pool [[buffer(1)]],
+                            device const uint* blocks [[buffer(2)]],
+                            device float* scores [[buffer(3)]],
+                            constant AttnParams& p [[buffer(4)]],
+                            uint g [[thread_position_in_grid]]) {
+    attn_scores_t(q, pool, blocks, scores, p, g);
 }
 
 // Softmax of each head's n_pos scores in place: one threadgroup a head.
@@ -1020,12 +1052,10 @@ kernel void attn_softmax(device float* scores [[buffer(0)]],
 
 // out[h * head_dim + d] = sum_t p[h, t] * v_t[kvh * head_dim + d]: one
 // thread each.
-kernel void attn_values(device const float* scores [[buffer(0)]],
-                        device const float* pool [[buffer(1)]],
-                        device const uint* blocks [[buffer(2)]],
-                        device float* out [[buffer(3)]],
-                        constant AttnParams& p [[buffer(4)]],
-                        uint g [[thread_position_in_grid]]) {
+template <typename KT>
+inline void attn_values_t(device const float* scores, device const KT* pool,
+                          device const uint* blocks, device float* out,
+                          constant AttnParams& p, uint g) {
     if (g >= p.n_heads * p.head_dim) {
         return;
     }
@@ -1034,10 +1064,28 @@ kernel void attn_values(device const float* scores [[buffer(0)]],
     device const float* s = scores + h * p.n_pos;
     float acc = 0.0f;
     for (uint t = 0; t < p.n_pos; ++t) {
-        acc += s[t] * pool[kv_row(p, blocks, t) + p.v_off +
-                           kvh * p.head_dim + d];
+        acc += s[t] * float(pool[kv_row(p, blocks, t) + p.v_off +
+                                 kvh * p.head_dim + d]);
     }
     out[g] = acc;
+}
+
+kernel void attn_values(device const float* scores [[buffer(0)]],
+                        device const float* pool [[buffer(1)]],
+                        device const uint* blocks [[buffer(2)]],
+                        device float* out [[buffer(3)]],
+                        constant AttnParams& p [[buffer(4)]],
+                        uint g [[thread_position_in_grid]]) {
+    attn_values_t(scores, pool, blocks, out, p, g);
+}
+
+kernel void attn_values_f16(device const float* scores [[buffer(0)]],
+                            device const half* pool [[buffer(1)]],
+                            device const uint* blocks [[buffer(2)]],
+                            device float* out [[buffer(3)]],
+                            constant AttnParams& p [[buffer(4)]],
+                            uint g [[thread_position_in_grid]]) {
+    attn_values_t(scores, pool, blocks, out, p, g);
 }
 
 struct SiluParams {
@@ -1064,25 +1112,20 @@ kernel void silu_mul(device float* gate [[buffer(0)]],
 constant constexpr uint kAttnMaxPos = 4096;
 constant constexpr uint kAttnGroup = 256;
 
-kernel void attn_fused(device const float* q [[buffer(0)]],
-                       device const float* pool [[buffer(1)]],
-                       device const uint* blocks [[buffer(2)]],
-                       device float* out [[buffer(3)]],
-                       constant AttnParams& p [[buffer(4)]],
-                       uint h [[threadgroup_position_in_grid]],
-                       uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float s[kAttnMaxPos];
-    threadgroup float part[32];
-    threadgroup float4 red[kAttnGroup];
+template <typename KT>
+inline void attn_fused_t(device const float* q, device const KT* pool,
+                         device const uint* blocks, device float* out,
+                         constant AttnParams& p, uint h, uint tid,
+                         threadgroup float* s, threadgroup float* part,
+                         threadgroup float4* red) {
     const uint kvh = h / (p.n_heads / p.n_kv_heads);
     device const float4* qh = (device const float4*)(q + h * p.head_dim);
     float m = -INFINITY;
     for (uint t = tid; t < p.n_pos; t += kAttnGroup) {
-        device const float4* k = (device const float4*)(
-            pool + kv_row(p, blocks, t) + kvh * p.head_dim);
+        const ulong kr = kv_row(p, blocks, t) + kvh * p.head_dim;
         float d = 0.0f;
         for (uint i = 0; i < p.head_dim / 4; ++i) {
-            d += dot(qh[i], k[i]);
+            d += dot(qh[i], kv4(pool, kr, i));
         }
         d *= p.kq_scale;
         s[t] = d;
@@ -1104,9 +1147,10 @@ kernel void attn_fused(device const float* q [[buffer(0)]],
     float4 acc = 0.0f;
     if (slice < per) {
         for (uint t = slice; t < p.n_pos; t += per) {
-            acc += s[t] * ((device const float4*)(
-                              pool + kv_row(p, blocks, t) + p.v_off +
-                              kvh * p.head_dim))[c];
+            acc += s[t] * kv4(pool,
+                              kv_row(p, blocks, t) + p.v_off +
+                                  kvh * p.head_dim,
+                              c);
         }
     }
     red[tid] = acc;
@@ -1120,6 +1164,32 @@ kernel void attn_fused(device const float* q [[buffer(0)]],
     }
 }
 
+kernel void attn_fused(device const float* q [[buffer(0)]],
+                       device const float* pool [[buffer(1)]],
+                       device const uint* blocks [[buffer(2)]],
+                       device float* out [[buffer(3)]],
+                       constant AttnParams& p [[buffer(4)]],
+                       uint h [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float s[kAttnMaxPos];
+    threadgroup float part[32];
+    threadgroup float4 red[kAttnGroup];
+    attn_fused_t(q, pool, blocks, out, p, h, tid, s, part, red);
+}
+
+kernel void attn_fused_f16(device const float* q [[buffer(0)]],
+                           device const half* pool [[buffer(1)]],
+                           device const uint* blocks [[buffer(2)]],
+                           device float* out [[buffer(3)]],
+                           constant AttnParams& p [[buffer(4)]],
+                           uint h [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float s[kAttnMaxPos];
+    threadgroup float part[32];
+    threadgroup float4 red[kAttnGroup];
+    attn_fused_t(q, pool, blocks, out, p, h, tid, s, part, red);
+}
+
 struct AttnSplitParams {
     AttnParams a;
     uint n_parts;  // kAttnGroup positions a part
@@ -1130,18 +1200,13 @@ struct AttnSplitParams {
 // It writes the part's max score m, its exp sum l and its unnormalized
 // value sums into part[g * (head_dim + 4) ..]: head_dim sums, m, l
 // (the stride a float4 multiple).
-kernel void attn_split(device const float* q [[buffer(0)]],
-                       device const float* pool [[buffer(1)]],
-                       device const uint* blocks [[buffer(2)]],
-                       device float* part_out [[buffer(3)]],
-                       constant AttnSplitParams& sp [[buffer(4)]],
-                       uint g [[threadgroup_position_in_grid]],
-                       uint tid [[thread_index_in_threadgroup]]) {
+template <typename KT>
+inline void attn_split_t(device const float* q, device const KT* pool,
+                         device const uint* blocks, device float* part_out,
+                         constant AttnSplitParams& sp, uint g, uint tid,
+                         threadgroup float* s, threadgroup ulong* rows,
+                         threadgroup float* part, threadgroup float4* red) {
     constant AttnParams& p = sp.a;
-    threadgroup float s[kAttnGroup];
-    threadgroup ulong rows[kAttnGroup];
-    threadgroup float part[32];
-    threadgroup float4 red[kAttnGroup];
     const uint h = g / sp.n_parts, pi = g % sp.n_parts;
     const uint kvh = h / (p.n_heads / p.n_kv_heads);
     const uint t0 = pi * kAttnGroup;
@@ -1151,10 +1216,9 @@ kernel void attn_split(device const float* q [[buffer(0)]],
     if (tid < cnt) {
         const ulong row = kv_row(p, blocks, t0 + tid) + kvh * p.head_dim;
         rows[tid] = row;
-        device const float4* k = (device const float4*)(pool + row);
         d = 0.0f;
         for (uint i = 0; i < p.head_dim / 4; ++i) {
-            d += dot(qh[i], k[i]);
+            d += dot(qh[i], kv4(pool, row, i));
         }
         d *= p.kq_scale;
     }
@@ -1169,8 +1233,7 @@ kernel void attn_split(device const float* q [[buffer(0)]],
     float4 acc = 0.0f;
     if (slice < per) {
         for (uint t = slice; t < cnt; t += per) {
-            acc += s[t] *
-                   ((device const float4*)(pool + rows[t] + p.v_off))[c];
+            acc += s[t] * kv4(pool, rows[t] + p.v_off, c);
         }
     }
     red[tid] = acc;
@@ -1187,6 +1250,34 @@ kernel void attn_split(device const float* q [[buffer(0)]],
         o[p.head_dim] = m;
         o[p.head_dim + 1] = l;
     }
+}
+
+kernel void attn_split(device const float* q [[buffer(0)]],
+                       device const float* pool [[buffer(1)]],
+                       device const uint* blocks [[buffer(2)]],
+                       device float* part_out [[buffer(3)]],
+                       constant AttnSplitParams& sp [[buffer(4)]],
+                       uint g [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float s[kAttnGroup];
+    threadgroup ulong rows[kAttnGroup];
+    threadgroup float part[32];
+    threadgroup float4 red[kAttnGroup];
+    attn_split_t(q, pool, blocks, part_out, sp, g, tid, s, rows, part, red);
+}
+
+kernel void attn_split_f16(device const float* q [[buffer(0)]],
+                           device const half* pool [[buffer(1)]],
+                           device const uint* blocks [[buffer(2)]],
+                           device float* part_out [[buffer(3)]],
+                           constant AttnSplitParams& sp [[buffer(4)]],
+                           uint g [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float s[kAttnGroup];
+    threadgroup ulong rows[kAttnGroup];
+    threadgroup float part[32];
+    threadgroup float4 red[kAttnGroup];
+    attn_split_t(q, pool, blocks, part_out, sp, g, tid, s, rows, part, red);
 }
 
 // Pass 2, a thread a (head, dimension): the parts rescaled to the
@@ -1741,6 +1832,22 @@ kernel void kv_scatter(device const float* k [[buffer(0)]],
     pool[rows[t] + p.v_off + i] = v[g];
 }
 
+// kv_scatter into a half pool (kv-type f16): each value rounded to the
+// nearest half, as the CPU codec stores it.
+kernel void kv_scatter_f16(device const float* k [[buffer(0)]],
+                           device const float* v [[buffer(1)]],
+                           device half* pool [[buffer(2)]],
+                           device const ulong* rows [[buffer(3)]],
+                           constant ScatterParams& p [[buffer(4)]],
+                           uint g [[thread_position_in_grid]]) {
+    if (g >= p.n_tok * p.kv_dim) {
+        return;
+    }
+    const uint t = g / p.kv_dim, i = g % p.kv_dim;
+    pool[rows[t] + i] = half(k[g]);
+    pool[rows[t] + p.v_off + i] = half(v[g]);
+}
+
 struct AttnRowsParams {
     AttnParams a;    // n_pos unused: query t sees base + t + 1
     uint base;       // the chunk's first position
@@ -1750,16 +1857,12 @@ struct AttnRowsParams {
 // Causal attention for a chunk: threadgroup g is query t = g / n_heads,
 // head h = g % n_heads, over positions [0, base + t]; as attn_fused,
 // up to kAttnMaxPos positions.
-kernel void attn_rows(device const float* q [[buffer(0)]],
-                      device const float* pool [[buffer(1)]],
-                      device const uint* blocks [[buffer(2)]],
-                      device float* out [[buffer(3)]],
-                      constant AttnRowsParams& pr [[buffer(4)]],
-                      uint g [[threadgroup_position_in_grid]],
-                      uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float s[kAttnMaxPos];
-    threadgroup float part[32];
-    threadgroup float red[kAttnGroup];
+template <typename KT>
+inline void attn_rows_t(device const float* q, device const KT* pool,
+                        device const uint* blocks, device float* out,
+                        constant AttnRowsParams& pr, uint g, uint tid,
+                        threadgroup float* s, threadgroup float* part,
+                        threadgroup float* red) {
     constant AttnParams& p = pr.a;
     const uint t = g / p.n_heads, h = g % p.n_heads;
     const uint n_pos = pr.base + t + 1;
@@ -1768,11 +1871,10 @@ kernel void attn_rows(device const float* q [[buffer(0)]],
         (device const float4*)(q + ulong(t) * pr.q_stride + h * p.head_dim);
     float m = -INFINITY;
     for (uint j = tid; j < n_pos; j += kAttnGroup) {
-        device const float4* k = (device const float4*)(
-            pool + kv_row(p, blocks, j) + kvh * p.head_dim);
+        const ulong kr = kv_row(p, blocks, j) + kvh * p.head_dim;
         float d = 0.0f;
         for (uint i = 0; i < p.head_dim / 4; ++i) {
-            d += dot(qh[i], k[i]);
+            d += dot(qh[i], kv4(pool, kr, i));
         }
         d *= p.kq_scale;
         s[j] = d;
@@ -1792,8 +1894,8 @@ kernel void attn_rows(device const float* q [[buffer(0)]],
     float acc = 0.0f;
     if (slice < per) {
         for (uint j = slice; j < n_pos; j += per) {
-            acc += s[j] * pool[kv_row(p, blocks, j) + p.v_off +
-                               kvh * p.head_dim + d];
+            acc += s[j] * float(pool[kv_row(p, blocks, j) + p.v_off +
+                                     kvh * p.head_dim + d]);
         }
     }
     red[tid] = acc;
@@ -1805,6 +1907,32 @@ kernel void attn_rows(device const float* q [[buffer(0)]],
         }
         out[ulong(t) * pr.q_stride + h * p.head_dim + d] = v * inv;
     }
+}
+
+kernel void attn_rows(device const float* q [[buffer(0)]],
+                      device const float* pool [[buffer(1)]],
+                      device const uint* blocks [[buffer(2)]],
+                      device float* out [[buffer(3)]],
+                      constant AttnRowsParams& pr [[buffer(4)]],
+                      uint g [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float s[kAttnMaxPos];
+    threadgroup float part[32];
+    threadgroup float red[kAttnGroup];
+    attn_rows_t(q, pool, blocks, out, pr, g, tid, s, part, red);
+}
+
+kernel void attn_rows_f16(device const float* q [[buffer(0)]],
+                          device const half* pool [[buffer(1)]],
+                          device const uint* blocks [[buffer(2)]],
+                          device float* out [[buffer(3)]],
+                          constant AttnRowsParams& pr [[buffer(4)]],
+                          uint g [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float s[kAttnMaxPos];
+    threadgroup float part[32];
+    threadgroup float red[kAttnGroup];
+    attn_rows_t(q, pool, blocks, out, pr, g, tid, s, part, red);
 }
 
 
@@ -1819,18 +1947,12 @@ kernel void attn_rows(device const float* q [[buffer(0)]],
 constant constexpr uint kTileQ = 8;
 constant constexpr uint kTileFloats = 2048;
 
-kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
-                            device const float* pool [[buffer(1)]],
-                            device const uint* blocks [[buffer(2)]],
-                            device float* out [[buffer(3)]],
-                            constant AttnRowsParams& pr [[buffer(4)]],
-                            uint g [[threadgroup_position_in_grid]],
-                            uint tid [[thread_index_in_threadgroup]],
-                            uint sg [[simdgroup_index_in_threadgroup]],
-                            uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float kt[kTileFloats];
-    threadgroup float vt[kTileFloats];
-    threadgroup float qs[kTileQ * 128];
+template <typename KT>
+inline void attn_rows_tiled_t(device const float* q, device const KT* pool,
+                              device const uint* blocks, device float* out,
+                              constant AttnRowsParams& pr, uint g, uint tid,
+                              uint sg, uint lane, threadgroup float* kt,
+                              threadgroup float* vt, threadgroup float* qs) {
     constant AttnParams& p = pr.a;
     // A chunk is at most 32 positions: lane j scores position c + j.
     const uint hd = p.head_dim, ch = min(kTileFloats / hd, 32u);
@@ -1856,8 +1978,8 @@ kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
             const uint j = c + i / hd;
             if (j < last) {
                 const ulong r = kv_row(p, blocks, j) + kvh * hd + i % hd;
-                kt[i] = pool[r];
-                vt[i] = pool[r + p.v_off];
+                kt[i] = float(pool[r]);
+                vt[i] = float(pool[r + p.v_off]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1903,6 +2025,36 @@ kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
     }
 }
 
+kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
+                            device const float* pool [[buffer(1)]],
+                            device const uint* blocks [[buffer(2)]],
+                            device float* out [[buffer(3)]],
+                            constant AttnRowsParams& pr [[buffer(4)]],
+                            uint g [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float kt[kTileFloats];
+    threadgroup float vt[kTileFloats];
+    threadgroup float qs[kTileQ * 128];
+    attn_rows_tiled_t(q, pool, blocks, out, pr, g, tid, sg, lane, kt, vt, qs);
+}
+
+kernel void attn_rows_tiled_f16(device const float* q [[buffer(0)]],
+                                device const half* pool [[buffer(1)]],
+                                device const uint* blocks [[buffer(2)]],
+                                device float* out [[buffer(3)]],
+                                constant AttnRowsParams& pr [[buffer(4)]],
+                                uint g [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float kt[kTileFloats];
+    threadgroup float vt[kTileFloats];
+    threadgroup float qs[kTileQ * 128];
+    attn_rows_tiled_t(q, pool, blocks, out, pr, g, tid, sg, lane, kt, vt, qs);
+}
+
 
 // Causal attention for a chunk on the simdgroup matrices: threadgroup
 // g takes queries 32 (g / n_heads) .. + 32 of head g % n_heads, a
@@ -1920,9 +2072,10 @@ static_assert(kFaC == 32, "attn_mma: a chunk is one simdgroup wide");
 
 // The operands attn_mma reads: the paged, causal prefill (AttnRowsParams)
 // or the image transformers' contiguous, unmasked rows (SeqAttnParams).
-struct MmaPaged {
+template <typename KT>
+struct MmaPagedT {
     device const float* q;
-    device const float* pool;
+    device const KT* pool;
     device const uint* blocks;
     device float* out;
     constant AttnRowsParams* pp;
@@ -1941,8 +2094,8 @@ struct MmaPaged {
         return kv_row(pp->a, blocks, j) + kvh * pp->a.head_dim;
     }
     ulong v_at(uint j, uint h) const { return k_at(j, h) + pp->a.v_off; }
-    device const float* kbuf() const { return pool; }
-    device const float* vbuf() const { return pool; }
+    device const KT* kbuf() const { return pool; }
+    device const KT* vbuf() const { return pool; }
     device float* o_at(uint t, uint h) const {
         return out + ulong(t) * pp->q_stride + h * pp->a.head_dim;
     }
@@ -2028,9 +2181,7 @@ inline void attn_mma(thread const S& src, uint g, uint sg,
                 const ulong at = j < last ? src.v_at(j, h) : 0;
                 for (uint i = lane * 4; i < hd; i += 128) {
                     *(threadgroup float4*)(vs + r * hd + i) =
-                        j < last ? float4(*(device const packed_float4*)(
-                                       src.vbuf() + at + i))
-                                 : float4(0.0f);
+                        j < last ? kvp4(src.vbuf(), at + i) : float4(0.0f);
                 }
             }
         }
@@ -2043,9 +2194,7 @@ inline void attn_mma(thread const S& src, uint g, uint sg,
             const ulong at = j < last ? src.k_at(j, h) : 0;
             for (uint i = sg * 4; i < hd; i += NSG * 4) {
                 const float4 v =
-                    j < last ? float4(*(device const packed_float4*)(
-                                   src.kbuf() + at + i))
-                             : float4(0.0f);
+                    j < last ? kvp4(src.kbuf(), at + i) : float4(0.0f);
                 kv[i * kFaC + lane] = v.x;
                 kv[(i + 1) * kFaC + lane] = v.y;
                 kv[(i + 2) * kFaC + lane] = v.z;
@@ -2127,9 +2276,7 @@ inline void attn_mma(thread const S& src, uint g, uint sg,
                 const ulong at = j < last ? src.v_at(j, h) : 0;
                 for (uint i = lane * 4; i < hd; i += 128) {
                     *(threadgroup float4*)(vs + r * hd + i) =
-                        j < last ? float4(*(device const packed_float4*)(
-                                       src.vbuf() + at + i))
-                                 : float4(0.0f);
+                        j < last ? kvp4(src.vbuf(), at + i) : float4(0.0f);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2181,8 +2328,26 @@ kernel void attn_rows_mma(device const float* q [[buffer(0)]],
     threadgroup float kv[kFaC * 128];
     threadgroup float spall[kAttnRowsSg * 8 * kFaC];
     threadgroup float dgall[kAttnRowsSg * 64];
-    const MmaPaged src{q, pool, blocks, out, &pr};
-    attn_mma<MmaPaged, kAttnRowsSg>(src, g, sg, lane, kv, spall, dgall);
+    const MmaPagedT<float> src{q, pool, blocks, out, &pr};
+    attn_mma<MmaPagedT<float>, kAttnRowsSg>(src, g, sg, lane, kv, spall,
+                                            dgall);
+}
+
+// attn_rows_mma over a half pool (kv-type f16): K and V staged as float.
+kernel void attn_rows_mma_f16(device const float* q [[buffer(0)]],
+                              device const half* pool [[buffer(1)]],
+                              device const uint* blocks [[buffer(2)]],
+                              device float* out [[buffer(3)]],
+                              constant AttnRowsParams& pr [[buffer(4)]],
+                              uint g [[threadgroup_position_in_grid]],
+                              uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float kv[kFaC * 128];
+    threadgroup float spall[kAttnRowsSg * 8 * kFaC];
+    threadgroup float dgall[kAttnRowsSg * 64];
+    const MmaPagedT<half> src{q, pool, blocks, out, &pr};
+    attn_mma<MmaPagedT<half>, kAttnRowsSg>(src, g, sg, lane, kv, spall,
+                                           dgall);
 }
 
 // Unmasked attention of n_q query rows over n_kv key / value rows (the

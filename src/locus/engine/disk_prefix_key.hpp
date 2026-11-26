@@ -22,8 +22,9 @@ namespace locus::engine {
  * mtime makes a file replaced under the same name a miss. The override
  * part hashes what changes K or V bits besides the weights: context
  * length, RoPE and YaRN settings, Q8_K activations, the device name,
- * the LOCUS_* debug and offload switches that pick other kernels and,
- * on Vulkan, f16 prefill staging and the batch-invariant kernels.
+ * the LOCUS_* debug and offload switches that pick other kernels, on
+ * Vulkan f16 prefill staging and the batch-invariant kernels, and on
+ * Metal the batch-invariant mode and whether the GPU forward runs.
  * The backend is the one running `m`, so call this after use_backend
  * and the Vulkan mode setters.
  *
