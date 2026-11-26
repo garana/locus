@@ -42,6 +42,10 @@ struct GuardVerdict {
     Kind kind = Kind::kMalformed;
     /** The violated category codes ("S1", "S10"), for kUnsafe. */
     std::vector<std::string> categories;
+    /** For kUnsafe: rejects whatever labels the guard enables (a
+     *  Qwen3Guard Controversial verdict under controversial=reject,
+     *  which may name no category). */
+    bool rejects_any = false;
     /** Why the guard failed on this request, for kMalformed (logs);
      *  may be empty. */
     std::string error;
@@ -60,7 +64,8 @@ GuardVerdict parse_guard_verdict(std::string_view reply);
 
 /**
  * Whether a verdict rejects the request: an unsafe verdict naming at
- * least one enabled category, or a malformed one (fail closed).
+ * least one enabled category, or marked rejects_any, or a malformed one
+ * (fail closed).
  *
  * @param v The verdict.
  * @param enabled The category codes that reject; empty means all.
@@ -119,8 +124,9 @@ std::vector<GuardCategory> qwen3_guard_categories();
  * "Safety: Controversial", then "Categories: " and a comma-separated list
  * of its category names, or "None". Safe needs "None"; Unsafe needs at
  * least one category; Controversial takes either. A Controversial verdict
- * is kUnsafe when `controversial_rejects` (Qwen's strict mode), else
- * kSafe (its loose mode). Whitespace around lines and names is ignored.
+ * is kUnsafe with rejects_any when `controversial_rejects` (Qwen's strict
+ * mode: it rejects whatever labels= enables), else kSafe (its loose
+ * mode). Whitespace around lines and names is ignored.
  *
  * @param reply The guard's decoded output.
  * @param controversial_rejects Whether Controversial counts as unsafe.

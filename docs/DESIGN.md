@@ -1018,8 +1018,9 @@ guarding the default path.
   conversation as `USER:` and `ASSISTANT:` lines (a system turn too, as
   the template has it), then an empty `<think>` block. It stops at
   `<|im_end|>`. Its verdict is `Safety: Safe|Unsafe|Controversial` and
-  `Categories:` with names; Controversial rejects unless
-  `controversial=allow` (Qwen's strict and loose modes). On the x86
+  `Categories:` with names; Controversial rejects, whatever `labels=`
+  names, unless `controversial=allow` (Qwen's strict and loose modes).
+  On the x86
   host the 0.6B Q8_0 guard prefills its 300-token prompt at 49 tok/s on
   the CPU and 111 on CUDA (per op), and the prefix cache serves the
   fixed head after the first check.

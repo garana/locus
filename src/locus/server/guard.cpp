@@ -80,7 +80,7 @@ bool guard_rejects(const GuardVerdict& v,
         case GuardVerdict::Kind::kMalformed: return true;
         case GuardVerdict::Kind::kUnsafe: break;
     }
-    if (enabled.empty()) return true;
+    if (enabled.empty() || v.rejects_any) return true;
     return std::any_of(v.categories.begin(), v.categories.end(),
                        [&](const std::string& c) {
                            return std::find(enabled.begin(), enabled.end(),
@@ -296,7 +296,10 @@ GuardVerdict parse_qwen3_guard_verdict(std::string_view reply,
     } else if (label == "Controversial") {
         v.kind = controversial_rejects ? GuardVerdict::Kind::kUnsafe
                                        : GuardVerdict::Kind::kSafe;
-        if (controversial_rejects) v.categories = std::move(cats);
+        if (controversial_rejects) {
+            v.categories = std::move(cats);
+            v.rejects_any = true;  // whatever labels= enables
+        }
     }
     return v;
 }

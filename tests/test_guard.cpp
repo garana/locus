@@ -474,6 +474,34 @@ TEST_CASE("a Qwen3Guard verdict parses", "[guard]") {
     }
 }
 
+// A Controversial verdict under controversial=reject rejects whatever
+// labels= enables, even one naming no category; under allow it passes.
+TEST_CASE("a Qwen3Guard Controversial verdict rejects whatever the labels",
+          "[guard]") {
+    const std::vector<Message> turns{{"user", "a question"}};
+    for (const char* reply :
+         {"Safety: Controversial\nCategories: None",
+          "Safety: Controversial\nCategories: Politically Sensitive Topics"}) {
+        INFO(reply);
+        const auto fixed = [reply](const locus::chat::ChatTemplate::Prompt&) {
+            return std::string(reply);
+        };
+        LlamaGuard strict(fixed, {"Violent"}, "q",
+                          locus::server::qwen3_guard_format(), true);
+        CHECK(strict.rejects(strict.check(turns)));
+        LlamaGuard loose(fixed, {"Violent"}, "q",
+                         locus::server::qwen3_guard_format(), false);
+        CHECK_FALSE(loose.rejects(loose.check(turns)));
+    }
+    // An Unsafe verdict still needs an enabled category.
+    LlamaGuard other(
+        [](const locus::chat::ChatTemplate::Prompt&) {
+            return std::string("Safety: Unsafe\nCategories: PII");
+        },
+        {"Violent"}, "q", locus::server::qwen3_guard_format(), true);
+    CHECK_FALSE(other.rejects(other.check(turns)));
+}
+
 TEST_CASE("a qwen3-guard spec takes category names and controversial=",
           "[guard]") {
     const auto s = parse_guard_spec(

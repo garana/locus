@@ -300,7 +300,7 @@ a repeatable `--guard kind=llama-guard,model=P[,name=N][,labels=S1:S9]`,
 or `--guard kind=qwen3-guard,model=P[,labels=Violent:PII]` for
 Qwen3Guard-Gen (Apache-2.0, ungated; its category names as labels;
 `controversial=allow` lets its Controversial verdict through, which
-rejects by default), or
+rejects by default whatever `labels=` names), or
 `--guard kind=prompt-guard,model=P,labels=INJECTION@0.9[,threshold=T]`
 for a DeBERTa classifier such as Prompt Guard (from
 `scripts/text/convert-deberta.py`; its labels from the model, each
