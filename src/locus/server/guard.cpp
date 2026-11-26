@@ -148,6 +148,178 @@ std::vector<GuardCategory> llama_guard3_1b_categories() {
     };
 }
 
+namespace {
+
+// Qwen3Guard-Gen's tokenizer.chat_template, for a conversation whose last
+// turn is the user's (i#1106): the text before the conversation and the
+// text after it, as its Jinja literals hold them.
+constexpr std::string_view kQwen3GuardHead =
+    "<|im_start|>user\n"
+    "# Task:\n"
+    "1) Evaluate whether THE LAST USER's query belongs to safe or unsafe "
+    "content based on our safety policy.\n"
+    "2) Identify the category of unsafe content found.\n"
+    "\n"
+    "<BEGIN SAFETY POLICY>\n"
+    "**Safety: Safe**: The USER's query does not contain any prohibited "
+    "content or content that could lead to prohibited content.\n"
+    "**Safety: Unsafe**: The USER's query contains prohibited content.\n"
+    "**Safety: Controversial**: The USER's query does not explicitly "
+    "contain prohibited content, but its intent, context, or potential "
+    "responses could be misinterpreted, misused, or exploited to generate "
+    "unsafe content under certain conditions.\n"
+    "<END SAFETY POLICY>\n"
+    "\n"
+    "<BEGIN UNSAFE CONTENT CATEGORIES>\n"
+    "Violent.\n"
+    "Non-violent Illegal Acts.\n"
+    "Sexual Content or Sexual Acts.\n"
+    "PII.\n"
+    "Suicide & Self-Harm.\n"
+    "Unethical Acts.\n"
+    "Politically Sensitive Topics.\n"
+    "Copyright Violation.\n"
+    "Jailbreak.\n"
+    "<END UNSAFE CONTENT CATEGORIES>\n"
+    "\n"
+    "<BEGIN CONVERSATION>\n"
+    "\n";
+constexpr std::string_view kQwen3GuardTail =
+    "\n"
+    "\n"
+    "<END CONVERSATION>\n"
+    "\n"
+    "Provide your safety assessment for ONLY THE LAST **USER's query** in "
+    "the above conversation:\n"
+    " - The first line must be one of: 'Safety: Safe', 'Safety: Unsafe', "
+    "'Safety: Controversial'.\n"
+    " - The second line should start with 'Categories:' followed by a list "
+    "of any unsafe content categories, separated by commas. If the content "
+    "is safe, use 'Categories: None'.<|im_end|>\n"
+    "<|im_start|>assistant\n"
+    "<think>\n"
+    "\n"
+    "</think>\n"
+    "\n";
+
+}  // namespace
+
+chat::ChatTemplate::Prompt qwen3_guard_prompt(
+    std::span<const chat::Message> turns) {
+    chat::ChatTemplate::Prompt out;
+    std::string& p = out.text;
+    p = kQwen3GuardHead;
+    const auto put = [&](const std::string& text) {
+        out.content.push_back({p.size(), p.size() + text.size()});
+        p += text;
+    };
+    // The template's loop: the first turn (system or user) as "USER: ";
+    // a user turn right after a system turn joined by a blank line with
+    // no prefix; then assistant and user turns on their own, each after a
+    // blank line. Other roles write nothing.
+    for (std::size_t i = 0; i < turns.size(); ++i) {
+        const chat::Message& m = turns[i];
+        if (i == 0) {
+            if (m.role == "system" || m.role == "user") {
+                p += "USER: ";
+                put(m.content);
+            }
+        } else if (turns[i - 1].role == "system" && m.role == "user") {
+            p += "\n\n";
+            put(m.content);
+        } else if (m.role == "assistant") {
+            p += "\n\nASSISTANT: ";
+            put(m.content);
+        } else if (m.role == "user") {
+            p += "\n\nUSER: ";
+            put(m.content);
+        }
+    }
+    p += kQwen3GuardTail;
+    return out;
+}
+
+std::vector<GuardCategory> qwen3_guard_categories() {
+    std::vector<GuardCategory> out;
+    for (const char* n :
+         {"Violent", "Non-violent Illegal Acts",
+          "Sexual Content or Sexual Acts", "PII", "Suicide & Self-Harm",
+          "Unethical Acts", "Politically Sensitive Topics",
+          "Copyright Violation", "Jailbreak"}) {
+        out.push_back({n, n});
+    }
+    return out;
+}
+
+GuardVerdict parse_qwen3_guard_verdict(std::string_view reply,
+                                       bool controversial_rejects) {
+    GuardVerdict v;
+    const std::string_view text = trim(reply);
+    const std::size_t nl = text.find('\n');
+    if (nl == std::string_view::npos) return v;  // kMalformed
+    const std::string_view first = trim(text.substr(0, nl));
+    const std::string_view second = trim(text.substr(nl + 1));
+    if (second.find('\n') != std::string_view::npos) return v;
+    constexpr std::string_view kSafety = "Safety: ";
+    constexpr std::string_view kCats = "Categories:";
+    if (first.substr(0, kSafety.size()) != kSafety ||
+        second.substr(0, kCats.size()) != kCats) {
+        return v;
+    }
+    const std::string_view label = first.substr(kSafety.size());
+    const std::string_view list = trim(second.substr(kCats.size()));
+    std::vector<std::string> cats;
+    if (list != "None") {
+        const auto known = qwen3_guard_categories();
+        std::size_t at = 0;
+        while (at <= list.size()) {
+            const std::size_t comma = list.find(',', at);
+            const std::string_view name = trim(list.substr(
+                at, comma == std::string_view::npos ? std::string_view::npos
+                                                    : comma - at));
+            if (std::none_of(known.begin(), known.end(),
+                             [&](const GuardCategory& c) {
+                                 return c.name == name;
+                             })) {
+                return v;  // kMalformed: not one of the nine
+            }
+            cats.emplace_back(name);
+            if (comma == std::string_view::npos) break;
+            at = comma + 1;
+        }
+    }
+    if (label == "Safe" && cats.empty()) {
+        v.kind = GuardVerdict::Kind::kSafe;
+    } else if (label == "Unsafe" && !cats.empty()) {
+        v.kind = GuardVerdict::Kind::kUnsafe;
+        v.categories = std::move(cats);
+    } else if (label == "Controversial") {
+        v.kind = controversial_rejects ? GuardVerdict::Kind::kUnsafe
+                                       : GuardVerdict::Kind::kSafe;
+        if (controversial_rejects) v.categories = std::move(cats);
+    }
+    return v;
+}
+
+const GuardFormat& llama_guard3_format() {
+    static const GuardFormat f{
+        "llama-guard",
+        [](std::span<const chat::Message> turns) {
+            return llama_guard3_prompt(turns, llama_guard3_1b_categories());
+        },
+        [](std::string_view reply, bool) {
+            return parse_guard_verdict(reply);
+        },
+        "<|eot_id|>"};
+    return f;
+}
+
+const GuardFormat& qwen3_guard_format() {
+    static const GuardFormat f{"qwen3-guard", &qwen3_guard_prompt,
+                               &parse_qwen3_guard_verdict, "<|im_end|>"};
+    return f;
+}
+
 std::string guard_reply_text(std::span<const tok::TokenId> generated,
                              tok::TokenId eos, tok::TokenId eot,
                              const tok::Tokenizer& tok) {
@@ -167,21 +339,23 @@ struct LlamaGuard::Loaded {
     std::unique_ptr<tok::Tokenizer> tok;
     engine::Engine engine;
 
-    /** <|eot_id|>'s id when the vocabulary has it as one token, else
-     *  EOS: Llama Guard 3 ends its verdict there, and a GGUF may name
-     *  <|end_of_text|> as EOS instead. */
+    /** The format's end-of-turn marker's id when the vocabulary has it
+     *  as one token, else EOS: Llama Guard 3 ends its verdict at
+     *  <|eot_id|> (a GGUF may name <|end_of_text|> as EOS instead),
+     *  Qwen3Guard at <|im_end|>. */
     tok::TokenId eot;
 
     Loaded(const std::string& path, const backend::Backend& backend,
-           std::uint32_t n_blocks)
+           std::uint32_t n_blocks, std::string_view eot_marker)
         : file(gguf::GgufFile::open(path)),
           model(model::TransformerModel::load(file)),
           tok(tok::tokenizer_from_gguf(file)),
           engine(use(model, backend), tok->eos_id(), config(n_blocks)),
-          eot(end_of_turn(*tok)) {}
+          eot(end_of_turn(*tok, eot_marker)) {}
 
-    static tok::TokenId end_of_turn(const tok::Tokenizer& t) {
-        const auto ids = t.encode("<|eot_id|>", false);
+    static tok::TokenId end_of_turn(const tok::Tokenizer& t,
+                                    std::string_view marker) {
+        const auto ids = t.encode(std::string(marker), false);
         return ids.size() == 1 ? ids[0] : t.eos_id();
     }
 
@@ -316,18 +490,22 @@ struct LlamaGuard::Loaded {
 };
 
 LlamaGuard::LlamaGuard(Classifier classify, std::vector<std::string> enabled,
-                       std::string name)
+                       std::string name, const GuardFormat& format,
+                       bool controversial_rejects)
     : Guard(std::move(name), std::move(enabled)),
       classify_(std::move(classify)),
-      categories_(llama_guard3_1b_categories()) {}
+      format_(format),
+      controversial_rejects_(controversial_rejects) {}
 
 LlamaGuard::~LlamaGuard() = default;
 
 std::unique_ptr<LlamaGuard> LlamaGuard::load(
     const std::string& path, const backend::Backend& backend,
     std::uint32_t n_blocks, std::vector<std::string> enabled,
-    std::string name) {
-    auto loaded = std::make_unique<Loaded>(path, backend, n_blocks);
+    std::string name, const GuardFormat& format,
+    bool controversial_rejects) {
+    auto loaded =
+        std::make_unique<Loaded>(path, backend, n_blocks, format.eot);
     Loaded* raw = loaded.get();
     auto g = std::make_unique<LlamaGuard>(
         [raw](const chat::ChatTemplate::Prompt& p) {
@@ -335,7 +513,7 @@ std::unique_ptr<LlamaGuard> LlamaGuard::load(
             if (!r[0].error.empty()) throw std::runtime_error(r[0].error);
             return r[0].text;
         },
-        std::move(enabled), std::move(name));
+        std::move(enabled), std::move(name), format, controversial_rejects);
     g->loaded_ = std::move(loaded);
     return g;
 }
@@ -374,6 +552,7 @@ float parse_threshold(const std::string& text) {
 GuardSpec parse_guard_spec(std::string_view text) {
     GuardSpec s;
     bool have_labels = false, have_threshold = false, have_max_windows = false;
+    bool have_controversial = false;
     std::size_t at = 0;
     while (at <= text.size()) {
         const std::size_t comma = text.find(',', at);
@@ -436,6 +615,14 @@ GuardSpec parse_guard_spec(std::string_view text) {
             have_max_windows = true;
         } else if (key == "embedding") {
             s.embedding = value;
+        } else if (key == "controversial") {
+            if (value != "reject" && value != "allow") {
+                throw std::invalid_argument("--guard: controversial '" +
+                                            value +
+                                            "' is not reject or allow");
+            }
+            s.controversial_rejects = value == "reject";
+            have_controversial = true;
         } else {
             throw std::invalid_argument("--guard: unknown key '" +
                                         std::string(key) + "'");
@@ -446,11 +633,34 @@ GuardSpec parse_guard_spec(std::string_view text) {
     if (s.kind.empty() || s.model.empty()) {
         throw std::invalid_argument("--guard needs kind= and model=");
     }
-    if (s.kind != "llama-guard" && s.kind != "prompt-guard" &&
-        s.kind != "classifier" && s.kind != "linear-head") {
+    if (s.kind != "llama-guard" && s.kind != "qwen3-guard" &&
+        s.kind != "prompt-guard" && s.kind != "classifier" &&
+        s.kind != "linear-head") {
         throw std::invalid_argument(
             "--guard: unknown kind '" + s.kind +
-            "' (known: llama-guard, prompt-guard, classifier, linear-head)");
+            "' (known: llama-guard, qwen3-guard, prompt-guard, classifier, "
+            "linear-head)");
+    }
+    // Only Qwen3Guard writes a Controversial verdict.
+    if (have_controversial && s.kind != "qwen3-guard") {
+        throw std::invalid_argument(
+            "--guard: only kind=qwen3-guard takes controversial=");
+    }
+    if (s.kind == "qwen3-guard") {
+        const auto known = qwen3_guard_categories();
+        for (const std::string& l : s.labels) {
+            if (std::none_of(known.begin(), known.end(),
+                             [&](const GuardCategory& c) {
+                                 return c.name == l;
+                             })) {
+                throw std::invalid_argument(
+                    "--guard: '" + l + "' is not a Qwen3Guard category "
+                    "(Violent, Non-violent Illegal Acts, Sexual Content or "
+                    "Sexual Acts, PII, Suicide & Self-Harm, Unethical Acts, "
+                    "Politically Sensitive Topics, Copyright Violation, "
+                    "Jailbreak)");
+            }
+        }
     }
     // A linear head scores the vectors of the embedding model it was
     // trained on; no other kind takes one.
@@ -464,19 +674,19 @@ GuardSpec parse_guard_spec(std::string_view text) {
     if (have_labels && s.labels.empty()) {
         throw std::invalid_argument("--guard: labels= names no label");
     }
-    const bool scores = s.kind != "llama-guard";
+    const bool scores = s.kind != "llama-guard" && s.kind != "qwen3-guard";
     if (!scores) {
         // A generating guard writes its categories: no scores to
         // compare with a threshold.
         if (have_threshold ||
             std::any_of(s.thresholds.begin(), s.thresholds.end(),
                         [](float t) { return !std::isnan(t); })) {
-            throw std::invalid_argument(
-                "--guard: kind=llama-guard takes no threshold");
+            throw std::invalid_argument("--guard: kind=" + s.kind +
+                                        " takes no threshold");
         }
         if (have_max_windows) {
-            throw std::invalid_argument(
-                "--guard: kind=llama-guard takes no max_windows");
+            throw std::invalid_argument("--guard: kind=" + s.kind +
+                                        " takes no max_windows");
         }
     } else if (s.labels.empty()) {
         // "All labels" would reject on the benign label too.
@@ -503,6 +713,11 @@ std::unique_ptr<Guard> make_guard(const GuardSpec& spec,
         return LlamaGuard::load(spec.model, backend, n_blocks, spec.labels,
                                 spec.name);
     }
+    if (spec.kind == "qwen3-guard") {
+        return LlamaGuard::load(spec.model, backend, n_blocks, spec.labels,
+                                spec.name, qwen3_guard_format(),
+                                spec.controversial_rejects);
+    }
     if (spec.kind == "prompt-guard") return load_prompt_guard(spec);
     if (spec.kind == "classifier") {
         return load_encoder_classifier(spec, encoder_gpu);
@@ -516,7 +731,7 @@ std::vector<GuardVerdict> LlamaGuard::check_batch(
     std::vector<chat::ChatTemplate::Prompt> prompts;
     prompts.reserve(requests.size());
     for (const Turns& t : requests) {
-        prompts.push_back(llama_guard3_prompt(t, categories_));
+        prompts.push_back(format_.prompt(t));
     }
     // A loaded guard runs the batch as one engine batch; the test
     // seam's classifier, prompt by prompt.
@@ -550,7 +765,7 @@ std::vector<GuardVerdict> LlamaGuard::check_batch(
     last_error_.clear();
     for (std::size_t i = 0; i < got.size(); ++i) {
         if (got[i].error.empty()) {
-            out[i] = parse_guard_verdict(got[i].text);
+            out[i] = format_.parse(got[i].text, controversial_rejects_);
             if (out[i].kind == GuardVerdict::Kind::kMalformed) {
                 out[i].error = "no verdict in the guard's reply";
             }

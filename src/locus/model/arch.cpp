@@ -1728,6 +1728,13 @@ const ArchSpec kArchs[] = {
      "experts)",
      &qwen3moe_hparams, &qwen3moe_attention_tensors,
      &qwen3moe_attention, &llama_kv_dim},
+    // Dense Qwen3 (i#1106: Qwen3Guard): qwen3moe's attention and
+    // hparams (with no experts, the layers take the dense SwiGLU FFN).
+    {"qwen3",
+     "Qwen3 dense (GQA + per-head q/k norm, NEOX rope)",
+     &qwen3moe_hparams, &qwen3moe_attention_tensors,
+     &qwen3moe_attention, &llama_kv_dim, nullptr, nullptr, nullptr, false,
+     false, nullptr, true},
     {"dbrx",
      "DBRX (GQA, fused QKV + clip_qkv, LayerNorm, fine-grained "
      "MoE 16x/4)",

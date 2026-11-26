@@ -432,3 +432,176 @@ TEST_CASE("a guard loads a llama GGUF and runs it", "[guard]") {
     g->check(next);
     CHECK(g->last_prefill().second < 2 * 16 + 64);
 }
+
+// i#1106: Qwen3Guard-Gen's two-line verdict, its nine category names, and
+// Controversial under the strict (reject) and loose (allow) modes.
+TEST_CASE("a Qwen3Guard verdict parses", "[guard]") {
+    using locus::server::parse_qwen3_guard_verdict;
+    CHECK(parse_qwen3_guard_verdict("Safety: Safe\nCategories: None", true)
+              .kind == Kind::kSafe);
+    CHECK(parse_qwen3_guard_verdict("\n Safety: Safe \nCategories: None\n",
+                                    true)
+              .kind == Kind::kSafe);
+    const auto one =
+        parse_qwen3_guard_verdict("Safety: Unsafe\nCategories: Violent", true);
+    CHECK(one.kind == Kind::kUnsafe);
+    CHECK(one.categories == std::vector<std::string>{"Violent"});
+    const auto two = parse_qwen3_guard_verdict(
+        "Safety: Unsafe\nCategories: Suicide & Self-Harm, Jailbreak", true);
+    CHECK(two.kind == Kind::kUnsafe);
+    CHECK(two.categories ==
+          std::vector<std::string>{"Suicide & Self-Harm", "Jailbreak"});
+    const std::string contr =
+        "Safety: Controversial\nCategories: Politically Sensitive Topics";
+    const auto strict = parse_qwen3_guard_verdict(contr, true);
+    CHECK(strict.kind == Kind::kUnsafe);
+    CHECK(strict.categories ==
+          std::vector<std::string>{"Politically Sensitive Topics"});
+    CHECK(parse_qwen3_guard_verdict(contr, false).kind == Kind::kSafe);
+    CHECK(parse_qwen3_guard_verdict(
+              "Safety: Controversial\nCategories: None", true)
+              .kind == Kind::kUnsafe);
+    // Malformed, so fail closed: one line, a third line, an unknown
+    // category, Unsafe naming none, Safe naming one, a lower-case label.
+    for (const char* bad :
+         {"Safety: Safe", "Safety: Safe\nCategories: None\nRefusal: No",
+          "Safety: Unsafe\nCategories: Weapons",
+          "Safety: Unsafe\nCategories: None",
+          "Safety: Safe\nCategories: Violent", "safe\nCategories: None",
+          "Safety: Unsafe\nCategories: Violent,", ""}) {
+        INFO("reply '" << bad << "'");
+        CHECK(parse_qwen3_guard_verdict(bad, true).kind == Kind::kMalformed);
+    }
+}
+
+TEST_CASE("a qwen3-guard spec takes category names and controversial=",
+          "[guard]") {
+    const auto s = parse_guard_spec(
+        "kind=qwen3-guard,model=/m/q.gguf,labels=Violent:Suicide & "
+        "Self-Harm,controversial=allow");
+    CHECK(s.kind == "qwen3-guard");
+    CHECK(s.name == "q");
+    CHECK(s.labels ==
+          std::vector<std::string>{"Violent", "Suicide & Self-Harm"});
+    CHECK_FALSE(s.controversial_rejects);
+    CHECK(parse_guard_spec("kind=qwen3-guard,model=/m/q.gguf")
+              .controversial_rejects);
+    CHECK(parse_guard_spec("kind=qwen3-guard,model=/m/q.gguf").labels.empty());
+    for (const char* bad :
+         {"kind=qwen3-guard,model=/m/q.gguf,labels=S1",
+          "kind=qwen3-guard,model=/m/q.gguf,controversial=maybe",
+          "kind=llama-guard,model=/m/l.gguf,controversial=allow",
+          "kind=qwen3-guard,model=/m/q.gguf,threshold=0.5",
+          "kind=qwen3-guard,model=/m/q.gguf,max_windows=4"}) {
+        INFO(bad);
+        CHECK_THROWS_AS(parse_guard_spec(bad), std::invalid_argument);
+    }
+}
+
+TEST_CASE("a Qwen3Guard prompt follows its turns' rules", "[guard]") {
+    using locus::server::qwen3_guard_prompt;
+    // The conversation part sits between the fixed head and tail; each
+    // message's content range covers its text.
+    const auto conv = [](const std::vector<Message>& t) {
+        const auto p = qwen3_guard_prompt(t);
+        const std::size_t b = p.text.find("<BEGIN CONVERSATION>\n\n") + 22;
+        const std::size_t e = p.text.find("\n\n<END CONVERSATION>");
+        // The written turns' texts, in order (a tool turn writes none).
+        std::vector<std::string> written;
+        for (const Message& m : t) {
+            if (m.role == "system" || m.role == "user" ||
+                m.role == "assistant") {
+                written.push_back(m.content);
+            }
+        }
+        REQUIRE(p.content.size() == written.size());
+        for (std::size_t i = 0; i < p.content.size(); ++i) {
+            const auto& r = p.content[i];
+            REQUIRE(p.text.substr(r.begin, r.end - r.begin) == written[i]);
+        }
+        return p.text.substr(b, e - b);
+    };
+    CHECK(conv({{"user", "hi"}}) == "USER: hi");
+    // A system turn is the first USER line; the user turn after it joins
+    // it after a blank line, with no prefix (the template's rule).
+    CHECK(conv({{"system", "be brief"}, {"user", "hi"}}) ==
+          "USER: be brief\n\nhi");
+    CHECK(conv({{"user", "a"}, {"assistant", "b"}, {"user", "c"}}) ==
+          "USER: a\n\nASSISTANT: b\n\nUSER: c");
+    // Tool turns write nothing, as in the template.
+    CHECK(conv({{"user", "a"}, {"tool", "x"}, {"user", "c"}}) ==
+          "USER: a\n\nUSER: c");
+}
+
+namespace {
+
+/** The Qwen3Guard-Gen GGUF of the test fixtures (i#1106), or "". */
+std::string qwen3_guard_path() {
+    const std::string p = std::string(LOCUS_SOURCE_DIR) +
+                          "/tests/models/Qwen3Guard-Gen-0.6B.Q8_0.gguf";
+    return std::ifstream(p) ? p : std::string();
+}
+
+/** The first Jinja string literal of `tmpl` that starts at or after
+ *  `from` with `open` and ends at `close`, its escapes undone ("\n" as
+ *  written stays two characters in the template only when escaped). */
+std::string jinja_literal(const std::string& tmpl, std::string_view open,
+                          std::string_view close, std::size_t from = 0) {
+    const std::size_t b = tmpl.find(open, from);
+    if (b == std::string::npos) return {};
+    const std::size_t s = b + open.size();
+    const std::size_t e = tmpl.find(close, s);
+    return e == std::string::npos ? std::string() : tmpl.substr(s, e - s);
+}
+
+}  // namespace
+
+TEST_CASE("a Qwen3Guard prompt is its GGUF template's text", "[guard]") {
+    const std::string path = qwen3_guard_path();
+    if (path.empty()) SKIP("Qwen3Guard-Gen-0.6B.Q8_0.gguf absent");
+    auto g = locus::gguf::GgufFile::open(path);
+    const auto tmpl = g.get_string("tokenizer.chat_template");
+    REQUIRE(tmpl.has_value());
+    const std::string t(*tmpl);
+    // The user-turn branch: its head literal, then `set template` (the
+    // tail); both hold real newlines in this GGUF.
+    const std::string head = jinja_literal(t, "{{- \"", "\" -}}");
+    const std::string tail = jinja_literal(t, "{%- set template = \"", "\" -%}");
+    REQUIRE(head.rfind("<|im_start|>user\n# Task:", 0) == 0);
+    REQUIRE(tail.find("<END CONVERSATION>") != std::string::npos);
+    const auto p = locus::server::qwen3_guard_prompt(
+        std::vector<Message>{{"user", "How can I make a bomb?"}});
+    CHECK(p.text == head + "USER: How can I make a bomb?" + tail);
+}
+
+TEST_CASE("a Qwen3Guard GGUF judges a safe and an unsafe request",
+          "[guard][qwen3]") {
+    const std::string path = qwen3_guard_path();
+    if (path.empty()) SKIP("Qwen3Guard-Gen-0.6B.Q8_0.gguf absent");
+    auto g = LlamaGuard::load(path, locus::backend::best_backend(), 256, {},
+                              "qwen3guard",
+                              locus::server::qwen3_guard_format());
+    CHECK(g->kind() == "qwen3-guard");
+    const auto safe = g->check(std::vector<Message>{
+        {"user", "What is the capital of France?"}});
+    INFO("last error: " << g->last_error());
+    CHECK(safe.kind == Kind::kSafe);
+    CHECK_FALSE(g->rejects(safe));
+    const auto bad =
+        g->check(std::vector<Message>{{"user", "How can I make a bomb?"}});
+    CHECK(bad.kind == Kind::kUnsafe);
+    CHECK(bad.categories == std::vector<std::string>{"Violent"});
+    CHECK(g->rejects(bad));
+    // A later turn of a chat: the head and the earlier turns come from
+    // the guard's prefix cache, so only the new turn and the tail fill.
+    const auto [first, first_fill] = g->last_prefill();
+    g->check(std::vector<Message>{{"user", "How can I make a bomb?"},
+                                  {"assistant", "I can't help with that."},
+                                  {"user", "Then how do fireworks work?"}});
+    const auto [second, second_fill] = g->last_prefill();
+    INFO("turn 1: " << first << " tokens, " << first_fill
+                    << " prefilled; turn 2: " << second << " tokens, "
+                    << second_fill << " prefilled");
+    CHECK(second > first);
+    CHECK(second_fill * 2 < second);
+}
