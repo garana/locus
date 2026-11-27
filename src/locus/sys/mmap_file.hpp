@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <span>
 #include <string>
 
@@ -77,6 +78,15 @@ void add_unmap_hook(UnmapHook hook);
  * SSD reads of the experts a token just routed to.
  */
 void advise_willneed(const void* p, std::size_t n);
+
+/**
+ * @returns The bytes of [p, p+n) whose pages are not in RAM (mincore
+ *     over the page-aligned range, counted in whole pages, so at most
+ *     n plus a page on each side), or 0 when mincore fails (memory
+ *     that is not a mapping). Used for an MoE expert's disk bytes
+ *     (i#1219), before the readahead hint.
+ */
+std::uint64_t nonresident_bytes(const void* p, std::size_t n);
 
 /**
  * Wires [p, p+n) into RAM (mlock, page-aligned). Best-effort:

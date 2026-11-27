@@ -58,6 +58,7 @@
 #include "locus/server/image_lora.hpp"
 #include "locus/server/tools.hpp"
 #include "locus/sys/features.hpp"
+#include "locus/sys/meminfo.hpp"
 #include "locus/sys/perf_counters.hpp"
 #include "locus/video/jobs.hpp"
 
@@ -761,18 +762,79 @@ void render_fallbacks(MetricsText& mt) {
  * least once have a series.
  */
 void render_expert_calls(MetricsText& mt) {
+    // The process's storage reads (i#1219): what the per-expert disk
+    // bytes below add up against. Read at scrape time.
+    mt.counter("locus_storage_read_bytes_total",
+               "Bytes the process read from storage (Linux /proc/self/io "
+               "read_bytes, macOS proc_pid_rusage ri_diskio_bytesread).",
+               sys::storage_read_bytes());
     const auto calls = model::ExpertCalls::snapshot();
     if (calls.empty()) return;
+    const auto where = [](std::uint32_t layer, std::uint32_t expert) {
+        return MetricsText::label("layer", std::to_string(layer)) + "," +
+               MetricsText::label("expert", std::to_string(expert));
+    };
+    const auto on = [](std::string_view device, std::string_view api) {
+        return MetricsText::label("device", device) + "," +
+               MetricsText::label("api", api);
+    };
     mt.family("locus_moe_expert_calls_total",
               "Routed MoE expert calls, per layer, expert and device.",
               "counter");
     for (const auto& c : calls) {
         mt.value("locus_moe_expert_calls_total",
-                 MetricsText::label("layer", std::to_string(c.layer)) + "," +
-                     MetricsText::label("expert", std::to_string(c.expert)) +
-                     "," + MetricsText::label("device", c.device) + "," +
-                     MetricsText::label("api", c.api),
+                 where(c.layer, c.expert) + "," + on(c.device, c.api),
                  c.calls);
+    }
+    // Per expert run (i#1219): CPU and CUDA runs only.
+    const auto runs = model::ExpertCalls::run_snapshot();
+    if (!runs.empty()) {
+        mt.family("locus_moe_expert_seconds_total",
+                  "Wall time of routed MoE expert runs by the host clock "
+                  "(cpu: the compute; cuda: input upload, kernel and copy "
+                  "back).",
+                  "counter");
+        for (const auto& r : runs) {
+            mt.value("locus_moe_expert_seconds_total",
+                     where(r.layer, r.expert) + "," + on(r.device, r.api),
+                     static_cast<double>(r.ns) / 1e9);
+        }
+        mt.family("locus_moe_expert_runs_total",
+                  "Routed MoE expert runs: one weight pass each, a batched "
+                  "run over several tokens counted once.",
+                  "counter");
+        for (const auto& r : runs) {
+            mt.value("locus_moe_expert_runs_total",
+                     where(r.layer, r.expert) + "," + on(r.device, r.api),
+                     r.runs);
+        }
+    }
+    const auto disk = model::ExpertCalls::disk_snapshot();
+    if (!disk.empty()) {
+        mt.family("locus_moe_expert_disk_bytes_total",
+                  "Bytes of an expert's weights not in RAM when it was "
+                  "picked (mincore, before the readahead hint); "
+                  "file-backed weights only.",
+                  "counter");
+        for (const auto& d : disk) {
+            mt.value("locus_moe_expert_disk_bytes_total",
+                     where(d.layer, d.expert), d.bytes);
+        }
+    }
+    const auto tokens = model::ExpertCalls::run_tokens();
+    if (!tokens.empty()) {
+        mt.family("locus_moe_expert_run_tokens",
+                  "Tokens served per routed MoE expert run, over all layers "
+                  "and experts.",
+                  "histogram");
+        for (const auto& t : tokens) {
+            mt.histogram_series(
+                "locus_moe_expert_run_tokens",
+                on(t.device, t.api) + "," +
+                    MetricsText::label("phase",
+                                       model::run_phase_name(t.phase)),
+                t.tokens);
+        }
     }
 }
 

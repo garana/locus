@@ -17,4 +17,14 @@ namespace locus::sys {
  */
 std::uint64_t total_ram_bytes();
 
+/**
+ * Bytes this process has read from storage so far (i#1219): Linux
+ * /proc/self/io read_bytes, macOS proc_pid_rusage ri_diskio_bytesread.
+ * Page-cache hits are not counted, so a streamed model's expert reads
+ * from disk are.
+ *
+ * @returns the bytes read, or 0 when the platform does not report it.
+ */
+std::uint64_t storage_read_bytes();
+
 }  // namespace locus::sys

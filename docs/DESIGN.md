@@ -1173,7 +1173,23 @@ guarding the default path.
   `vulkan`, `moltenvk` or the CPU kernel set (`neon`, `avx2`, `sse4`,
   `scalar`). Vulkan's GPU-routed MoE layers keep the picks on the
   device and are not counted; picks its host-routed layers run on the
-  CPU count as `cpu` with the CPU kernel set.
+  CPU count as `cpu` with the CPU kernel set. Per expert with the same
+  labels, `locus_moe_expert_runs_total` counts weight passes (a
+  batched prefill run over several tokens once) and
+  `locus_moe_expert_seconds_total` their host-clock time, so
+  calls / runs is the tokens a run and seconds / runs its time; only
+  CPU and CUDA runs (a CUDA matvec blocks on its copy back), since a
+  Vulkan or Metal expert is recorded into a command buffer.
+  `locus_moe_expert_run_tokens{device,api,phase}` is the spread of
+  tokens a run, `phase` the forward call's (`prefill`, `decode`,
+  `verify`, set by the engine around each call); the runs cost about
+  1% of a resident MoE model's CPU decode. On a file-backed model
+  with `LOCUS_MOE_DISK_BYTES=1`, `locus_moe_expert_disk_bytes_total
+  {layer,expert}` adds the bytes of an expert's weights not in RAM
+  when it is picked (mincore, before the readahead hint), to set
+  against `locus_storage_read_bytes_total`, the process's storage
+  reads. It is opt-in: a mincore over each pick's weights halved
+  Qwen1.5-MoE's CPU decode on the M4 Max (92 to 46 tok/s).
 - KV-cache quantization: Q8 or Q4 blocks of 32 (f16 scale) in a
   separate byte pool, for the llama-family attention. Each layer's
   past rows are dequantized into scratch, so the attention math is the

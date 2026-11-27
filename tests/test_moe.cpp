@@ -2067,3 +2067,65 @@ TEST_CASE("a forward with remote experts is one process's bits",
         }
     }
 }
+
+// i#1219: through the engine on a CPU backend, with the thread pool on,
+// the batched prefill's expert runs land under phase="prefill" (one run
+// an expert a call, its tokens counted) and each decode's under
+// "decode" (a run a token); every run is timed, and the tokens the
+// runs served add up to the calls.
+TEST_CASE("expert runs land under their forward call's phase",
+          "[moe][metrics]") {
+    using locus::model::ExpertCalls;
+    using locus::model::RunPhase;
+    ModelBuilder moe;
+    moe.common();
+    moe.tensor("blk.0.ffn_gate_inp.weight", {kE, 4}, weights(kE * 4, 80));
+    moe.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 81));
+    moe.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 82));
+    moe.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+               weights(kF * kE * 4, 83));
+    auto img = moe.build(4, 2);
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = TransformerModel::load(g);
+    model.use_backend(locus::backend::backends().front());  // best CPU
+    REQUIRE(model.supports_batch_prefill());
+    ExpertCalls::reset();
+    locus::engine::Engine engine(model, static_cast<locus::tok::TokenId>(-1),
+                                 locus::engine::Engine::Config{});
+    const auto id = engine.submit({3, 7, 1, 3, 7, 1, 9, 2}, 3);
+    engine.run_to_completion();
+    REQUIRE(engine.get(id)->generated.size() == 3);
+
+    // 8 prompt tokens and 2 decodes, 2 picks each.
+    std::uint64_t calls = 0;
+    for (const auto& c : ExpertCalls::snapshot()) calls += c.calls;
+    REQUIRE(calls == 20);
+    const locus::model::ExpertCalls::RunTokens* pre = nullptr;
+    const locus::model::ExpertCalls::RunTokens* dec = nullptr;
+    const auto rt = ExpertCalls::run_tokens();
+    for (const auto& t : rt) {
+        REQUIRE(t.device == "cpu");
+        if (t.phase == RunPhase::kPrefill) pre = &t;
+        if (t.phase == RunPhase::kDecode) dec = &t;
+        REQUIRE(t.phase != RunPhase::kVerify);
+    }
+    REQUIRE(pre != nullptr);
+    REQUIRE(dec != nullptr);
+    // The prompt's 16 picks in at most 4 runs (one an expert).
+    REQUIRE(pre->tokens.sum == 16);
+    REQUIRE(pre->tokens.count <= 4);
+    REQUIRE(dec->tokens.sum == 4);
+    REQUIRE(dec->tokens.count == 4);
+    std::uint64_t runs = 0, ns = 0;
+    for (const auto& r : ExpertCalls::run_snapshot()) {
+        runs += r.runs;
+        ns += r.ns;
+    }
+    REQUIRE(runs == pre->tokens.count + dec->tokens.count);
+    REQUIRE(ns > 0);
+    // An in-memory image: no disk bytes.
+    REQUIRE(ExpertCalls::disk_snapshot().empty());
+    ExpertCalls::reset();
+}

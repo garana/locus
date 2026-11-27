@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -190,6 +191,38 @@ void advise_expert(const TransformerModel::Layer& lay, std::uint32_t e) {
                          lay.up_exps.expert_bytes);
     sys::advise_willneed(lay.down_exps.expert(e).data,
                          lay.down_exps.expert_bytes);
+}
+
+/** @returns Whether expert picks measure their disk bytes (i#1219):
+ *  LOCUS_MOE_DISK_BYTES=1, opt-in, since mincore over each pick's
+ *  weights halves a resident model's CPU decode (Qwen1.5-MoE on the
+ *  M4 Max: 92 to 46 tok/s). */
+bool disk_bytes_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("LOCUS_MOE_DISK_BYTES");
+        return e != nullptr && std::string_view(e) == "1";
+    }();
+    return on;
+}
+
+/** @returns The bytes of routed expert e's gate, up and down weights
+ *  not in RAM (mincore, i#1219). */
+std::uint64_t expert_disk_bytes(const TransformerModel::Layer& lay,
+                                std::uint32_t e) {
+    return sys::nonresident_bytes(lay.gate_exps.expert(e).data,
+                                  lay.gate_exps.expert_bytes) +
+           sys::nonresident_bytes(lay.up_exps.expert(e).data,
+                                  lay.up_exps.expert_bytes) +
+           sys::nonresident_bytes(lay.down_exps.expert(e).data,
+                                  lay.down_exps.expert_bytes);
+}
+
+/** @returns Host-clock nanoseconds since t0 (an expert run, i#1219). */
+std::uint64_t ns_since(std::chrono::steady_clock::time_point t0) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
 }
 
 /**
@@ -2601,8 +2634,12 @@ bool TransformerModel::moe_hybrid_touch(MoeHybrid& hy,
         hy.promoted.fetch_add(1, std::memory_order_relaxed);
     }
     (t.hot ? hy.hot : hy.cold).fetch_add(1, std::memory_order_relaxed);
-    ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, t.hot,
-                        t.hot ? gpu_api : hy.cpu->name);
+    const std::string_view api = t.hot ? gpu_api : hy.cpu->name;
+    ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, t.hot, api);
+    if (file_backed_ && disk_bytes_on()) {
+        ExpertCalls::record_disk(layer, e, hp_.n_layers, hp_.n_expert,
+                                 t.hot, api, expert_disk_bytes(lay, e));
+    }
     return t.hot;
 }
 
@@ -2747,8 +2784,27 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
             }
             ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, gpu,
                                 api);
+            // Its weights not in RAM, before the readahead hint below.
+            if (file_backed_ && disk_bytes_on()) {
+                ExpertCalls::record_disk(layer, e, hp_.n_layers,
+                                         hp_.n_expert, gpu, api,
+                                         expert_disk_bytes(lay, e));
+            }
         }
     }
+    // An expert run's host-clock time (CPU and CUDA, i#1219), around
+    // the call on this thread.
+    const bool timing = ExpertCalls::timed(api);
+    const auto run = [&](std::uint32_t e, auto&& f) {
+        if (!timing) {
+            f();
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        f();
+        ExpertCalls::record_run(layer, e, hp_.n_layers, hp_.n_expert, gpu,
+                                api, 1, ns_since(t0));
+    };
     // The cold experts run on the CPU backend while the GPU runs the
     // hot ones; ws.xb is read-only until both are done. The CPU reads
     // them from the model file whatever its size, so ask for them all
@@ -2766,18 +2822,25 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
         // to the helper thread, which would otherwise take the global
         // one and oversubscribe the cores.
         sys::ThreadPool& caller_pool = sys::ThreadPool::instance();
-        cold_done = std::async(std::launch::async, [&] {
+        // The helper thread runs under the caller's phase (i#1219).
+        const RunPhase phase = run_phase();
+        cold_done = std::async(std::launch::async, [&, phase] {
             const sys::ThreadPool::Scope scope(caller_pool);
+            const RunPhaseScope ph(phase);
             const Ops cop =
                 effective_ops(hy->cpu, q8k_activations_for(hy->cpu));
             std::vector<float> g(n_ff), u(n_ff), d(hp_.n_embd);
             for (const auto& [e, wgt] : cold) {
+                const auto t0 = std::chrono::steady_clock::now();
                 const MatvecJob gu[] = {
                     {lay.gate_exps.expert(e), ws.xb, g},
                     {lay.up_exps.expert(e), ws.xb, u}};
                 matvec_mt_group(cop, gu);
                 silu_mul(g, u, g);
                 matvec_mt(cop, lay.down_exps.expert(e), g, d);
+                ExpertCalls::record_run(layer, e, hp_.n_layers,
+                                        hp_.n_expert, false, hy->cpu->name,
+                                        1, ns_since(t0));
                 for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
                     cold_acc[i] += wgt * d[i];
                 }
@@ -2843,9 +2906,11 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
     };
     if (!any_remote) {
         for (const auto& [e, wgt] : picked) {
-            swiglu_into_acc(lay.gate_exps.expert(e),
-                            lay.up_exps.expert(e),
-                            lay.down_exps.expert(e), n_ff, wgt);
+            run(e, [&] {
+                swiglu_into_acc(lay.gate_exps.expert(e),
+                                lay.up_exps.expert(e),
+                                lay.down_exps.expert(e), n_ff, wgt);
+            });
         }
     } else {
         // Each pick's d, local ones computed while the remote ones run,
@@ -2856,9 +2921,12 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
         for (std::size_t p = 0; p < picked.size(); ++p) {
             if (is_remote[p] == 0) {
                 const std::uint32_t e = picked[p].first;
-                swiglu_expert(op, lay.gate_exps.expert(e),
-                              lay.up_exps.expert(e), lay.down_exps.expert(e),
-                              n_ff, ws.xb, ws.gate, ws.up, d[p]);
+                run(e, [&] {
+                    swiglu_expert(op, lay.gate_exps.expert(e),
+                                  lay.up_exps.expert(e),
+                                  lay.down_exps.expert(e), n_ff, ws.xb,
+                                  ws.gate, ws.up, d[p]);
+                });
             }
         }
         for (std::size_t p = 0; p < picked.size(); ++p) {
@@ -3008,6 +3076,21 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
     std::sort(uses.begin(), uses.end(), by_expert);
     std::sort(cold.begin(), cold.end(), by_expert);
 
+    // Each picked expert's weights not in RAM, once a call, before the
+    // readahead hint (i#1219); the hybrid counted its picks in
+    // moe_hybrid_touch.
+    if (file_backed_ && hy == nullptr && disk_bytes_on()) {
+        std::uint32_t prev = UINT32_MAX;
+        for (const auto& u : uses) {
+            if (u.e == prev) {
+                continue;
+            }
+            prev = u.e;
+            ExpertCalls::record_disk(layer, u.e, hp_.n_layers, hp_.n_expert,
+                                     gpu, api, expert_disk_bytes(lay, u.e));
+        }
+    }
+
     // Readahead the union once (first appearance of each expert).
     if (readahead_enabled()) {
         std::uint32_t prev = UINT32_MAX;
@@ -3061,12 +3144,16 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
     if (!cold.empty()) {
         // The caller's pool follows the work (i#45), as above.
         sys::ThreadPool& caller_pool = sys::ThreadPool::instance();
-        cold_done = std::async(std::launch::async, [&] {
+        // The helper thread runs under the caller's phase (i#1219).
+        const RunPhase phase = run_phase();
+        cold_done = std::async(std::launch::async, [&, phase] {
             const sys::ThreadPool::Scope scope(caller_pool);
+            const RunPhaseScope ph(phase);
             const Ops cop =
                 effective_ops(hy->cpu, q8k_activations_for(hy->cpu));
             std::vector<float> g(ff), u(ff), d(E);
             for (const auto& c : cold) {
+                const auto t0 = std::chrono::steady_clock::now();
                 const float* xin =
                     xbf.data() + static_cast<std::size_t>(c.t) * E;
                 const MatvecJob gu[] = {
@@ -3075,6 +3162,10 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
                 matvec_mt_group(cop, gu);
                 silu_mul(g, u, g);
                 matvec_mt(cop, lay.down_exps.expert(c.e), g, d);
+                // A run a token: the CPU side does not batch them.
+                ExpertCalls::record_run(layer, c.e, hp_.n_layers,
+                                        hp_.n_expert, false, hy->cpu->name,
+                                        1, ns_since(t0));
                 const float wgt = picked[c.t][c.s].second;
                 float* r = res.data() +
                            (static_cast<std::size_t>(c.t) * k + c.s) * E;
@@ -3089,6 +3180,7 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
     // matvec_batch is byte-identical to the per-token matvecs, so the
     // res slots get the same bits.
     std::vector<float> xg, gg, ug, dg;
+    const bool timing = ExpertCalls::timed(api);
     for (std::size_t i = 0; i < uses.size();) {
         const std::uint32_t e = uses[i].e;
         std::size_t j = i;
@@ -3096,6 +3188,8 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
             ++j;
         }
         const auto m = static_cast<std::uint32_t>(j - i);
+        // One run of e over its m tokens (i#1219).
+        const auto t0 = std::chrono::steady_clock::now();
         xg.resize(static_cast<std::size_t>(m) * E);
         gg.resize(static_cast<std::size_t>(m) * ff);
         ug.resize(static_cast<std::size_t>(m) * ff);
@@ -3113,6 +3207,10 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
                      {gg.data() + o, ff});
         }
         matvec_batch(op, lay.down_exps.expert(e), gg, dg, m);
+        if (timing) {
+            ExpertCalls::record_run(layer, e, hp_.n_layers, hp_.n_expert,
+                                    gpu, api, m, ns_since(t0));
+        }
         for (std::uint32_t q = 0; q < m; ++q) {
             const auto& u = uses[i + q];
             const float wgt = picked[u.t][u.s].second;
