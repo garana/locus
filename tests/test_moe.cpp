@@ -1238,8 +1238,8 @@ std::vector<std::byte> quantize_q8_0(const std::vector<float>& w,
 TEST_CASE("dequant-amortized batch matvec matches per-token "
           "(f32 byte-identical, q8_0 token-exact)", "[batch]") {
     using locus::backend::Mat;
-    // rows > kMinRowsPerSlice (64) so the threaded row-split path
-    // is actually exercised below.
+    // rows * n over 64 per slice, so the threaded row-split path is
+    // actually exercised below.
     constexpr std::uint32_t rows = 200, cols = 64, n = 5;
     const auto& op = locus::backend::find_backend("scalar")->ops;
 
@@ -1305,6 +1305,38 @@ TEST_CASE("dequant-amortized batch matvec matches per-token "
         }
         unsetenv("LOCUS_THREADS");
     }
+}
+
+// i#1198: a 128-row weight (Qwen2.5 0.5B's k and v projections) over a
+// 64-token chunk splits by rows times tokens: 4 slices of 32 rows where
+// 64 rows a slice gave 2. Each (row, token) is still one slice's work,
+// so the bits equal n per-token matvecs at every thread count.
+TEST_CASE("a small weight over a token chunk splits across threads, "
+          "bit-exact", "[batch]") {
+    using locus::backend::Mat;
+    constexpr std::uint32_t rows = 128, cols = 64, n = 64;
+    const auto& op = locus::backend::find_backend("scalar")->ops;
+    const std::vector<float> w =
+        weights(static_cast<std::size_t>(rows) * cols, 91);
+    const std::vector<float> xb =
+        weights(static_cast<std::size_t>(n) * cols, 92);
+    const Mat m{locus::gguf::TensorType::kF32,
+                reinterpret_cast<const std::byte*>(w.data()), rows, cols};
+    std::vector<float> ref(static_cast<std::size_t>(n) * rows);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        op.matvec(m, {xb.data() + t * cols, cols},
+                  {ref.data() + t * rows, rows});
+    }
+    for (const char* nt : {"1", "2", "4"}) {
+        setenv("LOCUS_THREADS", nt, 1);
+        std::vector<float> got(static_cast<std::size_t>(n) * rows);
+        locus::model::matvec_batch(op, m, xb, got, n);
+        REQUIRE(got == ref);
+        std::vector<float> deq(static_cast<std::size_t>(n) * rows);
+        locus::model::matvec_batch_deq(op, m, xb, deq, n);
+        REQUIRE(deq == ref);
+    }
+    unsetenv("LOCUS_THREADS");
 }
 
 TEST_CASE("qwen2moe gated shared expert scales only the shared "

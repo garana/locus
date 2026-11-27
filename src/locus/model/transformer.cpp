@@ -193,14 +193,20 @@ void advise_expert(const TransformerModel::Layer& lay, std::uint32_t e) {
 }
 
 /**
- * How many row-slices to split a `rows`-row matvec across: the
- * fan-out (mt_fanout), capped by keeping at least kMinRowsPerSlice
- * rows per slice so dispatch overhead never dominates. Returns <= 1
- * when the work should run inline.
+ * How many row-slices to split a `rows`-row matvec of `n` tokens
+ * across: the fan-out (mt_fanout), capped by keeping at least
+ * kMinRowTokensPerSlice rows times tokens per slice so dispatch
+ * overhead never dominates. One token keeps 64 rows a slice; a batch
+ * needs fewer rows (i#1198: Qwen2.5's 128-row k and v projections of a
+ * 64-token chunk took 2 of 4 threads, 2.5x llama.cpp's time). Returns
+ * <= 1 when the work should run inline.
  */
-std::size_t mt_slices(std::uint32_t rows) {
-    constexpr std::uint32_t kMinRowsPerSlice = 64;
-    return std::min<std::size_t>(mt_fanout(), rows / kMinRowsPerSlice);
+std::size_t mt_slices(std::uint32_t rows, std::uint32_t n = 1) {
+    constexpr std::uint64_t kMinRowTokensPerSlice = 64;
+    const std::uint64_t min_rows = std::max<std::uint64_t>(
+        1, (kMinRowTokensPerSlice + std::max(n, 1u) - 1) / std::max(n, 1u));
+    return static_cast<std::size_t>(std::min<std::uint64_t>(
+        mt_fanout(), rows / min_rows));
 }
 
 }  // namespace
@@ -2182,16 +2188,18 @@ bool batch_dequant_enabled() {
 }
 
 /**
- * Runs body(r0, r1) over row-slices of a rows-row matvec: threaded
- * across mt_slices() when the backend is re-entrant, else inline.
- * Each slice carries the full n-token batch, so the weight rows in
- * that slice stay hot across all n tokens (weight-stationary) while
- * the slices themselves fan out over cores.
+ * Runs body(r0, r1) over row-slices of a rows-row matvec of n tokens:
+ * threaded across mt_slices(rows, n) when the backend is re-entrant,
+ * else inline. Each slice carries the full n-token batch, so the
+ * weight rows in that slice stay hot across all n tokens
+ * (weight-stationary) while the slices themselves fan out over cores.
+ * Every (row, token) is computed by one slice, as before, so the
+ * slice count changes no bit.
  */
 template <typename Body>
 void for_row_slices(const backend::Ops& op, std::uint32_t rows,
-                    Body&& body) {
-    const std::size_t nslice = op.mt_safe ? mt_slices(rows) : 0;
+                    std::uint32_t n, Body&& body) {
+    const std::size_t nslice = op.mt_safe ? mt_slices(rows, n) : 0;
     if (nslice <= 1) {
         body(0u, rows);
         return;
@@ -2214,7 +2222,7 @@ void matvec_batch_deq(const backend::Ops& op, const Mat& w,
                       std::span<float> out_batch, std::uint32_t n) {
     const std::uint32_t xc = w.cols;
     const std::uint32_t oc = w.rows;
-    for_row_slices(op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+    for_row_slices(op, oc, n, [&](std::uint32_t r0, std::uint32_t r1) {
         std::vector<float> row(xc);
         for (std::uint32_t r = r0; r < r1; ++r) {
             op.dequant_row(w, r, row);
@@ -2258,7 +2266,7 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
             // Each slice transposes its own rows into the token-major
             // output, so no thread waits on a serial transpose.
             for_row_slices(
-                op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+                op, oc, n, [&](std::uint32_t r0, std::uint32_t r1) {
                     const Mat sub = backend::mat_rows(w, r0, r1 - r0);
                     thread_local std::vector<float> rt;
                     rt.resize(static_cast<std::size_t>(r1 - r0) * n);
@@ -2301,7 +2309,7 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
             op.matvec_batch(w, x_batch, rt, n);
         } else {
             for_row_slices(
-                op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+                op, oc, n, [&](std::uint32_t r0, std::uint32_t r1) {
                     const Mat sub = backend::mat_rows(w, r0, r1 - r0);
                     op.matvec_batch(
                         sub, x_batch,
@@ -2334,7 +2342,7 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     // for_row_slices splits on mt_safe alone (it also fans out CPU
     // dequant work); backend calls follow splits_rows.
     if (backend::splits_rows(op)) {
-        for_row_slices(op, oc, per_token);
+        for_row_slices(op, oc, n, per_token);
     } else {
         per_token(0u, oc);
     }
