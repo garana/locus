@@ -1556,11 +1556,13 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
     const uint ah = (tid & 1) * 16;
     const uint bt = tid >> 2;
     const uint bk = (tid & 3) * 8;
-    const bool a_in = m0 + ar < p.rows;
-    const bool b_in = n0 + bt < n_tok;
-    device const uchar* wrow =
-        w + (a_in ? ulong(m0 + ar) * L::row_bytes(p.cols) : 0);
-    const uint xr = !b_in ? 0 : G ? perm[bt] / p.slot_div : n0 + bt;
+    // A thread past the last row or token loads the last one instead (as
+    // llama.cpp's kernel_mul_mm): the loop has no bounds branches, and
+    // those rows' and tokens' sums are never stored.
+    const uint arc = min(m0 + ar, p.rows - 1);
+    const uint btc = min(n0 + bt, n0 + n_tok - 1) - n0;
+    device const uchar* wrow = w + ulong(arc) * L::row_bytes(p.cols);
+    const uint xr = G ? perm[btc] / p.slot_div : n0 + btc;
     device const float* xrow = x + ulong(xr) * p.x_stride;
     // Where this thread's values go: A's k = ah + i is row ar of block
     // (ah / 8 + i / 8, ar / 8) at [k % 8][ar % 8]; B's 8 k are row bt % 8
@@ -1572,19 +1574,12 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
 
     for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
         float va[16];
-        if (a_in) {
-            L::load(wrow, k0, ah, va);
-        } else {
-            for (uint i = 0; i < 16; ++i) va[i] = 0.0f;
-        }
-        float4 vb0 = float4(0.0f), vb1 = float4(0.0f);
-        if (b_in) {
-            // packed: a token row's offset need not be 16-byte aligned.
-            device const packed_float4* src =
-                (device const packed_float4*)(xrow + k0 + bk);
-            vb0 = float4(src[0]);
-            vb1 = float4(src[1]);
-        }
+        L::load(wrow, k0, ah, va);
+        // packed: a token row's offset need not be 16-byte aligned.
+        device const packed_float4* src =
+            (device const packed_float4*)(xrow + k0 + bk);
+        const float4 vb0 = float4(src[0]);
+        const float4 vb1 = float4(src[1]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = 0; i < 8; ++i) da[8 * i] = va[i];
         for (uint i = 0; i < 8; ++i) da[64 * 8 + 8 * i] = va[8 + i];
@@ -1596,6 +1591,7 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
         for (uint kk = 0; kk < kMmTK / 8; ++kk) {
             simdgroup_float8x8 ma[4], mb[2];
             for (uint i = 0; i < 4; ++i) simdgroup_load(ma[i], lsa + 64 * i, 8);
+            simdgroup_barrier(mem_flags::mem_none);
             for (uint i = 0; i < 2; ++i) simdgroup_load(mb[i], lsb + 64 * i, 8);
             for (uint i = 0; i < 8; ++i) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4],
