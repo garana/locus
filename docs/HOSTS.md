@@ -25,6 +25,12 @@ given), against `llama-bench` (`tg128`, `pp<N>`) on the same host.
 llama.cpp's figure counts the graph alone, locus's the engine's whole
 step, so the gap is a little smaller than the ratio.
 
+Each section's "Against llama.cpp" table is `scripts/bench/vs-llama.sh`
+(#1242): the first 2200 and 8600 bytes of docs/DESIGN.md as prompts,
+then 128 decoded tokens, three rounds (locus's median, llama-bench's
+mean), the miner stopped. Rerun it when a perf change lands on that
+host's path, and replace the table.
+
 ## Apple M2 Pro
 
 Match rule: Apple GPU family apple8 (M2). Measured on an M2 Pro: arm64
@@ -60,11 +66,29 @@ M4 Max below). Several Q8_0 clients still do 4 to 9% better on
 | prefill 2.3k, Qwen2.5-0.5B Q8_0  | `--backend metal`              | 2437            | 1556         | not measured                    | #1066        |
 | speech, Orpheus 3B Q4_K_M + SNAC | `locus-server --backend metal` | 15.5 ms a token | not measured | 15.9 ms a token (with sampling) | #784, #1060  |
 
-- Prefill trails llama.cpp at about 0.5x here (#1074, Backlog).
 - Speech: 17.7 ms a token on Metal before #1060's Q6_K kernel; the
   same request, 784 tokens with sampling, in both.
 - PixArt's VAE decode, 128 x 128: CPU 27.2 s, Vulkan 3.09 s, Metal's
   convs 2.83 s (#1055). The server takes Vulkan for it today (#1057).
+
+Against llama.cpp (Homebrew, ggml 1.1.1; 2026-11-27, on AC power):
+Metal on main 5443ecf5, the CPU on main 6e13558f; `llama-bench -ngl 0`
+still uses Accelerate for its CPU prefill. tok/s:
+
+| model                      | phase                   | Metal  | llama.cpp Metal | share | CPU (neon) | llama.cpp CPU | share |
+|----------------------------|-------------------------|--------|-----------------|-------|------------|---------------|-------|
+| llama-3.2-1b-q8_0          | prefill 512 (501 tok)   | 1764.8 | 2557.1          | 0.69x | 451.0      | 668.7         | 0.67x |
+| llama-3.2-1b-q8_0          | decode 128              | 105.9  | 120.0           | 0.88x | 70.5       | 81.8          | 0.86x |
+| llama-3.2-1b-q8_0          | prefill 2048 (2101 tok) | 1642.0 | 2352.9          | 0.70x | 323.9      | 355.0         | 0.91x |
+| llama-3.2-1b-q4_k_m        | prefill 512 (501 tok)   | 1608.4 | 2280.4          | 0.71x | 377.6      | 258.3         | 1.46x |
+| llama-3.2-1b-q4_k_m        | decode 128              | 155.9  | 171.0           | 0.91x | 102.2      | 107.0         | 0.96x |
+| llama-3.2-1b-q4_k_m        | prefill 2048 (2101 tok) | 1505.4 | 1913.6          | 0.79x | 274.9      | 206.3         | 1.33x |
+| qwen2.5-0.5b-instruct-q8_0 | prefill 512 (501 tok)   | 4210.8 | 5949.4          | 0.71x | 1072.4     | 1243.7        | 0.86x |
+| qwen2.5-0.5b-instruct-q8_0 | decode 128              | 187.7  | 191.7           | 0.98x | 154.8      | 176.2         | 0.88x |
+| qwen2.5-0.5b-instruct-q8_0 | prefill 2048 (2123 tok) | 3690.0 | 5264.1          | 0.70x | 722.0      | 652.1         | 1.11x |
+
+Metal prefill is the gap (#1074): the prefill matmuls run at about
+3.7 TFLOP/s against llama.cpp's about 4.8.
 
 ## Apple M4 Max
 
@@ -118,6 +142,26 @@ cost above.
   4.30 s; 1024 x 1024 Vulkan 17.6 s, Metal 16.4 s (#1044). The server
   serves images on Vulkan today (#1057).
 
+Against llama.cpp (Homebrew, ggml 1.1.1; 2026-11-27), main 5443ecf5,
+so the CPU rows are before #1232's block-32 change (its Q8_0 prefill
+gain is not in them); `llama-bench -ngl 0` uses Accelerate for its CPU
+prefill. tok/s:
+
+| model                      | phase                   | Metal   | llama.cpp Metal | share | CPU (neon) | llama.cpp CPU | share |
+|----------------------------|-------------------------|---------|-----------------|-------|------------|---------------|-------|
+| llama-3.2-1b-q8_0          | prefill 512 (501 tok)   | 4315.5  | 5311.9          | 0.81x | 520.5      | 925.4         | 0.56x |
+| llama-3.2-1b-q8_0          | decode 128              | 206.7   | 211.3           | 0.98x | 139.1      | 164.2         | 0.85x |
+| llama-3.2-1b-q8_0          | prefill 2048 (2101 tok) | 3946.1  | 3704.9          | 1.07x | 393.7      | 510.5         | 0.77x |
+| llama-3.2-1b-q4_k_m        | prefill 512 (501 tok)   | 4118.0  | 5098.4          | 0.81x | 550.7      | 387.1         | 1.42x |
+| llama-3.2-1b-q4_k_m        | decode 128              | 269.9   | 288.1           | 0.94x | 172.7      | 177.8         | 0.97x |
+| llama-3.2-1b-q4_k_m        | prefill 2048 (2101 tok) | 3877.6  | 4245.0          | 0.91x | 413.5      | 286.0         | 1.45x |
+| qwen2.5-0.5b-instruct-q8_0 | prefill 512 (501 tok)   | 10061.8 | 12743.0         | 0.79x | 1119.7     | 1762.7        | 0.64x |
+| qwen2.5-0.5b-instruct-q8_0 | decode 128              | 312.6   | 337.5           | 0.93x | 271.3      | 309.5         | 0.88x |
+| qwen2.5-0.5b-instruct-q8_0 | prefill 2048 (2123 tok) | 8889.9  | 10755.4         | 0.83x | 847.3      | 838.4         | 1.01x |
+
+llama.cpp's Q8_0 prefill at 2048 is below its own 512 row here, so
+that 1.07x is its dip, not a locus gain.
+
 ## Intel Core i5-2400 with an NVIDIA GTX 750 Ti
 
 Match rule: x86-64 with SSE4.1 and AVX, no AVX2 and no FMA; an NVIDIA
@@ -131,6 +175,25 @@ to CUDA by itself: pass `--backend cuda`.
 Recommended: `--backend cuda` for dense models that fit in 2 GB (1.7x
 to 3.2x the CPU's decode, 9.7x to 12x its prefill); the CPU default
 for larger ones.
+
+Against llama.cpp (e8e6c7a, built here: CUDA for sm_50 with `-ngl 99`,
+and CPU-only, 4 threads; 2026-11-27), main 6e13558f, `--backend cuda`
+and `--backend sse4`. tok/s:
+
+| model                      | phase                   | CUDA  | llama.cpp CUDA | share | CPU (sse4) | llama.cpp CPU | share |
+|----------------------------|-------------------------|-------|----------------|-------|------------|---------------|-------|
+| llama-3.2-1b-q8_0          | prefill 512 (501 tok)   | 406.5 | 503.3          | 0.81x | 41.0       | 42.6          | 0.96x |
+| llama-3.2-1b-q8_0          | decode 128              | 35.9  | 36.1           | 0.99x | 9.7        | 11.0          | 0.88x |
+| llama-3.2-1b-q8_0          | prefill 2048 (2101 tok) | 238.2 | 449.4          | 0.53x | 34.6       | 39.6          | 0.87x |
+| llama-3.2-1b-q4_k_m        | prefill 512 (501 tok)   | 387.2 | 496.0          | 0.78x | 37.7       | 44.3          | 0.85x |
+| llama-3.2-1b-q4_k_m        | decode 128              | 27.1  | 31.5           | 0.86x | 13.5       | 17.0          | 0.79x |
+| llama-3.2-1b-q4_k_m        | prefill 2048 (2101 tok) | 229.7 | 448.7          | 0.51x | 32.1       | 41.6          | 0.77x |
+| qwen2.5-0.5b-instruct-q8_0 | prefill 512 (501 tok)   | 885.6 | 1186.4         | 0.75x | 98.7       | 107.1         | 0.92x |
+| qwen2.5-0.5b-instruct-q8_0 | decode 128              | 54.2  | 80.8           | 0.67x | 21.2       | 25.2          | 0.84x |
+| qwen2.5-0.5b-instruct-q8_0 | prefill 2048 (2123 tok) | 428.3 | 994.4          | 0.43x | 77.5       | 97.1          | 0.80x |
+
+On CUDA the long prompt is the gap (the attention over the prefix);
+Qwen2.5's decode leaves its small matmuls' launch overhead bare.
 
 | workload                         | default (CPU) | llama.cpp CPU | `--backend cuda` | llama.cpp CUDA | source      |
 |----------------------------------|---------------|---------------|------------------|----------------|-------------|
@@ -190,6 +253,26 @@ V3D 7.1 (Mesa 24.2.8, Vulkan 1.2); Debian 12, GCC 12.
 Automatic: `neon` (it uses its dotprod kernels on this CPU).
 Recommended: no flags; leave `--kv-type` at f32 and `--engines` at 1.
 
+Against llama.cpp (a956a85, CPU build, `-ngl 0`, 4 threads;
+2026-11-27, each run from under 60 C, not throttled), main 6e13558f,
+`--backend neon`. llama.cpp has no Vulkan build here. tok/s:
+
+| model                      | phase                   | CPU (neon) | llama.cpp CPU | share |
+|----------------------------|-------------------------|------------|---------------|-------|
+| llama-3.2-1b-q8_0          | prefill 512 (501 tok)   | 45.1       | 52.7          | 0.86x |
+| llama-3.2-1b-q8_0          | decode 128              | 6.1        | 5.8           | 1.06x |
+| llama-3.2-1b-q8_0          | prefill 2048 (2101 tok) | 33.6       | 46.1          | 0.73x |
+| llama-3.2-1b-q4_k_m        | prefill 512 (501 tok)   | 39.2       | 67.1          | 0.58x |
+| llama-3.2-1b-q4_k_m        | decode 128              | 8.5        | 8.1           | 1.05x |
+| llama-3.2-1b-q4_k_m        | prefill 2048 (2101 tok) | 32.3       | 58.2          | 0.55x |
+| qwen2.5-0.5b-instruct-q8_0 | prefill 512 (501 tok)   | 113.0      | 190.2         | 0.59x |
+| qwen2.5-0.5b-instruct-q8_0 | decode 128              | 15.1       | 10.7          | 1.41x |
+| qwen2.5-0.5b-instruct-q8_0 | prefill 2048 (2123 tok) | 84.9       | 158.0         | 0.54x |
+
+llama.cpp's load-time repack is most of its prefill lead here (its
+pp512 with `--repack 0` against `1`: Q8_0 1.40x, Q4_K_M 1.68x, Q4_0
+2.99x, Qwen2.5 Q8_0 2.16x; #1243).
+
 | workload                         | command               | number                                                                  | source     |
 |----------------------------------|-----------------------|-------------------------------------------------------------------------|------------|
 | text, Llama 3.2 1B Q4_K_M        | default               | prefill 34 to 38, decode 10.7 to 11.0 (llama.cpp: 66, 8.1)              | #412       |
@@ -211,12 +294,10 @@ Recommended: no flags; leave `--kv-type` at f32 and `--engines` at 1.
   or 506 tokens, decode 127 tokens after "1, 2, 3, 4, 5,". bitcoind and
   other processes left about 1.8 GB free, and the prefill runs vary up
   to 20% (Qwen2.5 71 to 89).
-- At the medians, prefill trails llama.cpp at 0.35x to 0.66x by
-  default (#1076); on Q8_0, `LOCUS_CPU_FAST=1` brought it to 0.56x
-  (#1076, an older run). Decode leads it by 15% to 39% at the medians
-  (15% to 45% over the runs); the decode columns differ in setup:
-  locus decodes after its prompt, llama-bench's tg128 from an empty
-  context.
+- The text rows above are older (main 2f96456b); the "Against
+  llama.cpp" table is the current comparison. The decode columns
+  differ in setup there too: locus decodes after its prompt,
+  llama-bench's tg128 from an empty context.
 - On V3D, the 1B Q8_0 prefill is killed out of memory (4 GB shared with
   the CPU), and Orpheus 3B fails to allocate its heap, as speech on
   V3D does.
