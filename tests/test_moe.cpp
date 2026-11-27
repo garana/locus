@@ -1327,16 +1327,23 @@ TEST_CASE("a small weight over a token chunk splits across threads, "
         op.matvec(m, {xb.data() + t * cols, cols},
                   {ref.data() + t * rows, rows});
     }
+    // The suite's own LOCUS_THREADS, put back at the end.
+    const char* had = std::getenv("LOCUS_THREADS");
+    const std::string saved = had != nullptr ? had : "";
     for (const char* nt : {"1", "2", "4"}) {
         setenv("LOCUS_THREADS", nt, 1);
         std::vector<float> got(static_cast<std::size_t>(n) * rows);
         locus::model::matvec_batch(op, m, xb, got, n);
-        REQUIRE(got == ref);
         std::vector<float> deq(static_cast<std::size_t>(n) * rows);
         locus::model::matvec_batch_deq(op, m, xb, deq, n);
+        if (had != nullptr) {
+            setenv("LOCUS_THREADS", saved.c_str(), 1);
+        } else {
+            unsetenv("LOCUS_THREADS");
+        }
+        REQUIRE(got == ref);
         REQUIRE(deq == ref);
     }
-    unsetenv("LOCUS_THREADS");
 }
 
 TEST_CASE("qwen2moe gated shared expert scales only the shared "
