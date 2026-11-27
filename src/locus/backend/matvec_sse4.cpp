@@ -1029,12 +1029,6 @@ __m128i block32_lanes_sse4(const std::int8_t* q, const std::int8_t* x) {
                          lanes16_sse4(_mm_abs_epi8(q1), q1, x1));
 }
 
-/** @returns The sum of v's four int32 lanes (exact). */
-inline int hsum_epi32_sse4(__m128i v) {
-    const __m128i h = _mm_hadd_epi32(v, v);
-    return _mm_cvtsi128_si32(_mm_hadd_epi32(h, h));
-}
-
 /**
  * One row of 32-weight blocks (an f16 scale first, kBlk bytes each)
  * dotted with a Q8_0-quantized activation, in the float order of scalar
