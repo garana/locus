@@ -532,13 +532,37 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
         const char* prompt;
         std::size_t prompt_tokens;
         const char* continuation;  // llama.cpp, 24 tokens
+        // A near-tie llama.cpp's token wins (DESIGN 16): at decode step
+        // tie_step the test checks |logit[tie_token] - logit[tie_other]|
+        // is under tie_bound, then feeds tie_token instead of the
+        // argmax. -1: no tie.
+        int tie_step = -1;
+        locus::tok::TokenId tie_token = 0, tie_other = 0;
+        float tie_bound = 0.0f;
     };
     const Golden goldens[] = {
+        // Step 2, after "\n    ": " if" (421) against ' """\n' (3190),
+        // 0.09 to 0.13 apart on neon and metal, and the CPU softmax's
+        // exp (#1251) flips it on neon (-0.09; logits move about 0.1,
+        // as much as neon against metal on one commit).
         {"def fibonacci(n):", 4,
          "\n    if n <= 1:\n        return n\n    else:\n        "
-         "return fibonacci(n-1) + fibonacci"},
+         "return fibonacci(n-1) + fibonacci",
+         2, 421, 3190, 0.25f},
         {"x.append(item)\n\tif (n<2) return n;", 13,
          "\n\tfor (int i=2; i<n; i++) {\n\t\tif (x[i-1] > x"},
+    };
+    // The next token at decode step i: the argmax, or at gd's near-tie
+    // llama.cpp's token once its margin is checked.
+    const auto pick = [](const Golden& gd, int i,
+                         const std::vector<float>& logits) {
+        if (i != gd.tie_step) {
+            return locus::model::argmax(logits);
+        }
+        const float gap = logits[gd.tie_token] - logits[gd.tie_other];
+        CAPTURE(gap);
+        CHECK(std::abs(gap) < gd.tie_bound);
+        return gd.tie_token;
     };
     for (const char* be : backends) {
         model.use_backend(*locus::backend::find_backend(be));
@@ -560,7 +584,7 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
             }
             std::vector<locus::tok::TokenId> gen;
             for (int i = 0; i < 24; ++i) {
-                const auto next = locus::model::argmax(logits);
+                const auto next = pick(gd, i, logits);
                 gen.push_back(next);
                 REQUIRE(cache.ensure_capacity(seq, 1));
                 model.forward(next, cache, seq, ws, logits);
@@ -591,7 +615,7 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
             }
             std::vector<locus::tok::TokenId> gen;
             for (int i = 0; i < 24; ++i) {
-                const auto next = locus::model::argmax(logits);
+                const auto next = pick(gd, i, logits);
                 gen.push_back(next);
                 REQUIRE(cache.ensure_capacity(seq, 1));
                 model.forward(next, cache, seq, ws, logits);
