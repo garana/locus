@@ -1,5 +1,6 @@
 #include "locus/backend/registry.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -151,10 +152,14 @@ const std::vector<Backend>& list() {
         // Metal (#10): plain llama models run their whole token on the
         // GPU (TransformerModel::metal_forward, i#866) over a KV pool
         // in a shared Metal buffer; everything else runs this build's
-        // best CPU kernels (the first entry). Listed after the GPU
-        // backends, so it is never the default.
+        // best CPU kernels (the first available CPU entry, not merely
+        // the first listed, i#1226). Listed after the GPU backends, so
+        // it is never the default.
         const bool mt = metal::Context::usable();
-        Ops mo = b.front().ops;
+        const auto cpu_best = std::find_if(
+            b.begin(), b.end(),
+            [](const Backend& e) { return e.available && e.ops.cpu; });
+        Ops mo = cpu_best->ops;  // scalar is always available
         mo.alloc_kv = &metal::alloc_kv;
         mo.free_kv = &metal::free_kv;
         b.push_back({"metal",
