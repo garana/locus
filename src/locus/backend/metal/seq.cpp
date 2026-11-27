@@ -5,6 +5,7 @@
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "locus/backend/metal/context.hpp"
@@ -177,6 +178,13 @@ void Seq::read(Slot i, std::size_t off, std::span<float> out) {
 
 void Seq::flush() {
     im_->end();
+    // Between batches nothing in flight needs the lock (the next op
+    // looks its weights up again), so a Metal call waiting on another
+    // thread (text decode beside an image step, i#1057) runs here
+    // instead of after the whole step.
+    im_->lk.unlock();
+    std::this_thread::yield();
+    im_->lk.lock();
     im_->ctx.begin_batch();
 }
 

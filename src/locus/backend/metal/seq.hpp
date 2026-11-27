@@ -21,8 +21,12 @@ namespace locus::backend::metal {
  * record into an open batch; flush() submits it and waits. write() and
  * read() flush first, so they see every op recorded before them.
  *
- * Holds the Metal device lock for its lifetime: create one per step,
- * on one thread, and keep other Metal calls out of its scope.
+ * Holds the Metal device lock for its lifetime except inside flush()
+ * (and write(), read() and a growing reserve(), which flush): between
+ * two batches it lets a Metal call waiting on another thread run, so
+ * text decode is not held off for a whole image step (i#1057). Create
+ * one per step, on one thread, and keep other Metal calls on that
+ * thread out of its scope.
  */
 class Seq {
   public:
