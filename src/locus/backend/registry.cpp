@@ -167,6 +167,9 @@ const std::vector<Backend>& list() {
             b.begin(), b.end(),
             [](const Backend& e) { return e.available && e.ops.cpu; });
         Ops mo = cpu_best->ops;  // scalar is always available
+        // No load-time Q8_0 copy on Metal (i#1243): its forward reads
+        // the mapped weights, so a copy would double their RAM.
+        mo.packs_q8_0 = false;
         mo.alloc_kv = &metal::alloc_kv;
         mo.free_kv = &metal::free_kv;
         b.push_back({"metal",

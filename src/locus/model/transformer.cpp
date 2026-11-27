@@ -241,7 +241,9 @@ std::size_t mt_slices(std::uint32_t rows) {
  * @returns The first row of slice i of n over rows: rows * i / n
  *     rounded down to a multiple of 4, so each slice starts on a quad
  *     of a load-time Q8_0 copy (i#1243); rows for i == n. Each row's
- *     dot does not depend on its slice, so the cut moves no bits.
+ *     dot does not depend on its slice, so the cut moves no bits. Under
+ *     4 rows a slice, neighbours may round to the same row: that slice
+ *     is empty, a no-op for the kernels.
  */
 std::uint32_t slice_row(std::uint32_t rows, std::uint64_t i,
                         std::uint64_t n) {
@@ -338,8 +340,13 @@ std::uint64_t TransformerModel::packed_bytes() const {
 }
 
 void TransformerModel::prepare_cpu_layout() {
-    if (packed_ != nullptr || backend_ == nullptr ||
-        !backend_->ops.packs_q8_0) {
+    // A backend that does not read the copy (a GPU one, sse4) frees it,
+    // so a GPU run does not hold a second copy of the Q8_0 weights.
+    if (backend_ == nullptr || !backend_->ops.packs_q8_0) {
+        packed_.reset();
+        return;
+    }
+    if (packed_ != nullptr) {
         return;
     }
     if (const char* e = std::getenv("LOCUS_CPU_REPACK");
@@ -799,7 +806,8 @@ TransformerModel TransformerModel::load(const GgufFile& g,
                      locked >> 20, failed >> 20);
     }
     m.stage_metrics_ = std::make_shared<StageMetrics>(m.hp_.n_layers);
-    m.prepare_cpu_layout();
+    // No copy here: use_backend makes it once the backend is chosen
+    // (use_backend_for may move the model to a GPU first).
     return m;
 }
 

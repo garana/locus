@@ -1184,7 +1184,8 @@ class TransformerModel {
     struct PackedSet;
     std::shared_ptr<const PackedSet> packed_;
     /** Makes packed_ when backend_ reads it (Ops::packs_q8_0) and the
-     * model is not streamed; idempotent. */
+     * model is not streamed, frees it when backend_ does not; called by
+     * use_backend, idempotent. */
     void prepare_cpu_layout();
     /** Loaded layer range [layer_begin_, layer_end_) under slice-only
      * loading; [0, n_layers) for a normal full load. layers_ is still
