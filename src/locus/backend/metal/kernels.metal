@@ -519,27 +519,12 @@ inline float dot8(float4 a, float4 b, uint2 q, uint sh) {
     return dot(nib4(q.x, sh), a) + dot(nib4(q.y, sh), b);
 }
 
-kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
-                    device const float* xb [[buffer(1)]],
-                    device float* out [[buffer(2)]],
-                    constant MvParams& p [[buffer(3)]],
-                    device const uint* route [[buffer(7)]],
-                    device const float* cs [[buffer(8)]],
-                    uint tg [[threadgroup_position_in_grid]],
-                    uint sg [[simdgroup_index_in_threadgroup]],
-                    uint lane [[thread_index_in_simdgroup]]) {
-    const uint gps = (p.rows + kQ4Rows - 1) / kQ4Rows;  // groups a slot
-    const uint slot = tg / gps;
-    const uint r0 = tg % gps * kQ4Rows + sg * 2;
-    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
-    device const float* xs =
-        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
-    const uint nb = p.cols / 256;
-    const ulong row_bytes = ulong(nb) * 144;
+// The Q4_K row pair's sums in ggml's layout (the one described above).
+inline void q4k_units_dot(device const uchar* w0, ulong row_bytes,
+                          device const float* xs, uint nb, uint rows_left,
+                          uint lane, thread float& acc0, thread float& acc1) {
     const uint ix = lane / 8, jq = (lane % 8) / 4, ir = lane % 4;
-    device const uchar* w0 = w + wo + ulong(r0) * row_bytes;
     device const float* x = xs + 64 * jq + 8 * ir;
-    float acc0 = 0.0f, acc1 = 0.0f;
     for (uint b = ix; b < nb; b += 4) {
         device const float4* y = (device const float4*)(x + b * 256);
         // Elements of sub-blocks 2 jq, 2 jq + 1, 2 jq + 4, 2 jq + 5.
@@ -547,10 +532,7 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
         const float4 c0 = y[32], c1 = y[33], e0 = y[40], e1 = y[41];
         const float s0 = hsum(a0 + a1), s1 = hsum(b0 + b1);
         const float s2 = hsum(c0 + c1), s3 = hsum(e0 + e1);
-        for (uint i = 0; i < 2; ++i) {
-            if (r0 + i >= p.rows) {
-                break;
-            }
+        for (uint i = 0; i < 2 && i < rows_left; ++i) {
             device const uchar* blk = w0 + i * row_bytes + b * 144;
             const half2 dm = *(device const half2*)blk;
             float sc0, mn0, sc1, mn1, sc2, mn2, sc3, mn3;
@@ -574,6 +556,74 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
             }
         }
     }
+}
+
+// The Q4_K row pair's sums in the half-block layout (i#1061, Q6_K's
+// Halves of i#1058): 16 lanes a block, lane l in half h = l % 16 / 8
+// (sub-blocks 4 h .. 4 h + 3, nibble bytes 64 h .. 64 h + 63) takes 4
+// bytes at 4 (l % 8) of each of the half's two 32-byte runs, so
+// neighbouring lanes read neighbouring words; two blocks a step for
+// the simdgroup's 32 lanes.
+inline void q4k_halves_dot(device const uchar* w0, ulong row_bytes,
+                           device const float* xs, uint nb, uint rows_left,
+                           uint lane, thread float& acc0,
+                           thread float& acc1) {
+    const uint h = (lane % 16) / 8, k = lane % 8;
+    for (uint b = lane / 16; b < nb; b += 2) {
+        device const float* x = xs + b * 256 + 128 * h + 4 * k;
+        const float4 a = *(device const float4*)x;
+        const float4 c = *(device const float4*)(x + 32);
+        const float4 e = *(device const float4*)(x + 64);
+        const float4 f = *(device const float4*)(x + 96);
+        const float s0 = hsum(a), s1 = hsum(c), s2 = hsum(e), s3 = hsum(f);
+        for (uint i = 0; i < 2 && i < rows_left; ++i) {
+            device const uchar* blk = w0 + i * row_bytes + b * 144;
+            const half2 dm = *(device const half2*)blk;
+            float sc0, mn0, sc1, mn1, sc2, mn2, sc3, mn3;
+            q4k_scale_min(4 * h, blk + 4, sc0, mn0);
+            q4k_scale_min(4 * h + 1, blk + 4, sc1, mn1);
+            q4k_scale_min(4 * h + 2, blk + 4, sc2, mn2);
+            q4k_scale_min(4 * h + 3, blk + 4, sc3, mn3);
+            device const uchar* q = blk + 16 + 64 * h + 4 * k;
+            const uint u0 = *(device const uint*)q;
+            const uint u1 = *(device const uint*)(q + 32);
+            const float v =
+                float(dm.x) * (sc0 * dot(nib4(u0, 0), a) +
+                               sc1 * dot(nib4(u0, 4), c) +
+                               sc2 * dot(nib4(u1, 0), e) +
+                               sc3 * dot(nib4(u1, 4), f)) -
+                float(dm.y) * (mn0 * s0 + mn1 * s1 + mn2 * s2 + mn3 * s3);
+            if (i == 0) {
+                acc0 += v;
+            } else {
+                acc1 += v;
+            }
+        }
+    }
+}
+
+template <bool Halves>
+inline void mv_q4_k_impl(device const uchar* w, device const float* xb,
+                         device float* out, constant MvParams& p,
+                         device const uint* route, device const float* cs,
+                         uint tg, uint sg, uint lane) {
+    const uint gps = (p.rows + kQ4Rows - 1) / kQ4Rows;  // groups a slot
+    const uint slot = tg / gps;
+    const uint r0 = tg % gps * kQ4Rows + sg * 2;
+    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
+    device const float* xs =
+        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
+    const uint nb = p.cols / 256;
+    const ulong row_bytes = ulong(nb) * 144;
+    device const uchar* w0 = w + wo + ulong(r0) * row_bytes;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    if (Halves) {
+        q4k_halves_dot(w0, row_bytes, xs, nb,
+                       r0 < p.rows ? p.rows - r0 : 0, lane, acc0, acc1);
+    } else {
+        q4k_units_dot(w0, row_bytes, xs, nb,
+                      r0 < p.rows ? p.rows - r0 : 0, lane, acc0, acc1);
+    }
     const float t0 = simd_sum(acc0), t1 = simd_sum(acc1);
     if (lane == 0 && p.rope_hd != 0 && r0 + 1 < p.rows) {
         // The pair (r0, r0 + 1), r0 even: rope_norm's rotation, on the
@@ -594,6 +644,30 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
             *o = p.accumulate != 0 ? *o + v : v;
         }
     }
+}
+
+kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
+                    device const float* cs [[buffer(8)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint sg [[simdgroup_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]]) {
+    mv_q4_k_impl<false>(w, xb, out, p, route, cs, tg, sg, lane);
+}
+
+kernel void mv_q4_k_halves(device const uchar* w [[buffer(0)]],
+                           device const float* xb [[buffer(1)]],
+                           device float* out [[buffer(2)]],
+                           constant MvParams& p [[buffer(3)]],
+                           device const uint* route [[buffer(7)]],
+                           device const float* cs [[buffer(8)]],
+                           uint tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    mv_q4_k_impl<true>(w, xb, out, p, route, cs, tg, sg, lane);
 }
 
 // K-quants over several activation columns (i#1184): 8 lanes a row,

@@ -1310,6 +1310,58 @@ TEST_CASE("metal Q6_K matvec layouts match the CPU", "[metal]") {
     }
 }
 
+// i#1061: both Q4_K matvec layouts (the half-block one below Apple
+// family 9, ggml's unit one on 9 and up) match the CPU, odd row counts
+// (a lone last row of a pair) and several blocks a row included.
+TEST_CASE("metal Q4_K matvec layouts match the CPU", "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    // Puts the caller's LOCUS_METAL_Q4K back, even past a failure.
+    struct EnvGuard {
+        std::string old;
+        bool had = false;
+        EnvGuard() {
+            if (const char* e = std::getenv("LOCUS_METAL_Q4K")) {
+                old = e;
+                had = true;
+            }
+        }
+        ~EnvGuard() {
+            if (had) {
+                ::setenv("LOCUS_METAL_Q4K", old.c_str(), 1);
+            } else {
+                ::unsetenv("LOCUS_METAL_Q4K");
+            }
+        }
+    } guard;
+    std::mt19937 rng(1061);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const char* layout : {"halves", "units"}) {
+        ::setenv("LOCUS_METAL_Q4K", layout, 1);
+        for (const auto& [rows, cols] :
+             {std::pair{37u, 256u}, std::pair{201u, 3072u},
+              std::pair{8u, 768u}}) {
+            CAPTURE(layout, rows, cols);
+            const auto wv = random_weights(TensorType::kQ4_K, rows, cols,
+                                           rows + cols);
+            const locus::backend::Mat w{TensorType::kQ4_K, wv.data(), rows,
+                                        cols};
+            std::vector<float> x(cols), want(rows), got(rows);
+            for (auto& v : x) {
+                v = dist(rng);
+            }
+            locus::backend::matvec(w, x, want);
+            mb::matvec(w, x, got);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                REQUIRE(got[r] ==
+                        Catch::Approx(want[r]).margin(1e-3).epsilon(1e-4));
+            }
+        }
+    }
+}
+
 // i#1064: RoPE in the Q4_K q / k matvecs' store gives rope_norm's
 // results to the bit: the decode logits match with the epilogue off.
 TEST_CASE("metal decode RoPE epilogue matches rope_norm to the bit",

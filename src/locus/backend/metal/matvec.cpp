@@ -80,6 +80,24 @@ const char* q6k_kernel(const Context& ctx) {
     return ctx.apple_family() >= 9 ? "mv_q6_k" : "mv_q6_k_halves";
 }
 
+/**
+ * @returns The Q4_K matvec kernel for ctx's GPU (i#1061): the
+ * half-block layout below Apple family 9, as for Q6_K, else ggml's
+ * unit layout. LOCUS_METAL_Q4K=halves or units picks one (tests).
+ */
+const char* q4k_kernel(const Context& ctx) {
+    if (const char* e = std::getenv("LOCUS_METAL_Q4K")) {
+        const std::string_view v(e);
+        if (v == "halves") {
+            return "mv_q4_k_halves";
+        }
+        if (v == "units") {
+            return "mv_q4_k";
+        }
+    }
+    return ctx.apple_family() >= 9 ? "mv_q4_k" : "mv_q4_k_halves";
+}
+
 /** MvParams in kernels.metal. */
 struct MvParams {
     std::uint64_t w_off, out_off, expert_bytes;
@@ -260,11 +278,14 @@ void record_mv(Context& ctx, gguf::TensorType t, std::uint32_t rows,
         {fuse.rope_cs != nullptr ? fuse.rope_cs : &x, 0, 8},
         {fuse.norm_w != nullptr ? fuse.norm_w : &x, 0, 9}};
     const std::uint32_t groups = (rows + k.rows - 1) / k.rows;
-    // The Q6_K layout by GPU family (i#1058). The prenorm form is its
-    // own kernel, so the plain one keeps its code (Q6_K has none).
+    // The Q6_K and Q4_K layouts by GPU family (i#1058, i#1061). The
+    // prenorm form is its own kernel, so the plain one keeps its code
+    // (neither K-quant has one).
+    const char* base = t == TensorType::kQ6_K   ? q6k_kernel(ctx)
+                       : t == TensorType::kQ4_K ? q4k_kernel(ctx)
+                                                : k.kernel;
     const std::string name =
-        std::string(t == TensorType::kQ6_K ? q6k_kernel(ctx) : k.kernel) +
-        (fuse.norm_w != nullptr ? "_pn" : "");
+        std::string(base) + (fuse.norm_w != nullptr ? "_pn" : "");
     ctx.dispatch(name.c_str(), args, std::as_bytes(std::span(&p, 1)),
                  groups * n_slots * k.group, k.group);
 }
