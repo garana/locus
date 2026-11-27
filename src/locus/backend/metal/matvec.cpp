@@ -61,13 +61,6 @@ Kind kind_of(TensorType t) {
 }
 
 /**
- * @returns The Q6_K matvec kernel for ctx's GPU (i#1058): ggml's
- * half-block layout below Apple family 9 (the M2, family 8, reads Q6_K
- * at about twice the bandwidth with it; family 7, the M1, takes it too,
- * unmeasured), the unit layout on 9 and up (a few percent faster on the
- * M4). LOCUS_METAL_Q6K=halves or units picks one (tests).
- */
-/**
  * @returns The prefill matmul tile's weight rows for ctx's GPU (i#1074,
  * the per-family table of #1240): 128 below Apple family 9 (the M2,
  * family 8: Llama 1B's prefill matmuls about 5% faster than with 64;
@@ -88,6 +81,13 @@ std::uint32_t mm_tile_rows(const Context& ctx) {
     return ctx.apple_family() >= 9 ? 64 : 128;
 }
 
+/**
+ * @returns The Q6_K matvec kernel for ctx's GPU (i#1058): ggml's
+ * half-block layout below Apple family 9 (the M2, family 8, reads Q6_K
+ * at about twice the bandwidth with it; family 7, the M1, takes it too,
+ * unmeasured), the unit layout on 9 and up (a few percent faster on the
+ * M4). LOCUS_METAL_Q6K=halves or units picks one (tests).
+ */
 const char* q6k_kernel(const Context& ctx) {
     if (const char* e = std::getenv("LOCUS_METAL_Q6K")) {
         const std::string_view v(e);
