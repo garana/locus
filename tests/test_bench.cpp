@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -843,8 +844,18 @@ TEST_CASE("bench: cpu prefill attention per layer", "[.][bench]") {
     }
     // The softmax's share: one row per (query head, position) as the
     // prefill runs it, timed on 1/64 of the 8,702-position rows on one
-    // thread and scaled to the layer and the pool; then the same for
-    // the LOCUS_CPU_FAST softmax (i#705).
+    // thread and scaled to the layer and the pool; the std::exp loop
+    // first, then softmax_inplace, the polynomial one (i#705, i#1244).
+    const auto exp_softmax = [](std::span<float> x) {
+        float mx = x[0];
+        for (float v : x) mx = std::max(mx, v);
+        float sum = 0.0f;
+        for (float& v : x) {
+            v = std::exp(v - mx);
+            sum += v;
+        }
+        for (float& v : x) v /= sum;
+    };
     for (const bool fast : {false, true}) {
         constexpr std::uint32_t n_pos = 8702, sample = 64;
         std::vector<float> row(n_pos);
@@ -856,9 +867,9 @@ TEST_CASE("bench: cpu prefill attention per layer", "[.][bench]") {
             const auto t0 = std::chrono::steady_clock::now();
             for (std::uint32_t h = 0; h < heads; ++h) {
                 if (fast) {
-                    locus::backend::softmax_fast_inplace({row.data(), p + 1});
-                } else {
                     locus::backend::softmax_inplace({row.data(), p + 1});
+                } else {
+                    exp_softmax({row.data(), p + 1});
                 }
             }
             total += std::chrono::duration<double>(
