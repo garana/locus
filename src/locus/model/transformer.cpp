@@ -2444,8 +2444,15 @@ void matvec_batch_group(const backend::Ops& op,
         }
         return;
     }
-    // (job, first row, row count) per slice, at least one per job, as
-    // matvec_mt_group cuts them.
+    // (job, first row, row count) per slice. Slices of about equal rows,
+    // kGrain a thread: the pool claims them in order, so t slices of
+    // unequal size leave threads idle (Llama 1B's q / k / v of 2048,
+    // 512 and 512 rows cut by share were 683 x 3, 512, 512: one thread
+    // did 1024 rows where 768 is even). Largest slices first, so the
+    // small ones fill the gaps at the end.
+    constexpr std::uint64_t kGrain = 3;
+    const std::uint64_t per = std::max<std::uint64_t>(
+        1, (total + kGrain * t - 1) / (kGrain * t));
     struct Slice {
         std::size_t job;
         std::uint32_t r0, rows;
@@ -2454,7 +2461,7 @@ void matvec_batch_group(const backend::Ops& op,
     for (std::size_t k = 0; k < jobs.size(); ++k) {
         const std::uint64_t rows = jobs[k].w.rows;
         const std::uint64_t s =
-            std::max<std::uint64_t>(1, (rows * t + total / 2) / total);
+            std::max<std::uint64_t>(1, (rows + per / 2) / per);
         for (std::uint64_t i = 0; i < s; ++i) {
             const auto r0 = static_cast<std::uint32_t>(rows * i / s);
             const auto r1 = static_cast<std::uint32_t>(rows * (i + 1) / s);
@@ -2463,6 +2470,9 @@ void matvec_batch_group(const backend::Ops& op,
             }
         }
     }
+    std::stable_sort(sl.begin(), sl.end(), [](const Slice& a, const Slice& b) {
+        return a.rows > b.rows;
+    });
     sys::ThreadPool::instance().parallel_for(sl.size(), [&](std::size_t i) {
         const MatvecJob& j = jobs[sl[i].job];
         q8k_batch_rows(op, j.w, j.x, j.out, n, sl[i].r0,

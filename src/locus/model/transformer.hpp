@@ -1288,8 +1288,9 @@ void matvec_batch(const backend::Ops& op, const backend::Mat& w,
 /**
  * Several independent batched matvecs over the same n tokens (q / k /
  * v, gate / up) in one thread pool dispatch, as matvec_mt_group does
- * for one token: their rows are sliced together, each job getting
- * slices in proportion to its rows. Only the row-sliced Q8 batch path
+ * for one token: their rows are cut together into slices of about
+ * equal rows, about 3 a thread, largest first, so the pool's dynamic
+ * claims keep every thread busy. Only the row-sliced Q8 batch path
  * groups; any other path runs matvec_batch job by job. Each row runs
  * the same kernel over the same tokens, so the bits equal issuing the
  * jobs one by one.
