@@ -1560,7 +1560,9 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
     // llama.cpp's kernel_mul_mm): the loop has no bounds branches, and
     // those rows' and tokens' sums are never stored.
     const uint arc = min(m0 + ar, p.rows - 1);
-    const uint btc = min(n0 + bt, n0 + n_tok - 1) - n0;
+    // n_tok is all the tokens (n0 the tile's first) or, routed, the
+    // tile's own count (n0 = 0): either way n_tok - 1 is the last one.
+    const uint btc = min(n0 + bt, n_tok - 1) - n0;
     device const uchar* wrow = w + ulong(arc) * L::row_bytes(p.cols);
     const uint xr = G ? perm[btc] / p.slot_div : n0 + btc;
     device const float* xrow = x + ulong(xr) * p.x_stride;
