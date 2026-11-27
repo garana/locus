@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/repack.hpp"
 
 #if defined(__clang__)
 #pragma clang attribute push( \
@@ -104,25 +105,27 @@ inline void row_quants(const std::byte* const rows[4], int k, std::size_t b,
 }
 
 /**
- * Rows r0 .. r0 + 3 of w packed for quad_tokens: block b's 8 vectors
- * at qw + b * 128 (vector k holding bytes 4k .. 4k + 3 of each row) and
- * its 4 scales at qs + b * 4.
+ * Rows r0 .. r0 + 3 of w packed for quad_tokens, in the load-time
+ * layout (repack.hpp, i#1243): block b at out + b * 136, its 4 f16
+ * scales, then 8 vectors (vector k holding bytes 4k .. 4k + 3 of each
+ * row). The run-time pack for a matrix with no load-time copy.
  */
 void pack_quad(const Mat& w, std::uint32_t r0, std::size_t nb,
-               std::int8_t* qw, float* qs) {
+               std::byte* out) {
     const std::byte* rows[4];
     quad_rows(w, r0, nb, rows);
     for (std::size_t b = 0; b < nb; ++b) {
+        std::byte* o = out + b * kPackedQ8_0Block;
         int8x16_t lo[4], hi[4], wv[8];
         for (int k = 0; k < 4; ++k) {
             row_quants(rows, k, b, lo[k], hi[k]);
+            std::memcpy(o + 2 * k, rows[k] + b * kBlk, 2);
         }
         transpose4(lo[0], lo[1], lo[2], lo[3], wv);
         transpose4(hi[0], hi[1], hi[2], hi[3], wv + 4);
         for (int k = 0; k < 8; ++k) {
-            vst1q_s8(qw + b * 128 + k * 16, wv[k]);
+            vst1q_s8(reinterpret_cast<std::int8_t*>(o + 8 + k * 16), wv[k]);
         }
-        vst1q_f32(qs + b * 4, scales4(rows, b));
     }
 }
 
@@ -179,23 +182,29 @@ float32x4_t quad_direct(const Mat& w, std::uint32_t r0, std::size_t nb,
 }
 
 /**
- * A packed quad against T tokens (token t's scales at d + t * nb, its
- * quants at q + t * cols): lane r of sum[t] is row r's dot with token
- * t. Each (row, token) takes the same steps whatever T is.
+ * A packed quad (nb blocks of 136 bytes at pq) against T tokens (token
+ * t's scales at d + t * nb, its quants at q + t * cols): lane r of
+ * sum[t] is row r's dot with token t. Each (row, token) takes the same
+ * steps whatever T is, and whether the quad was packed at load or here.
  */
 template <int T>
-void quad_tokens(const std::int8_t* qw, const float* qs, std::size_t nb,
-                 std::size_t cols, const float* d, const std::int8_t* q,
-                 float32x4_t sum[T]) {
+void quad_tokens(const std::byte* pq, std::size_t nb, std::size_t cols,
+                 const float* d, const std::int8_t* q, float32x4_t sum[T]) {
     for (int t = 0; t < T; ++t) {
         sum[t] = vdupq_n_f32(0.0f);
     }
     for (std::size_t b = 0; b < nb; ++b) {
+        const std::byte* o = pq + b * kPackedQ8_0Block;
         int8x16_t wv[8];
         for (int k = 0; k < 8; ++k) {
-            wv[k] = vld1q_s8(qw + b * 128 + k * 16);
+            wv[k] = vld1q_s8(
+                reinterpret_cast<const std::int8_t*>(o + 8 + k * 16));
         }
-        const float32x4_t ws = vld1q_f32(qs + b * 4);
+        std::uint16_t h[4];
+        std::memcpy(h, o, sizeof(h));
+        // f16 to f32 is exact: the same scales as scales4.
+        const float32x4_t ws =
+            vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(h)));
         for (int t = 0; t < T; ++t) {
             const std::int8_t* x = q + t * cols + b * 32;
             sum[t] = quad_step(sum[t], wv, ws, vld1q_s8(x), vld1q_s8(x + 16),
@@ -216,17 +225,27 @@ std::uint32_t token_tile(std::size_t cols) {
 
 /**
  * out[r * ostride + t] for every row of w and n tokens (scales d at
- * t * nb, quants q at t * cols): per token tile, each quad of rows is
- * packed once and dotted against the tile's tokens, 4 at a time and
- * then one by one.
+ * t * nb, quants q at t * cols). With a load-time copy (pk, i#1243)
+ * each quad is read as packed; else, per token tile, each quad of rows
+ * is packed once here (one token: dotted as stored, quad_direct). Each
+ * quad is dotted against the tile's tokens 4 at a time, then one by
+ * one; every path takes the same steps per (row, token).
  */
-void q8_0_rows(const Mat& w, const float* d, const std::int8_t* q,
-               std::uint32_t n, float* out, std::size_t ostride) {
+void q8_0_rows(const Mat& w, const std::byte* pk, const float* d,
+               const std::int8_t* q, std::uint32_t n, float* out,
+               std::size_t ostride) {
     const std::size_t nb = w.cols / 32;
-    thread_local std::vector<std::int8_t> qw;
-    thread_local std::vector<float> qs;
-    qw.resize(nb * 128);
-    qs.resize(nb * 4);
+    thread_local std::vector<std::byte> qp;
+    if (pk == nullptr) {
+        qp.resize(nb * kPackedQ8_0Block);
+    }
+    const auto quad = [&](std::uint32_t r0) -> const std::byte* {
+        if (pk != nullptr) {
+            return pk + std::size_t{r0 / 4} * nb * kPackedQ8_0Block;
+        }
+        pack_quad(w, r0, nb, qp.data());
+        return qp.data();
+    };
     const auto store = [&](std::uint32_t r0, std::uint32_t t,
                            float32x4_t v4) {
         float v[4];
@@ -235,22 +254,26 @@ void q8_0_rows(const Mat& w, const float* d, const std::int8_t* q,
             out[std::size_t{r0 + k} * ostride + t] = v[k];
         }
     };
-    if (n == 1) {
+    // One token reads the copy too when there is one: reading the rows
+    // as stored while prefill reads the copy keeps both hot, and on the
+    // Pi 5 (4 GB) decode then ran 22% slower against 2% (i#1243).
+    if (n == 1 && pk == nullptr) {
         for (std::uint32_t r0 = 0; r0 < w.rows; r0 += 4) {
             store(r0, 0, quad_direct(w, r0, nb, d, q));
         }
         return;
     }
+    // The tile keeps its tokens' activations in cache across the rows,
+    // with or without a load-time copy.
     const std::uint32_t tile = token_tile(w.cols);
     for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
         const std::uint32_t t1 = std::min(n, t0 + tile);
         for (std::uint32_t r0 = 0; r0 < w.rows; r0 += 4) {
-            pack_quad(w, r0, nb, qw.data(), qs.data());
+            const std::byte* pq = quad(r0);
             std::uint32_t t = t0;
             for (; t + 4 <= t1; t += 4) {
                 float32x4_t sum[4];
-                quad_tokens<4>(qw.data(), qs.data(), nb, w.cols,
-                               d + std::size_t{t} * nb,
+                quad_tokens<4>(pq, nb, w.cols, d + std::size_t{t} * nb,
                                q + std::size_t{t} * w.cols, sum);
                 for (int k = 0; k < 4; ++k) {
                     store(r0, t + k, sum[k]);
@@ -258,8 +281,7 @@ void q8_0_rows(const Mat& w, const float* d, const std::int8_t* q,
             }
             for (; t < t1; ++t) {
                 float32x4_t sum[1];
-                quad_tokens<1>(qw.data(), qs.data(), nb, w.cols,
-                               d + std::size_t{t} * nb,
+                quad_tokens<1>(pq, nb, w.cols, d + std::size_t{t} * nb,
                                q + std::size_t{t} * w.cols, sum);
                 store(r0, t, sum[0]);
             }
@@ -283,7 +305,10 @@ bool takes(const Mat& w) {
 
 void matvec_neon_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
-    if (!takes(w)) {
+    // Without a load-time copy one token takes the one-row sdot kernel,
+    // the faster there (same bits); with one, the copy (see q8_0_rows).
+    const std::byte* pk = takes(w) ? find_packed_q8_0(w) : nullptr;
+    if (pk == nullptr) {
         base::matvec_neon_q8k(w, x, out);
         return;
     }
@@ -292,7 +317,7 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
     d.resize(w.cols / 32);
     q.resize(w.cols);
     quantize_activation_q8_0_neon(x, d.data(), q.data());
-    q8_0_rows(w, d.data(), q.data(), 1, out.data(), 1);
+    q8_0_rows(w, pk, d.data(), q.data(), 1, out.data(), 1);
 }
 
 void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
@@ -311,7 +336,8 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
             x_batch.subspan(std::size_t{t} * w.cols, w.cols),
             d.data() + t * nb, q.data() + std::size_t{t} * w.cols);
     }
-    q8_0_rows(w, d.data(), q.data(), n, out_batch.data(), n);
+    q8_0_rows(w, find_packed_q8_0(w), d.data(), q.data(), n,
+              out_batch.data(), n);
 }
 
 }  // namespace locus::backend::neon_dotprod_fast

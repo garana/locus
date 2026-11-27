@@ -1458,7 +1458,12 @@ f32 rounding of the scalar order per dot (about 1e-8 of the sum of
 the terms' magnitudes, the same as the scalar order's own error).
 Through a whole model those roundings can tip 8-bit activation
 quants, so logits move by up to a few tenths against the scalar
-path. The block-32 kernels replay the per-token order. On the M4 Max
+path. The block-32 kernels replay the per-token order. On a dotprod
+CPU the Q8_0 one takes four rows interleaved per `sdot` lane, from a
+copy made once at load (`backend/repack.hpp`, llama.cpp's
+`block_q8_0x4`; not for streamed or MoE expert weights), else
+interleaved per token tile; row slices start on multiples of 4 so each
+finds its quads. On the M4 Max
 this takes Orpheus 3B Q4_K_M prefill from 97 to 182 tok/s and decode
 from 80 to 85 tok/s. F32, F16 and BF16 weights always take the f32
 dot; on neon F16 and BF16 widen to f32 in registers, 8 weights a step

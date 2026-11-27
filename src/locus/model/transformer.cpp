@@ -16,6 +16,7 @@
 
 #include "locus/backend/accelerate.hpp"
 #include "locus/backend/metal/matvec.hpp"
+#include "locus/backend/repack.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/arch.hpp"
@@ -236,6 +237,20 @@ std::size_t mt_slices(std::uint32_t rows) {
     return std::min<std::size_t>(mt_fanout(), rows / kMinRowsPerSlice);
 }
 
+/**
+ * @returns The first row of slice i of n over rows: rows * i / n
+ *     rounded down to a multiple of 4, so each slice starts on a quad
+ *     of a load-time Q8_0 copy (i#1243); rows for i == n. Each row's
+ *     dot does not depend on its slice, so the cut moves no bits.
+ */
+std::uint32_t slice_row(std::uint32_t rows, std::uint64_t i,
+                        std::uint64_t n) {
+    if (i >= n) {
+        return rows;
+    }
+    return static_cast<std::uint32_t>(std::uint64_t{rows} * i / n) & ~3u;
+}
+
 }  // namespace
 
 /*
@@ -310,6 +325,64 @@ void TransformerModel::use_backend(const backend::Backend& b) {
             "backend not available on this machine: " + std::string(b.name));
     }
     backend_ = &b;
+    prepare_cpu_layout();
+}
+
+struct TransformerModel::PackedSet {
+    std::vector<std::unique_ptr<backend::PackedQ8_0>> mats;
+    std::uint64_t bytes = 0;
+};
+
+std::uint64_t TransformerModel::packed_bytes() const {
+    return packed_ != nullptr ? packed_->bytes : 0;
+}
+
+void TransformerModel::prepare_cpu_layout() {
+    if (packed_ != nullptr || backend_ == nullptr ||
+        !backend_->ops.packs_q8_0) {
+        return;
+    }
+    if (const char* e = std::getenv("LOCUS_CPU_REPACK");
+        e != nullptr && std::string_view(e) == "0") {
+        return;
+    }
+    // The copy is anonymous memory about the size of the Q8_0 weights;
+    // the mapped pages it replaces go cold and the kernel may reclaim
+    // them. A streamed model keeps the rows as stored, and so does one
+    // whose weights and copy would pass 3/4 of RAM.
+    const std::uint64_t ram = sys::total_ram_bytes();
+    if (weights_stream(weight_bytes_, ram)) {
+        return;
+    }
+    std::vector<const Mat*> todo;
+    const auto add = [&](const Mat& w) {
+        if (backend::packs_q8_0(w) &&
+            std::none_of(todo.begin(), todo.end(), [&](const Mat* o) {
+                return o->data == w.data;
+            })) {
+            todo.push_back(&w);
+        }
+    };
+    for (std::uint32_t l = layer_begin_; l < layer_end_; ++l) {
+        for_each_static_mat(layers_[l], add);
+    }
+    add(out_w_);
+    std::uint64_t bytes = 0;
+    for (const Mat* w : todo) {
+        bytes += std::uint64_t{(w->rows + 3u) / 4u} * 4u *
+                 backend::mat_row_bytes(*w);
+    }
+    if (todo.empty() || weight_bytes_ + bytes > ram / 4 * 3) {
+        return;
+    }
+    auto set = std::make_shared<PackedSet>();
+    set->mats.resize(todo.size());
+    sys::ThreadPool::instance().parallel_for(
+        todo.size(), [&](std::size_t i) {
+            set->mats[i] = std::make_unique<backend::PackedQ8_0>(*todo[i]);
+        });
+    set->bytes = bytes;
+    packed_ = std::move(set);
 }
 
 namespace {
@@ -353,10 +426,8 @@ void matvec_rows_mt(const backend::Ops& op,
         return;
     }
     sys::ThreadPool::instance().parallel_for(t, [&](std::size_t i) {
-        const std::uint32_t r0 = static_cast<std::uint32_t>(
-            static_cast<std::uint64_t>(w.rows) * i / t);
-        const std::uint32_t r1 = static_cast<std::uint32_t>(
-            static_cast<std::uint64_t>(w.rows) * (i + 1) / t);
+        const std::uint32_t r0 = slice_row(w.rows, i, t);
+        const std::uint32_t r1 = slice_row(w.rows, i + 1, t);
         mv(backend::mat_rows(w, r0, r1 - r0), x,
            out.subspan(r0, r1 - r0));
     });
@@ -417,8 +488,8 @@ void matvec_mt_group(const backend::Ops& op,
         const std::uint64_t s =
             std::max<std::uint64_t>(1, (rows * t + total / 2) / total);
         for (std::uint64_t i = 0; i < s; ++i) {
-            const auto r0 = static_cast<std::uint32_t>(rows * i / s);
-            const auto r1 = static_cast<std::uint32_t>(rows * (i + 1) / s);
+            const std::uint32_t r0 = slice_row(rows, i, s);
+            const std::uint32_t r1 = slice_row(rows, i + 1, s);
             if (r1 > r0) {
                 slices.push_back({k, r0, r1 - r0});
             }
@@ -728,6 +799,7 @@ TransformerModel TransformerModel::load(const GgufFile& g,
                      locked >> 20, failed >> 20);
     }
     m.stage_metrics_ = std::make_shared<StageMetrics>(m.hp_.n_layers);
+    m.prepare_cpu_layout();
     return m;
 }
 
@@ -2298,12 +2370,7 @@ void for_row_slices(const backend::Ops& op, std::uint32_t rows,
     }
     sys::ThreadPool::instance().parallel_for(
         nslice, [&](std::size_t i) {
-            const std::uint32_t r0 = static_cast<std::uint32_t>(
-                static_cast<std::uint64_t>(rows) * i / nslice);
-            const std::uint32_t r1 = static_cast<std::uint32_t>(
-                static_cast<std::uint64_t>(rows) * (i + 1) /
-                nslice);
-            body(r0, r1);
+            body(slice_row(rows, i, nslice), slice_row(rows, i + 1, nslice));
         });
 }
 

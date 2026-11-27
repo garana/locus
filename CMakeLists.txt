@@ -40,6 +40,7 @@ add_library(locus
     src/locus/backend/metal/matvec.cpp
     src/locus/backend/metal/seq.cpp
     src/locus/backend/registry.cpp
+    src/locus/backend/repack.cpp
     src/locus/backend/vulkan/context.cpp
     src/locus/chat/template.cpp
     src/locus/config/config_file.cpp

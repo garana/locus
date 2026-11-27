@@ -296,6 +296,9 @@ class TransformerModel {
      */
     void use_backend(const backend::Backend& b);
 
+    /** @returns Bytes of the load-time Q8_0 copies (i#1243), 0 if none. */
+    std::uint64_t packed_bytes() const;
+
     /** @returns Whether metal_forward takes this model on its backend
      *  (any cache conditions aside): the batched paths then run it a
      *  token at a time, so they match the per-token forward. */
@@ -1176,6 +1179,13 @@ class TransformerModel {
     std::span<const float> out_norm_;
     backend::Mat out_w_;
     std::vector<Layer> layers_;
+    /** The load-time Q8_0 copies (i#1243), shared by copies of the
+     * model; null when none were made. */
+    struct PackedSet;
+    std::shared_ptr<const PackedSet> packed_;
+    /** Makes packed_ when backend_ reads it (Ops::packs_q8_0) and the
+     * model is not streamed; idempotent. */
+    void prepare_cpu_layout();
     /** Loaded layer range [layer_begin_, layer_end_) under slice-only
      * loading; [0, n_layers) for a normal full load. layers_ is still
      * sized to n_layers and indexed absolutely; entries outside this

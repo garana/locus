@@ -55,12 +55,17 @@ const std::vector<Backend>& list() {
 #if defined(LOCUS_HAS_NEON_DOTPROD_FAST_VARIANT)
         // Q8_0 batches by sdot lane on four interleaved rows (i#1076):
         // the block-32 order every CPU kernel now has, so a token gets
-        // the same bits alone (the one-row kernel above, faster for one
-        // token) or in a batch (this one). The i8mm path below, in the
-        // same order, replaces it under LOCUS_CPU_FAST.
+        // the same bits alone or in a batch. Both read the model's
+        // load-time copy where it made one (i#1243), so only one copy
+        // of the weights is hot; else a batch interleaves the rows per
+        // token tile and one token takes the one-row kernel above. The
+        // i8mm path below, in the same order, replaces it under
+        // LOCUS_CPU_FAST.
         if (f.dotprod) {
             Ops& o = b.back().ops;
+            o.matvec_q8k = &neon_dotprod_fast::matvec_neon_q8k;
             o.matvec_q8k_batch = &neon_dotprod_fast::matvec_batch_neon_q8k;
+            o.packs_q8_0 = true;
         }
 #endif
 #if defined(LOCUS_HAS_NEON_I8MM_VARIANT)
@@ -70,6 +75,7 @@ const std::vector<Backend>& list() {
             Ops& o = b.back().ops;
             o.matvec_q8k = &neon_i8mm::matvec_neon_q8k;
             o.matvec_q8k_batch = &neon_i8mm::matvec_batch_neon_q8k;
+            o.packs_q8_0 = false;  // it reads the rows as stored
         }
 #endif
 #endif
