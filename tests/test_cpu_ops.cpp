@@ -1924,6 +1924,13 @@ TEST_CASE("neon dotprod fast Q8_0 follows llama.cpp's order alone and "
         quantize_activation_q8_0(xt, xd.data(), xq.data());
         std::vector<float> one(rows);
         neon_dotprod_fast::matvec_neon_q8k(m, xt, one);
+        // i#1076: the baseline one-row kernel and the scalar reference
+        // take the same order, so all three agree bit for bit.
+        std::vector<float> base(rows), scal(rows);
+        matvec_neon_q8k(m, xt, base);
+        matvec_q8k(m, xt, scal);
+        REQUIRE(base == one);
+        REQUIRE(scal == one);
         for (std::uint32_t r = 0; r < rows; ++r) {
             float sum = 0.0f;
             for (std::size_t b = 0; b < nb; ++b) {

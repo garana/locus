@@ -1,19 +1,18 @@
 // Q8_0 weights x Q8_0 activations through sdot by lane on four
-// interleaved weight rows, picked only under LOCUS_CPU_FAST (cpu_fast)
-// on a CPU with dotprod and no i8mm (where matvec_neon_i8mm.cpp takes
-// Q8_0). Four rows' blocks are transposed so that each 32-bit lane of
-// a vector holds 4 bytes of one row: one vdotq_laneq_s32 then dots 4
-// rows against 4 activation bytes, and one convert, one multiply and
-// one add per block serve the 4 rows, where the baseline kernels spend
-// them per row.
+// interleaved weight rows, the default Q8_0 batch kernel on a CPU with
+// dotprod (i#1076; matvec_neon_i8mm.cpp takes Q8_0 instead under
+// LOCUS_CPU_FAST on an i8mm CPU). Four rows' blocks are transposed so
+// that each 32-bit lane of a vector holds 4 bytes of one row: one
+// vdotq_laneq_s32 then dots 4 rows against 4 activation bytes, and one
+// convert, one multiply and one add per block serve the 4 rows, where
+// the one-row kernels spend them per row.
 //
-// The float order is matvec_neon_i8mm.cpp's (llama.cpp's
-// ggml_vec_dot_q8_0_q8_0): per block an exact integer dot, times
-// d_w * d_x, then added to the sum, a multiply then an add. So under
-// the flag a Q8_0 result is the same bits on a dotprod CPU as on an
-// i8mm one, and a token gets the same bits alone (matvec_neon_q8k) or
-// in a batch (matvec_batch_neon_q8k). It is not the baseline order,
-// hence the opt-in.
+// The float order is every CPU kernel's block-32 order (scalar
+// vec_dot_block32_q8_0, llama.cpp's repacked one): per block an exact
+// integer dot, times d_w * d_x, then added to the sum, a multiply then
+// an add. So a token gets the same bits alone (the one-row kernels) or
+// in a batch (matvec_batch_neon_q8k here), on a dotprod CPU as on an
+// i8mm one.
 //
 // Like matvec_neon_dotprod.cpp, the file keeps the baseline flags and
 // gives only its own functions the dotprod target (a pragma opened
