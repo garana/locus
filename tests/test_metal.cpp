@@ -835,9 +835,6 @@ TEST_CASE("metal forward on a GGUF parsed from memory copies its weights",
     CHECK(worst <= 0.01f * scale);
 }
 
-// i#1050: the Metal conv2d (implicit GEMM) against the CPU's, on the
-// image decoders' shapes: channel and pixel tails, strides 1 and 2,
-// pads 0 and 1, 1 x 1 and 3 x 3 kernels, with and without a bias.
 // i#1056: dense::attention on the Metal image ops runs seq_attn_mma on
 // the GPU; it tracks the CPU's at the head widths the image models use,
 // declines one the kernel does not take, and the image ops take it.
@@ -917,6 +914,9 @@ TEST_CASE("bench: metal dense attention", "[.bench][metal]") {
     }
 }
 
+// i#1050: the Metal conv2d (implicit GEMM) against the CPU's, on the
+// image decoders' shapes: channel and pixel tails, strides 1 and 2,
+// pads 0 and 1, 1 x 1 and 3 x 3 kernels, with and without a bias.
 TEST_CASE("metal conv2d matches the CPU reference", "[metal][conv2d]") {
     if (!Context::usable()) {
         SKIP("no Metal device");
