@@ -566,36 +566,6 @@ inline int32x4_t hsum4_s32(int32x4_t a, int32x4_t b, int32x4_t c,
 }
 
 /**
- * row_block32_q8_0_neon for four rows at once (i#1239): row r at
- * row0 + r * row_bytes. Per block, the four rows' exact int dots in one
- * vector (a pairwise-add tree of their lane sums), then lane r takes
- * row r's d = w_d * x_d, multiply and add: so out[r] has the bits
- * row_block32_q8_0_neon gives row r, without its serial scalar chain.
- */
-void rows4_block32_q8_0_neon(gguf::TensorType type, const std::byte* row0,
-                             std::size_t row_bytes, std::size_t bb,
-                             std::size_t nb, const float* yd,
-                             const std::int8_t* yq, float* out) {
-    float32x4_t sum = vdupq_n_f32(0.0f);
-    int8x16_t lo, hi;
-    for (std::size_t b = 0; b < nb; ++b) {
-        const std::int8_t* x = yq + b * 32;
-        float d[4];
-        int32x4_t p[4];
-        for (int r = 0; r < 4; ++r) {
-            d[r] = unpack_block32_neon(type, row0 + r * row_bytes + b * bb, lo,
-                                       hi) *
-                   yd[b];
-            p[r] = lanes32(lo, hi, x);
-        }
-        const float32x4_t m = vmulq_f32(
-            vcvtq_f32_s32(hsum4_s32(p[0], p[1], p[2], p[3])), vld1q_f32(d));
-        sum = vaddq_f32(sum, m);
-    }
-    vst1q_f32(out, sum);
-}
-
-/**
  * row_block32_q8_0_neon for T tokens: each weight block is unpacked
  * once and dotted against every token, each token with its own exact
  * int dot and float steps in the same order, so out[t] is
@@ -1911,17 +1881,9 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
         const std::size_t bb = w.type == gguf::TensorType::kQ8_0   ? 34
                                : w.type == gguf::TensorType::kQ5_0 ? 22
                                                                    : 18;
-        // Four rows a step (rows4_block32_q8_0_neon), the last 0 to 3
-        // alone: the same bits either way (i#1239).
-        const std::size_t rb = nb * bb;
-        std::uint32_t r = 0;
-        for (; r + 4 <= w.rows; r += 4) {
-            rows4_block32_q8_0_neon(w.type, w.data + r * rb, rb, bb, nb,
-                                    d8.data(), q8.data(), out.data() + r);
-        }
-        for (; r < w.rows; ++r) {
-            out[r] = row_block32_q8_0_neon(w.type, w.data + r * rb, bb, nb,
-                                           d8.data(), q8.data());
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            out[r] = row_block32_q8_0_neon(w.type, w.data + r * nb * bb, bb,
+                                           nb, d8.data(), q8.data());
         }
         return;
     }

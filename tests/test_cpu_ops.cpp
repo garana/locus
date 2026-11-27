@@ -1622,9 +1622,8 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
     // and IQ2_S run one 8-token pass and a 3-token tail through kernels
     // whose every token gets the scalar dot's bits (i#733, i#739), and
     // block-32 types take the bit-identical 4-token kernel: all equal
-    // matvec_neon_q8k exactly. rows 9: the one-token block-32 path runs
-    // two four-row steps and a tail row (i#1239).
-    constexpr std::uint32_t rows = 9, n = 11;
+    // matvec_neon_q8k exactly.
+    constexpr std::uint32_t rows = 5, n = 11;
     std::mt19937 rng(101);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
     const auto tokens = [&](std::uint32_t cols) {
@@ -1769,9 +1768,8 @@ TEST_CASE("neon dotprod variant is bit-identical to the baseline neon",
         mats.push_back(Mat{t, store.back().data(), rows, cols});
     }
     {
-        // Every block-32 type: rows 5 runs a four-row step and a tail row
-        // of the one-token kernel, n 7 a four-token step and a tail
-        // (i#1239).
+        // Every block-32 type: n 7 runs a four-token step of the batch
+        // kernel and a tail (i#1239).
         std::uniform_int_distribution<int> byte_d(0, 255);
         for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
                                        std::pair{TensorType::kQ4_0, 18u},
