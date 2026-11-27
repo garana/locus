@@ -221,6 +221,47 @@ TEST_CASE("vulkan forward_batch with input embeddings tracks the CPU",
     cX.release(sX);
 }
 
+// i#1106: dense qwen3 batches its projections in forward_batch, with the
+// per-head q / k norms and q wider than the residual; a chunk equals one
+// forward() per position (qwen3moe_attention per token) bit for bit.
+TEST_CASE("qwen3 forward_batch equals per-position forward",
+          "[model][batch]") {
+    const auto img = qwen_tiny::qwen3_lm();
+    const auto g = locus::gguf::GgufFile::parse(img);
+    auto model = TransformerModel::load(g);
+    REQUIRE(model.hparams().head_dim * model.hparams().n_heads >
+            model.hparams().n_embd);
+    const std::uint32_t V = model.hparams().n_vocab;
+    const std::vector<locus::tok::TokenId> toks = {3, 17, 9, 30, 1, 22, 5};
+    const auto m = static_cast<std::uint32_t>(toks.size());
+    auto cR = model.make_cache(16);
+    auto wR = model.make_workspace();
+    Seq sR;
+    std::vector<std::vector<float>> want(m, std::vector<float>(V));
+    for (std::uint32_t i = 0; i < m; ++i) {
+        REQUIRE(cR.ensure_capacity(sR, 1));
+        model.forward(toks[i], cR, sR, wR, want[i]);
+    }
+    // Two chunks, the second after cached positions, as a prefill runs.
+    auto cB = model.make_cache(16);
+    auto wB = model.make_workspace();
+    Seq sB;
+    std::vector<float> got(std::size_t{m} * V);
+    REQUIRE(cB.ensure_capacity(sB, 3));
+    model.forward_batch(std::span(toks).first(3), cB, sB, wB,
+                        std::span(got).first(std::size_t{3} * V), true);
+    REQUIRE(cB.ensure_capacity(sB, m - 3));
+    model.forward_batch(std::span(toks).subspan(3), cB, sB, wB,
+                        std::span(got).subspan(std::size_t{3} * V), true);
+    for (std::uint32_t i = 0; i < m; ++i) {
+        INFO("position " << i);
+        REQUIRE(std::vector<float>(got.begin() + i * V,
+                                   got.begin() + (i + 1) * V) == want[i]);
+    }
+    cR.release(sR);
+    cB.release(sB);
+}
+
 // i#671: qwen2-family attention (q / k / v biases, NEOX rope, M-RoPE)
 // batches its projections in forward_batch, as llama's does. Without
 // M-RoPE positions a chunk equals one forward() per position bit for bit

@@ -1015,6 +1015,19 @@ guarding the default path.
   client that someone sent the same conversation start. Only "safe", or
   "unsafe" and a line of codes, is a verdict; anything else, a reply
   cut at the cap, or a failed run rejects (fail closed).
+- Qwen3Guard-Gen (`kind=qwen3-guard`, i#1106): the same generating
+  guard with another `GuardFormat`. The GGUF (dense `qwen3` arch) gets
+  its `tokenizer.chat_template`'s prompt for a last user turn, built in:
+  the task, the safety policy, nine named categories and the
+  conversation as `USER:` and `ASSISTANT:` lines (a system turn too, as
+  the template has it), then an empty `<think>` block. It stops at
+  `<|im_end|>`. Its verdict is `Safety: Safe|Unsafe|Controversial` and
+  `Categories:` with names; Controversial rejects, whatever `labels=`
+  names, unless `controversial=allow` (Qwen's strict and loose modes).
+  On the x86
+  host the 0.6B Q8_0 guard prefills its 300-token prompt at 49 tok/s on
+  the CPU and 111 on CUDA (per op), and the prefix cache serves the
+  fixed head after the first check.
 - Prompt Guard (`kind=prompt-guard`, `server/classifier_guard.cpp`):
   a sequence classifier on the DeBERTa encoder, scoring the untrusted
   text of a request: every user turn (tool results arrive as user

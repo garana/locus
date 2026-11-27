@@ -109,6 +109,44 @@ inline std::vector<std::byte> lm(const std::string& arch = "qwen2vl",
     });
 }
 
+/** A tiny dense Qwen3 (i#1106): no q / k / v biases, a per-head RMS norm
+ *  on q and k, and q wider than the residual (kHeads * 32 = 128 against
+ *  kE = 64), as Qwen3-0.6B's 16 * 128 against 1024. */
+inline std::vector<std::byte> qwen3_lm() {
+    constexpr std::uint64_t hd = 32, q_dim = kHeads * hd;
+    std::map<std::string, Shape> shapes;
+    shapes["token_embd.weight"] = {kVocab, kE};
+    shapes["output_norm.weight"] = {kE};
+    shapes["output.weight"] = {kVocab, kE};
+    for (std::uint32_t i = 0; i < kLayers; ++i) {
+        const std::string b = "blk." + std::to_string(i) + ".";
+        shapes[b + "attn_norm.weight"] = {kE};
+        shapes[b + "ffn_norm.weight"] = {kE};
+        shapes[b + "attn_q.weight"] = {q_dim, kE};
+        shapes[b + "attn_k.weight"] = {kKv * hd, kE};
+        shapes[b + "attn_v.weight"] = {kKv * hd, kE};
+        shapes[b + "attn_q_norm.weight"] = {hd};
+        shapes[b + "attn_k_norm.weight"] = {hd};
+        shapes[b + "attn_output.weight"] = {kE, q_dim};
+        shapes[b + "ffn_gate.weight"] = {kFf, kE};
+        shapes[b + "ffn_up.weight"] = {kFf, kE};
+        shapes[b + "ffn_down.weight"] = {kE, kFf};
+    }
+    return build(shapes, 11, [&](GgufBuilder& g) {
+        g.kv_string("general.architecture", "qwen3");
+        g.kv_u32("qwen3.embedding_length", kE);
+        g.kv_u32("qwen3.block_count", kLayers);
+        g.kv_u32("qwen3.attention.head_count", kHeads);
+        g.kv_u32("qwen3.attention.head_count_kv", kKv);
+        g.kv_u32("qwen3.attention.key_length", hd);
+        g.kv_u32("qwen3.attention.value_length", hd);
+        g.kv_u32("qwen3.feed_forward_length", kFf);
+        g.kv_u32("qwen3.context_length", 128);
+        g.kv_f32("qwen3.attention.layer_norm_rms_epsilon", 1e-6f);
+        g.kv_f32("qwen3.rope.freq_base", 1000000.0f);
+    });
+}
+
 /** The tiny tower as an mmproj GGUF image, its merger projecting to
  *  `out` (24 in the vision golden, kE to feed the language model).
  *  clip_norm: the Qwen2.5-VL processor's image_mean and image_std (the

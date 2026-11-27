@@ -18,8 +18,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 
 - **Architectures:** llama (dense and Mixtral-style MoE), deepseek2
   (MLA), glm-dsa, qwen2, qwen2vl (Qwen2.5-VL's language model, with
-  M-RoPE for image tokens on the CPU), qwen2moe, qwen3moe, dbrx,
-  muse-spark, deepseek41, kolibri1 (Kolibri-1).
+  M-RoPE for image tokens on the CPU), qwen2moe, qwen3 (dense, as
+  Qwen3Guard), qwen3moe, dbrx, muse-spark, deepseek41, kolibri1
+  (Kolibri-1).
 - **Weight formats:** GGUF with F32, F16, BF16, the legacy quants,
   K-quants, IQ quants, TQ1_0 and TQ2_0.
 - **Tokenizers:** SentencePiece, byte-level BPE (gpt2, llama3 and
@@ -296,7 +297,11 @@ request with Llama Guard 3 before the chat model sees it; a flagged
 request gets a 400 (docs/CLIENTS.md), and `--guard-categories S1,S9`
 picks the categories that reject (default: all). More guards come from
 a repeatable `--guard kind=llama-guard,model=P[,name=N][,labels=S1:S9]`,
-or `--guard kind=prompt-guard,model=P,labels=INJECTION@0.9[,threshold=T]`
+or `--guard kind=qwen3-guard,model=P[,labels=Violent:PII]` for
+Qwen3Guard-Gen (Apache-2.0, ungated; its category names as labels;
+`controversial=allow` lets its Controversial verdict through, which
+rejects by default whatever `labels=` names), or
+`--guard kind=prompt-guard,model=P,labels=INJECTION@0.9[,threshold=T]`
 for a DeBERTa classifier such as Prompt Guard (from
 `scripts/text/convert-deberta.py`; its labels from the model, each
 with an optional threshold, 0.5 by default), or `kind=classifier` the
@@ -309,8 +314,8 @@ embedding model, trained from labeled examples by
 safe stand-in for a SetFit head, which is a pickle); `max_windows=`
 raises a classifier's window cap (64); they run in order and any one
 can reject. Guards run on the chat model's worker, between
-its steps; each llama-guard guard holds its own KV pool (`--ctx`,
-else 4096 positions).
+its steps; each llama-guard or qwen3-guard guard holds its own KV
+pool (`--ctx`, else 4096 positions).
 A converter whose input lies in a Hugging Face cache snapshot records
 the repository and commit (`general.source.url`,
 `general.source.revision`; `scripts/hf_source.py`, tested by

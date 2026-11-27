@@ -110,6 +110,15 @@ struct ArchSpec {
                         TransformerModel::Workspace& ws, std::uint32_t l,
                         std::uint32_t base, std::uint32_t n,
                         std::span<float> x) = nullptr;
+
+    /**
+     * Whether `attention` is qwen3moe_attention: the plain computation
+     * (no biases) with q wider than n_embd (n_heads * head_dim), a
+     * per-head RMS norm on q and k after their projections, and NEOX
+     * rope. forward_batch batches its projections as plain_attention's
+     * (i#1106), byte-identical to the per-token path.
+     */
+    bool qwen3_attention = false;
 };
 
 /** @returns All implemented architectures. */
