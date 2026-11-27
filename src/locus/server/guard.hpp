@@ -42,6 +42,10 @@ struct GuardVerdict {
     Kind kind = Kind::kMalformed;
     /** The violated category codes ("S1", "S10"), for kUnsafe. */
     std::vector<std::string> categories;
+    /** For kUnsafe: rejects whatever labels the guard enables (a
+     *  Qwen3Guard Controversial verdict under controversial=reject,
+     *  which may name no category). */
+    bool rejects_any = false;
     /** Why the guard failed on this request, for kMalformed (logs);
      *  may be empty. */
     std::string error;
@@ -60,7 +64,8 @@ GuardVerdict parse_guard_verdict(std::string_view reply);
 
 /**
  * Whether a verdict rejects the request: an unsafe verdict naming at
- * least one enabled category, or a malformed one (fail closed).
+ * least one enabled category, or marked rejects_any, or a malformed one
+ * (fail closed).
  *
  * @param v The verdict.
  * @param enabled The category codes that reject; empty means all.
@@ -92,6 +97,64 @@ chat::ChatTemplate::Prompt llama_guard3_prompt(
  *     names them (the 1B model has no S14).
  */
 std::vector<GuardCategory> llama_guard3_1b_categories();
+
+/**
+ * The Qwen3Guard-Gen prompt that asks whether the last user message of
+ * `turns` is unsafe (i#1106): the GGUF's `tokenizer.chat_template` for a
+ * conversation ending with a user turn, built in. One user turn holds the
+ * task, the safety policy, the nine categories and the conversation (the
+ * first turn "USER: text", a user turn after a system turn joined to it
+ * by a blank line, then "USER: " and "ASSISTANT: " turns; other roles
+ * left out, as the template does), then the instruction; the assistant
+ * turn follows with an empty <think> block. Encode it without BOS and
+ * with encode_literal over `content`, as llama_guard3_prompt's.
+ *
+ * @param turns The chat request's messages.
+ * @returns The prompt text and the byte ranges copied from messages.
+ */
+chat::ChatTemplate::Prompt qwen3_guard_prompt(
+    std::span<const chat::Message> turns);
+
+/** @returns Qwen3Guard's nine categories, in its prompt's order (the
+ *  names its verdict writes; code and name are the same). */
+std::vector<GuardCategory> qwen3_guard_categories();
+
+/**
+ * Parses a Qwen3Guard-Gen reply: "Safety: Safe", "Safety: Unsafe" or
+ * "Safety: Controversial", then "Categories: " and a comma-separated list
+ * of its category names, or "None". Safe needs "None"; Unsafe needs at
+ * least one category; Controversial takes either. A Controversial verdict
+ * is kUnsafe with rejects_any when `controversial_rejects` (Qwen's strict
+ * mode: it rejects whatever labels= enables), else kSafe (its loose
+ * mode). Whitespace around lines and names is ignored.
+ *
+ * @param reply The guard's decoded output.
+ * @param controversial_rejects Whether Controversial counts as unsafe.
+ * @returns The verdict; kMalformed for any other text, or a name outside
+ *     the nine.
+ */
+GuardVerdict parse_qwen3_guard_verdict(std::string_view reply,
+                                       bool controversial_rejects);
+
+/**
+ * A generating guard's format (i#1106): its --guard kind, how a request
+ * becomes its prompt, how its reply becomes a verdict, and the marker
+ * that ends its reply. Llama Guard 3 and Qwen3Guard-Gen.
+ */
+struct GuardFormat {
+    std::string_view kind;  ///< "llama-guard" or "qwen3-guard"
+    chat::ChatTemplate::Prompt (*prompt)(std::span<const chat::Message>);
+    GuardVerdict (*parse)(std::string_view reply, bool controversial_rejects);
+    /** The end-of-turn marker the reply stops at besides EOS, when the
+     *  vocabulary holds it as one token. */
+    std::string_view eot;
+};
+
+/** @returns Llama Guard 3's format (its 1B taxonomy, S1 to S13). */
+const GuardFormat& llama_guard3_format();
+
+/** @returns Qwen3Guard-Gen's format. */
+const GuardFormat& qwen3_guard_format();
 
 /**
  * The text of a guard's reply up to its first `eos` or `eot` token.
@@ -173,9 +236,10 @@ class Guard {
 };
 
 /**
- * Llama Guard 3 (kind "llama-guard"): builds its prompt from a
- * request's turns, runs the model greedily for a few tokens and parses
- * its written verdict. One check runs at a time.
+ * A generating guard (kinds "llama-guard" and "qwen3-guard", by its
+ * GuardFormat): builds its prompt from a request's turns, runs the model
+ * greedily for a few tokens and parses its written verdict. One check
+ * runs at a time.
  */
 class LlamaGuard final : public Guard {
   public:
@@ -188,29 +252,39 @@ class LlamaGuard final : public Guard {
      * @param classify Produces the guard's reply for a prompt.
      * @param enabled Category codes that reject; empty means all.
      * @param name The guard's name.
+     * @param format The prompt and verdict format.
+     * @param controversial_rejects Whether a Controversial verdict
+     *     rejects (Qwen3Guard; Llama Guard has none).
      */
     LlamaGuard(Classifier classify, std::vector<std::string> enabled,
-               std::string name = "llama-guard");
+               std::string name = "llama-guard",
+               const GuardFormat& format = llama_guard3_format(),
+               bool controversial_rejects = true);
 
     /**
-     * Loads a guard GGUF (a llama-arch Llama Guard 3) on `backend`,
-     * with its own KV pool of `n_blocks` 16-token blocks.
+     * Loads a guard GGUF (Llama Guard 3, llama arch; Qwen3Guard-Gen,
+     * qwen3 arch) on `backend`, with its own KV pool of `n_blocks`
+     * 16-token blocks.
      *
      * @param path The guard GGUF.
      * @param backend The backend the chat model runs on.
      * @param n_blocks KV blocks; a prompt past them fails the check.
      * @param enabled Category codes that reject; empty means all.
      * @param name The guard's name.
+     * @param format The prompt and verdict format.
+     * @param controversial_rejects As for the constructor.
      * @throws std::runtime_error (or gguf::Error) when it cannot load.
      */
     static std::unique_ptr<LlamaGuard> load(
         const std::string& path, const backend::Backend& backend,
         std::uint32_t n_blocks, std::vector<std::string> enabled,
-        std::string name = "llama-guard");
+        std::string name = "llama-guard",
+        const GuardFormat& format = llama_guard3_format(),
+        bool controversial_rejects = true);
 
     ~LlamaGuard() override;
 
-    std::string_view kind() const override { return "llama-guard"; }
+    std::string_view kind() const override { return format_.kind; }
 
     /** Judges each request's last user turn; the batch's prompts go
      *  to the guard's engine together. */
@@ -230,7 +304,8 @@ class LlamaGuard final : public Guard {
     struct Loaded;  // the GGUF, model, tokenizer and engine
     std::unique_ptr<Loaded> loaded_;
     Classifier classify_;
-    std::vector<GuardCategory> categories_;
+    const GuardFormat& format_;
+    bool controversial_rejects_;
     std::string last_error_;
     std::mutex mu_;
 };
@@ -282,7 +357,9 @@ inline constexpr std::size_t kGuardMaxWindows = 64;
 
 /** One --guard flag: which guard to load and how it rejects. */
 struct GuardSpec {
-    std::string kind;   ///< "llama-guard" or "prompt-guard"
+    /** "llama-guard", "qwen3-guard", "prompt-guard", "classifier" or
+     *  "linear-head". */
+    std::string kind;
     std::string model;  ///< the GGUF path
     /** /metrics and error-body name; default: the GGUF's file name
      *  without ".gguf". */
@@ -302,6 +379,10 @@ struct GuardSpec {
     /** embedding= (kind=linear-head only): the embedding GGUF whose
      *  vectors the head scores. */
     std::string embedding;
+    /** controversial=reject|allow (kind=qwen3-guard only): whether a
+     *  "Safety: Controversial" verdict rejects; reject by default (Qwen's
+     *  strict mode). */
+    bool controversial_rejects = true;
 };
 
 /**
@@ -312,16 +393,20 @@ struct GuardSpec {
  * threshold, labels=INJECTION@0.9:JAILBREAK; threshold= sets the
  * default (0.5). A label rejects when its score reaches its threshold.
  * kind=linear-head also needs embedding= (the embedding GGUF its head
- * was trained on), which no other kind takes.
+ * was trained on), which no other kind takes. kind=qwen3-guard takes
+ * labels= as category names (labels=Violent:Jailbreak) and
+ * controversial=reject|allow (default reject), which no other kind takes.
  *
  * @param text The flag's value, e.g.
  *     "kind=llama-guard,model=/m/lg.gguf,labels=S1:S9".
  * @returns The spec, with a default name filled in.
  * @throws std::invalid_argument on an unknown kind or key, a missing
  *     kind or model, a pair without '=', a classifier kind without
- *     labels, a threshold on llama-guard, a threshold that is not a
- *     number in (0, 1], or embedding= missing on linear-head or given
- *     to another kind.
+ *     labels, a threshold on a generating kind, a threshold that is not
+ *     a number in (0, 1], embedding= missing on linear-head or given to
+ *     another kind, controversial= on another kind than qwen3-guard or
+ *     with a value other than reject and allow, or a qwen3-guard label
+ *     outside its nine categories.
  */
 GuardSpec parse_guard_spec(std::string_view text);
 

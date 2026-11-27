@@ -1622,20 +1622,36 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     std::vector<float> xb2(static_cast<std::size_t>(n) * E);
     std::vector<float> gate(static_cast<std::size_t>(n) * ff);
     std::vector<float> up(static_cast<std::size_t>(n) * ff);
-    // Batched attention projections (plain llama attention, or qwen2's
-    // with its biases and NEOX / M-RoPE; F32 cache).
+    // Batched attention projections (plain llama attention, qwen2's
+    // with its biases and NEOX / M-RoPE, or qwen3's with per-head q / k
+    // norms and NEOX rope; F32 cache).
     const bool qwen2 = spec_->qwen2_attention;
+    const bool qwen3 = spec_->qwen3_attention;
     const bool plain =
-        (spec_->plain_attention || qwen2) && !cache.quantized();
+        (spec_->plain_attention || qwen2 || qwen3) && !cache.quantized();
     const std::uint32_t hd = hp_.head_dim;
+    // q is n_heads * head_dim wide: n_embd for llama and qwen2, wider
+    // for qwen3 (Qwen3-0.6B: 16 * 128 against 1024).
+    const std::size_t q_dim = std::size_t{hp_.n_heads} * hd;
     const std::size_t kv_dim = std::size_t{hp_.n_kv_heads} * hd;
     const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
-    std::vector<float> qb, kb, vb;
+    std::vector<float> qb, kb, vb, ab;
     if (plain) {
-        qb.resize(static_cast<std::size_t>(n) * E);
+        qb.resize(static_cast<std::size_t>(n) *
+                  std::max<std::size_t>(q_dim, E));
         kb.resize(static_cast<std::size_t>(n) * kv_dim);
         vb.resize(kb.size());
+        ab.resize(static_cast<std::size_t>(n) * q_dim);  // attention out
     }
+    // qwen3's per-head RMS norm (weights head_dim wide), in place, as
+    // qwen3moe_attention applies it.
+    const auto head_norm = [&](std::span<float> v, std::uint32_t heads,
+                               std::span<const float> w) {
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            const std::span<float> vh = v.subspan(std::size_t{h} * hd, hd);
+            backend::rmsnorm(vh, w, hp_.rms_eps, vh);
+        }
+    };
 
     lap.restart();  // wall time per part (i#285)
     constexpr std::uint32_t kNoLayer = StageMetrics::kNoLayer;
@@ -1669,7 +1685,8 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                            {xbf.data() + o, E});
             }
             lap.lap(l, Stage::kNorm);
-            matvec_batch(op, lay.wq, xbf, qb, n);
+            const std::span<float> qall(qb.data(), std::size_t{n} * q_dim);
+            matvec_batch(op, lay.wq, xbf, qall, n);
             matvec_batch(op, lay.wk, xbf, kb, n);
             matvec_batch(op, lay.wv, xbf, vb, n);
             // qwen2: the biases after the projections, as
@@ -1687,7 +1704,8 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             add_bias(vb, lay.wv_bias);
             for (std::uint32_t t = 0; t < n; ++t) {
                 const std::uint32_t pos = base + t;
-                const std::span<float> q(qb.data() + std::size_t{t} * E, E);
+                const std::span<float> q(qb.data() + std::size_t{t} * q_dim,
+                                         q_dim);
                 float* krow = cache.k(seq, l, pos);
                 float* vrow = cache.v(seq, l, pos);
                 std::copy_n(kb.data() + std::size_t{t} * kv_dim, kv_dim,
@@ -1695,7 +1713,16 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                 std::copy_n(vb.data() + std::size_t{t} * kv_dim, kv_dim,
                             vrow);
                 const std::span<float> k(krow, kv_dim);
-                if (!qwen2) {
+                if (qwen3) {
+                    head_norm(q, hp_.n_heads, lay.attn_q_norm);
+                    head_norm(k, hp_.n_kv_heads, lay.attn_k_norm);
+                    backend::rope_neox_yarn(q, hp_.n_heads, hd, pos,
+                                            hp_.rope_freq_base,
+                                            backend::Yarn{});
+                    backend::rope_neox_yarn(k, hp_.n_kv_heads, hd, pos,
+                                            hp_.rope_freq_base,
+                                            backend::Yarn{});
+                } else if (!qwen2) {
                     backend::rope_norm(q, hp_.n_heads, hd, pos,
                                        hp_.rope_freq_base, rope_factors());
                     backend::rope_norm(k, hp_.n_kv_heads, hd, pos,
@@ -1722,9 +1749,9 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             // there is one (the same bits per token as the decode path),
             // else on the host.
             if (!device_gqa_attend(op, cache, seq, l, hp_, base, n,
-                                   qb.data(), xb2.data(), E)) {
+                                   qb.data(), ab.data(), q_dim)) {
                 gqa_attend_batch(
-                    qb.data(), xb2.data(), E, n, base, hp_.n_heads, hd,
+                    qb.data(), ab.data(), q_dim, n, base, hp_.n_heads, hd,
                     group, hp_.kq_scale,
                     [&](std::uint32_t p) -> const float* {
                         return cache.k(seq, l, p);
@@ -1733,7 +1760,8 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                         return cache.v(seq, l, p);
                     });
             }
-            matvec_batch(op, lay.wo, xb2, qb, n);
+            matvec_batch(op, lay.wo, ab, {qb.data(), std::size_t{n} * E},
+                         n);
             for (std::size_t i = 0; i < static_cast<std::size_t>(n) * E;
                  ++i) {
                 x[i] += qb[i];
