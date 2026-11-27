@@ -2712,6 +2712,18 @@ void TransformerModel::expert_out_on(const backend::Backend& b,
                   hp_.n_ff_exp, xb, gate, up, d);
 }
 
+void TransformerModel::record_expert_disk(std::uint32_t layer,
+                                          std::uint32_t expert, bool gpu,
+                                          std::string_view api) const {
+    if (!file_backed_ || !disk_bytes_on() || layer < layer_begin_ ||
+        layer >= layer_end_ || layers_[layer].gate_exps.base.rows == 0 ||
+        expert >= hp_.n_expert) {
+        return;
+    }
+    ExpertCalls::record_disk(layer, expert, hp_.n_layers, hp_.n_expert, gpu,
+                             api, expert_disk_bytes(layers_[layer], expert));
+}
+
 void TransformerModel::expert_out_batch(std::uint32_t layer,
                                         std::uint32_t expert,
                                         std::span<const float> xs,

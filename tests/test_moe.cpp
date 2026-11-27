@@ -2129,3 +2129,46 @@ TEST_CASE("expert runs land under their forward call's phase",
     REQUIRE(ExpertCalls::disk_snapshot().empty());
     ExpertCalls::reset();
 }
+
+// i#1219: Vulkan with experts that do not fit the device routes on the
+// host and runs each pick on the host CPU (i#1174): each of those calls
+// is a timed run of one token under the CPU api.
+TEST_CASE("vulkan host-routed experts are timed as CPU runs",
+          "[moe][metrics][vulkan]") {
+    using locus::model::ExpertCalls;
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    ModelBuilder moe;
+    moe.common();
+    moe.tensor("blk.0.ffn_gate_inp.weight", {kE, 4}, weights(kE * 4, 80));
+    moe.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 81));
+    moe.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 82));
+    moe.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+               weights(kF * kE * 4, 83));
+    auto img = moe.build(4, 2);
+    locus::backend::vulkan_moe_misfit_for_test(true);
+    struct Off {
+        ~Off() { locus::backend::vulkan_moe_misfit_for_test(false); }
+    } off;
+    ExpertCalls::reset();
+    run(img, {3, 7, 1}, "vulkan");
+    std::uint64_t cpu_calls = 0, runs = 0, ns = 0;
+    for (const auto& c : ExpertCalls::snapshot()) {
+        if (c.device == "cpu") cpu_calls += c.calls;
+    }
+    for (const auto& r : ExpertCalls::run_snapshot()) {
+        REQUIRE(r.device == "cpu");
+        runs += r.runs;
+        ns += r.ns;
+    }
+    REQUIRE(cpu_calls == 6);  // 3 tokens, 2 picks each, all on the host
+    REQUIRE(runs == cpu_calls);
+    REQUIRE(ns > 0);
+    for (const auto& t : ExpertCalls::run_tokens()) {
+        REQUIRE(t.tokens.count == t.tokens.sum);  // a token a run
+    }
+    ExpertCalls::reset();
+}

@@ -154,18 +154,20 @@ std::uint64_t nonresident_bytes(const void* p, std::size_t n) {
     const std::uintptr_t base = addr & ~(page - 1);
     const std::size_t len = n + (addr - base);
     const std::size_t pages = (len + page - 1) / page;
-    // macOS declares the vector char *, Linux unsigned char *.
+    // macOS declares the vector char *, Linux unsigned char *. One
+    // buffer a thread, grown as needed (three calls a pick).
 #if defined(__APPLE__)
-    std::vector<char> vec(pages);
+    thread_local std::vector<char> vec;
 #else
-    std::vector<unsigned char> vec(pages);
+    thread_local std::vector<unsigned char> vec;
 #endif
+    if (vec.size() < pages) vec.resize(pages);
     if (::mincore(reinterpret_cast<void*>(base), len, vec.data()) != 0) {
         return 0;
     }
     std::uint64_t out = 0;
-    for (const auto v : vec) {
-        if ((static_cast<unsigned char>(v) & 1u) == 0) out += page;
+    for (std::size_t i = 0; i < pages; ++i) {
+        if ((static_cast<unsigned char>(vec[i]) & 1u) == 0) out += page;
     }
     return out;
 }

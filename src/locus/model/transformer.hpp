@@ -468,6 +468,18 @@ class TransformerModel {
                        std::span<float> d) const;
 
     /**
+     * Adds a picked expert's bytes not in RAM to
+     * locus_moe_expert_disk_bytes_total (i#1219), as moe_ffn does: on
+     * a file-backed model with LOCUS_MOE_DISK_BYTES=1, else nothing.
+     * Called before the pick runs, by a forward that routes on the
+     * host (Vulkan's host-routed layer).
+     * @param gpu Whether the pick runs on the GPU.
+     * @param api The interface that runs it (outlives the process).
+     */
+    void record_expert_disk(std::uint32_t layer, std::uint32_t expert,
+                            bool gpu, std::string_view api) const;
+
+    /**
      * expert_out over m hidden states at once (an expert host's batched
      * call, i#1186): the expert's weights are read once for all of them
      * (matvec_batch for gate and up, silu, down), so on a CPU backend
