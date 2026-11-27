@@ -647,7 +647,8 @@ from the same backend matvec as in the per-token path, so
 `forward_batch` gives a KV cache and logits equal to N `forward()`
 calls within the matmul tolerance (byte-identical where the kernels
 share an order, and always in the batch-invariant mode; section 16).
-Attention reads no large weights, so it stays per token, each against its own sequence's KV.
+Attention reads no large weights, so it stays per token, each against
+its own sequence's KV.
 MoE layers route per token, then apply each picked expert once to all
 the tokens that chose it. Activations go N wide; the attention scores
 buffer stays one wide (an N-wide one would be N x n_ctx).
@@ -763,9 +764,10 @@ Batched decode is a skinny GEMM, $Y = W X^\top$ with $X$ of N rows.
 Looping the per-token matvec streams $W$ from DRAM N times. The
 register-blocked kernels load and dequantize each weight block once
 and keep N accumulators, so weight traffic drops about N-fold. They
-keep matvec's per-block reduction order, so each token's dot is
+keep matvec's per-block reduction order, so today each token's dot is
 bitwise unchanged (a single end-of-row reduction would differ: float
-addition is not associative).
+addition is not associative); that is a property of these kernels, not
+a requirement (section 16).
 
 `Ops::matvec_batch` is the hook. Kernels exist for Q4_K and Q6_K on
 sse4 and neon, and on CUDA (one launch for up to 32 tokens) for Q4_K,
@@ -1501,4 +1503,7 @@ order, f32 staging on the GPU, an f32 KV cache by default. Each of
 those moves only with a measured speed gain. Kernel variants are
 picked per GPU family or CPU feature set from a table filled by
 measurements (as `q6k_kernel()` is), and weights may be reordered once
-at load into a kernel's layout where that measures faster.
+at load into a kernel's layout where that measures faster. The build
+keeps `-ffp-contract=off` for now, so the scalar reference rounds the
+same on every compiler; allowing fused multiply-adds is a perf item
+like any other, taken when it measures faster.
