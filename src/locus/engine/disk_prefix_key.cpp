@@ -81,7 +81,8 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
           "LOCUS_METAL_ATTN_PASSES", "LOCUS_METAL_MULTI",
           "LOCUS_METAL_NORM_FOLD", "LOCUS_METAL_NORM_ROPE",
           "LOCUS_METAL_ROPE_EPILOGUE", "LOCUS_METAL_MOE_MM",
-          "LOCUS_METAL_MOE_ROUTE", "LOCUS_METAL_Q6K"}) {
+          "LOCUS_METAL_MOE_ROUTE", "LOCUS_METAL_Q6K",
+          "LOCUS_METAL_PREFILL_COLS", "LOCUS_METAL_PREFILL_MV_ROWS"}) {
         const char* v = std::getenv(var);
         const std::string s = v != nullptr ? std::string("=") + v : "";
         o = fnv(fnv(o, var, std::strlen(var)), s.data(), s.size());
