@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -13,6 +14,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
+#include "locus/sys/features.hpp"
 
 using locus::model::TransformerModel;
 using Seq = locus::kv::PagedKvCache::Seq;
@@ -177,7 +179,16 @@ void check_outw(TransformerModel& model, float tol = 0.0f) {
 // one). The reference forward() and the batched paths share the one
 // model object, so they always use the section's backend. Vulkan is
 // skipped (no batched forward). Convention: test_model_e2e.cpp.
+// tol applies only where one token and a batch take different float
+// orders: the sse4 backend on an AVX CPU (i#1244) and the fallback copy
+// of it; every other backend, metal's batch-invariant mode among them,
+// keeps bit for bit.
 void sweep_backends(const std::string& path, float tol = 0.0f) {
+    const bool avx = locus::sys::detect().avx;
+    const auto tol_for = [&](std::string_view name) {
+        return avx && name == "sse4" ? tol : 0.0f;
+    };
+    const float fb_tol = tol_for(locus::backend::best_backend().name);
     // The wrapper's op.matvec fallback branch is reached only on a
     // backend that leaves Ops::matvec_batch null, which today is avx2
     // alone. The sweep below therefore cannot reach it on any host
@@ -199,7 +210,7 @@ void sweep_backends(const std::string& path, float tol = 0.0f) {
         if (b.available && b.selectable && b.name != "vulkan") {
             DYNAMIC_SECTION("backend " << b.name) {
                 model.use_backend(b);
-                check_outw(model, tol);
+                check_outw(model, tol_for(b.name));
             }
         }
     }
@@ -207,7 +218,7 @@ void sweep_backends(const std::string& path, float tol = 0.0f) {
     // comment at its declaration for why it is hoisted before `model`).
     DYNAMIC_SECTION("backend " << fb.name) {
         model.use_backend(fb);
-        check_outw(model, tol);
+        check_outw(model, fb_tol);
     }
 }
 }  // namespace
@@ -233,9 +244,10 @@ TEST_CASE("amortized LM head byte-exact: F32 head (layout guard)",
 // one token takes llama.cpp's Q4_K / Q6_K rows and a batch the sse4
 // order (i#1244, DESIGN 16): after 16 layers of Llama 3.2 1B Q4_K_M the
 // logits differ by up to 0.49 (each layer's Q8_K activations can round
-// to the next step), with the same top token on every row. So within 1
-// of the per-token logits and the same argmax; scalar and cuda stay
-// bit for bit (their largest gap is 0).
+// to the next step), with the same top token on every row. So sse4 on an
+// AVX CPU (and its fallback copy) is held within 1 of the per-token
+// logits and the same argmax; every other backend, metal's
+// batch-invariant mode among them, stays bit for bit.
 TEST_CASE("amortized LM head tracks per-token: quantized head",
           "[batch][outw]") {
     if (!std::filesystem::exists(q4k_path())) {
