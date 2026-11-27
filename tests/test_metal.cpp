@@ -421,7 +421,7 @@ TEST_CASE("metal matmuls match the CPU matvec per token",
             }
         }
     } guard;
-    for (const char* tile : {"64", "128"}) {
+    const char* tile = GENERATE("64", "128");
     ::setenv("LOCUS_METAL_MM_TILE", tile, 1);
     CAPTURE(tile);
     // Rows and tokens off both tiles (64 or 128 x 32), strided rows.
@@ -480,7 +480,6 @@ TEST_CASE("metal matmuls match the CPU matvec per token",
             ctx.free(wb);
             ctx.free(xb);
         }
-    }
     }
     // Types without a matmul kernel say so and record nothing.
     Context::Buffer none = ctx.alloc(64);
