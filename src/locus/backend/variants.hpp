@@ -180,8 +180,8 @@ void quantize_activation_q8k_sse4(std::span<const float> x, float* d,
                                   std::int8_t* qs, std::int16_t* bsums);
 /**
  * One token through llama.cpp's x86 __AVX__ Q4_K / Q6_K rows (i#801):
- * its float order, not the scalar kernel's, so matvec_sse4_q8k takes it
- * only under LOCUS_CPU_FAST.
+ * its float order, not the scalar kernel's; the AVX build's
+ * matvec_sse4_q8k takes it for one token (i#1244).
  *
  * @returns false (out untouched) for any other weight type.
  */

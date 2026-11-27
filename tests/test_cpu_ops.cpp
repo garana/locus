@@ -955,8 +955,8 @@ TEST_CASE("matvec_batch_sse4 F32 and BF16 tiles give the per-token bits",
 // every token of a batch, so batched prefill equals the per-token path.
 #if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
 // i#706: the SSE4 kernels built with AVX give the SSE4 build's bits on
-// every entry point, per token and batched (the scalar comparisons
-// above then hold for them too).
+// every entry point, per token and batched, but one-token Q4_K and Q6_K,
+// which take llama.cpp's rows there (i#1244) and stay within 1e-5.
 TEST_CASE("sse4_avx kernels give the sse4 bits", "[ops][batch][sse4]") {
     if (!locus::sys::detect().avx) {
         SKIP("CPU lacks AVX");
@@ -985,7 +985,15 @@ TEST_CASE("sse4_avx kernels give the sse4 bits", "[ops][batch][sse4]") {
         same();
         matvec_sse4_q8k(m, x0, a);
         sse4_avx::matvec_sse4_q8k(m, x0, b);
-        same();
+        if (m.type == TensorType::kQ4_K || m.type == TensorType::kQ6_K) {
+            // One token: the AVX build takes llama.cpp's rows (i#1244),
+            // another float order, so close, not equal.
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                REQUIRE(b[r] == Approx(a[r]).epsilon(1e-5).margin(1e-5));
+            }
+        } else {
+            same();
+        }
         a.resize(std::size_t{rows} * n);
         b.resize(a.size());
         matvec_batch_sse4(m, xb, a, n);
