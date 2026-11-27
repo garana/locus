@@ -572,8 +572,9 @@ NEON). There it is a capability win, not a speed win.
   active backend's matvec into a disjoint output span. Each row's dot
   is the same code, so today logits are bit-identical for every thread
   count (not required: section 16). `LOCUS_THREADS` caps the fan-out
-  (default: the performance cores; 1 runs single-threaded). Parallel slices also issue parallel
-  page faults, a deeper NVMe queue on streamed models. Independent
+  (default: the performance cores; 1 runs single-threaded). Parallel
+  slices also issue parallel page faults, a deeper NVMe queue on
+  streamed models. Independent
   matvecs reading the same input (q/k/v, gate/up) share one pool
   dispatch, and decode attention spreads its heads across the pool.
 - R9.2, static pinning: `LOCUS_PIN_STATIC=1` mlocks every non-expert
@@ -1390,8 +1391,8 @@ and a device-select seam (#47).
 Exit test: a two-host split gives byte-identical output to the
 single-host run on hosts of one architecture, and token-exact output
 (within the kernels' tolerance) across architectures; at concurrency
-at or above the pipeline depth, throughput approaches the single-box ceiling, with only the hop
-latency added.
+at or above the pipeline depth, throughput approaches the single-box
+ceiling, with only the hop latency added.
 
 `locus-server` serves the same way from several engines
 (`server::EngineGroup`, #929): each an `EngineLoop` with its own
