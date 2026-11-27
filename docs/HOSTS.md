@@ -225,7 +225,8 @@ Recommended: no flags; leave `--kv-type` at f32 and `--engines` at 1.
   explained, so it has no row.
 - `--kv-type q8` only to fit a longer context: it keeps the decode
   speed and costs about 25% of the prefill.
-- `LOCUS_CPU_FAST`: Q8_0 takes the dotprod fast path (four
-  interleaved rows per `sdot` lane, the i8mm path's float order): for
-  prompt-heavy Q8_0 work, at a decode cost of about 10%. Its faster
-  softmax applies too, but is not measured here.
+- The `LOCUS_CPU_FAST=1` Q8_0 row above was measured when the four
+  interleaved row `sdot` prefill was opt-in; it is the default now
+  (#1076), while decode keeps the one-row kernel, in the same float
+  order. The flag still turns on the faster softmax, not measured
+  here.

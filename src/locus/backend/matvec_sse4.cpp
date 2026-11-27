@@ -1029,11 +1029,17 @@ __m128i block32_lanes_sse4(const std::int8_t* q, const std::int8_t* x) {
                          lanes16_sse4(_mm_abs_epi8(q1), q1, x1));
 }
 
+/** @returns The sum of v's four int32 lanes (exact). */
+inline int hsum_epi32_sse4(__m128i v) {
+    const __m128i h = _mm_hadd_epi32(v, v);
+    return _mm_cvtsi128_si32(_mm_hadd_epi32(h, h));
+}
+
 /**
  * One row of 32-weight blocks (an f16 scale first, kBlk bytes each)
  * dotted with a Q8_0-quantized activation, in the float order of scalar
- * vec_dot_block32_q8_0: two blocks per step, four float lanes each, the
- * pairwise lane reduction, then a scalar tail block.
+ * vec_dot_block32_q8_0 (i#1076): per block the exact int dot, then
+ * sum = sum + dot * (w_d * x_d), a multiply then an add.
  *
  * @param lanes `lanes(blk, x)` gives one block's four int32 lane sums
  *     against the activation's 32 int8 at x.
@@ -1042,47 +1048,13 @@ template <std::size_t kBlk, class Lanes>
 float row_block32_q8_0_sse4(const std::byte* row, const float* xd,
                             const std::int8_t* xq, std::size_t nb,
                             const Lanes& lanes) {
-    __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
-    std::size_t b = 0;
-#if defined(LOCUS_SSE4_AVX_VARIANT)
-    // Block b in lanes 0-3 and b + 1 in 4-7 of one 256-bit sum: the same
-    // adds as s0 and s1 below.
-    __m256 s8 = _mm256_setzero_ps();
-    for (; b + 1 < nb; b += 2) {
-        const std::byte* b0 = row + b * kBlk;
-        const std::byte* b1 = b0 + kBlk;
-        const __m256 d = _mm256_set_m128(
-            _mm_set1_ps(f16_to_f32(load_u16(b1)) * xd[b + 1]),
-            _mm_set1_ps(f16_to_f32(load_u16(b0)) * xd[b]));
-        const __m256i p = _mm256_set_m128i(lanes(b1, xq + (b + 1) * 32),
-                                           lanes(b0, xq + b * 32));
-        s8 = _mm256_add_ps(s8, _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
-    }
-    s0 = _mm256_castps256_ps128(s8);
-    s1 = _mm256_extractf128_ps(s8, 1);
-#else
-    for (; b + 1 < nb; b += 2) {
-        const std::byte* b0 = row + b * kBlk;
-        const std::byte* b1 = b0 + kBlk;
-        const float d0 = f16_to_f32(load_u16(b0)) * xd[b];
-        const float d1 = f16_to_f32(load_u16(b1)) * xd[b + 1];
-        const __m128i p0 = lanes(b0, xq + b * 32);
-        const __m128i p1 = lanes(b1, xq + (b + 1) * 32);
-        s0 = _mm_add_ps(s0, _mm_mul_ps(_mm_cvtepi32_ps(p0), _mm_set1_ps(d0)));
-        s1 = _mm_add_ps(s1, _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
-    }
-#endif
-    alignas(16) float l0[4], l1[4];
-    _mm_store_ps(l0, s0);
-    _mm_store_ps(l1, s1);
-    float sum = ((l0[0] + l0[1]) + (l0[2] + l0[3])) +
-                ((l1[0] + l1[1]) + (l1[2] + l1[3]));
-    for (; b < nb; ++b) {
+    float sum = 0.0f;
+    for (std::size_t b = 0; b < nb; ++b) {
         const std::byte* blk = row + b * kBlk;
         const float d = f16_to_f32(load_u16(blk)) * xd[b];
-        alignas(16) std::int32_t p[4];
-        _mm_store_si128(reinterpret_cast<__m128i*>(p), lanes(blk, xq + b * 32));
-        sum += static_cast<float>(p[0] + p[1] + p[2] + p[3]) * d;
+        const int p = hsum_epi32_sse4(lanes(blk, xq + b * 32));
+        const float m = static_cast<float>(p) * d;
+        sum = sum + m;
     }
     return sum;
 }
@@ -1189,9 +1161,9 @@ float row_q5_0_q8_0_sse4(const std::byte* row, const float* xd,
 
 /**
  * row_q8_0_q8_0_sse4 for kT tokens: each weight block and its absolute
- * values are loaded once and dotted with every token's quants; each token's
- * float lanes and reduction keep the one-token order, so out[t] is the
- * bits row_q8_0_q8_0_sse4 gives for token t.
+ * values are loaded once and dotted with every token's quants; each
+ * token's exact block dot and float steps keep the one-token order, so
+ * out[t] is the bits row_q8_0_q8_0_sse4 gives for token t.
  */
 template <int kT>
 void row_q8_0_q8_0_sse4_xt(const std::byte* row, const float* const* xd,
@@ -1217,72 +1189,44 @@ void row_q8_0_q8_0_sse4_xt(const std::byte* row, const float* const* xd,
         return _mm_add_epi32(lanes16_sse4(w.abs_q[0], w.q[0], xa),
                              lanes16_sse4(w.abs_q[1], w.q[1], xb));
     };
-    __m128 s0[kT], s1[kT];
-    std::size_t b = 0;
-#if defined(LOCUS_SSE4_AVX_VARIANT)
-    // One 256-bit sum per token: block b in lanes 0-3 and b + 1 in lanes
-    // 4-7, the same adds as s0 and s1 below, so the same bits.
-    __m256 s8[kT];
-    for (int t = 0; t < kT; ++t) {
-        s8[t] = _mm256_setzero_ps();
-    }
-    for (; b + 1 < nb; b += 2) {
-        const std::byte* b0 = row + b * kBlk;
-        const std::byte* b1 = b0 + kBlk;
-        const float w0 = f16_to_f32(load_u16(b0));
-        const float w1 = f16_to_f32(load_u16(b1));
-        const W16 v0 = widen(b0), v1 = widen(b1);
+    if constexpr (kT == 4) {
+        // The four tokens' exact block dots in one vector (hadd of the
+        // lane sums), then lane t does token t's float steps: the same
+        // multiply and add as the one-token loop, so the same bits.
+        __m128 sum = _mm_setzero_ps();
+        for (std::size_t b = 0; b < nb; ++b) {
+            const std::byte* blk = row + b * kBlk;
+            const float w = f16_to_f32(load_u16(blk));
+            const W16 v = widen(blk);
+            const __m128i p = _mm_hadd_epi32(
+                _mm_hadd_epi32(lanes(v, xq[0] + b * 32),
+                               lanes(v, xq[1] + b * 32)),
+                _mm_hadd_epi32(lanes(v, xq[2] + b * 32),
+                               lanes(v, xq[3] + b * 32)));
+            const __m128 d = _mm_set_ps(w * xd[3][b], w * xd[2][b],
+                                        w * xd[1][b], w * xd[0][b]);
+            sum = _mm_add_ps(sum, _mm_mul_ps(_mm_cvtepi32_ps(p), d));
+        }
+        _mm_storeu_ps(out, sum);
+    } else {
+        float sum[kT];
         for (int t = 0; t < kT; ++t) {
-            const __m256 d = _mm256_set_m128(_mm_set1_ps(w1 * xd[t][b + 1]),
-                                             _mm_set1_ps(w0 * xd[t][b]));
-            const __m256i p = _mm256_set_m128i(
-                lanes(v1, xq[t] + (b + 1) * 32), lanes(v0, xq[t] + b * 32));
-            s8[t] = _mm256_add_ps(s8[t],
-                                  _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
+            sum[t] = 0.0f;
         }
-    }
-    for (int t = 0; t < kT; ++t) {
-        s0[t] = _mm256_castps256_ps128(s8[t]);
-        s1[t] = _mm256_extractf128_ps(s8[t], 1);
-    }
-#else
-    for (int t = 0; t < kT; ++t) {
-        s0[t] = _mm_setzero_ps();
-        s1[t] = _mm_setzero_ps();
-    }
-    for (; b + 1 < nb; b += 2) {
-        const std::byte* b0 = row + b * kBlk;
-        const std::byte* b1 = b0 + kBlk;
-        const float w0 = f16_to_f32(load_u16(b0));
-        const float w1 = f16_to_f32(load_u16(b1));
-        const W16 v0 = widen(b0), v1 = widen(b1);
+        for (std::size_t b = 0; b < nb; ++b) {
+            const std::byte* blk = row + b * kBlk;
+            const float w = f16_to_f32(load_u16(blk));
+            const W16 v = widen(blk);
+            for (int t = 0; t < kT; ++t) {
+                const float d = w * xd[t][b];
+                const int p = hsum_epi32_sse4(lanes(v, xq[t] + b * 32));
+                const float m = static_cast<float>(p) * d;
+                sum[t] = sum[t] + m;
+            }
+        }
         for (int t = 0; t < kT; ++t) {
-            const float d0 = w0 * xd[t][b];
-            const float d1 = w1 * xd[t][b + 1];
-            const __m128i p0 = lanes(v0, xq[t] + b * 32);
-            const __m128i p1 = lanes(v1, xq[t] + (b + 1) * 32);
-            s0[t] = _mm_add_ps(
-                s0[t], _mm_mul_ps(_mm_cvtepi32_ps(p0), _mm_set1_ps(d0)));
-            s1[t] = _mm_add_ps(
-                s1[t], _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
+            out[t] = sum[t];
         }
-    }
-#endif
-    for (int t = 0; t < kT; ++t) {
-        alignas(16) float l0[4], l1[4];
-        _mm_store_ps(l0, s0[t]);
-        _mm_store_ps(l1, s1[t]);
-        float sum = ((l0[0] + l0[1]) + (l0[2] + l0[3])) +
-                    ((l1[0] + l1[1]) + (l1[2] + l1[3]));
-        for (std::size_t bt = b; bt < nb; ++bt) {
-            const std::byte* blk = row + bt * kBlk;
-            const float d = f16_to_f32(load_u16(blk)) * xd[t][bt];
-            alignas(16) std::int32_t p[4];
-            _mm_store_si128(reinterpret_cast<__m128i*>(p),
-                            lanes(widen(blk), xq[t] + bt * 32));
-            sum += static_cast<float>(p[0] + p[1] + p[2] + p[3]) * d;
-        }
-        out[t] = sum;
     }
 }
 
