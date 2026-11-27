@@ -78,7 +78,8 @@ and an x86 host tests every code PR.
   punctuation (GitHub strips it: use `\ `, not `\,`) and `\lt`, not
   `<`.
 - Unit tests with vendored Catch2 for every component; all tests
-  green before any commit.
+  green before a merge (the batched integration run covers the PRs it
+  holds; a PR needs no run of its own first).
 - Commit as each unit of work completes. No Co-Authored-By lines.
 - Dependency policy (DESIGN.md 6): no FetchContent, no network at
   build time; vendor pinned single-file deps with recorded sha256.
