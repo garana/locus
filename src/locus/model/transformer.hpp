@@ -289,8 +289,12 @@ class TransformerModel {
     /**
      * Routes heavy ops through the given backend (default: the
      * best available at load time; see backend::backends()).
+     * @throws std::invalid_argument when `b` is not available on this
+     *     machine (a SIMD variant the CPU lacks: built in, listed by
+     *     backend::backends(), but its kernels would fault), as
+     *     backend::resolve_backend() refuses it.
      */
-    void use_backend(const backend::Backend& b) { backend_ = &b; }
+    void use_backend(const backend::Backend& b);
 
     /** @returns Whether metal_forward takes this model on its backend
      *  (any cache conditions aside): the batched paths then run it a

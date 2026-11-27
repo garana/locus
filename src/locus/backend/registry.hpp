@@ -221,13 +221,22 @@ struct Backend {
     Ops ops;
 };
 
-/** @returns All known backends, best-first for this build. */
+/**
+ * @returns All known backends, best-first for this build: every
+ *     variant built in, available on this machine or not (check
+ *     `available` before using one; best_backend() does).
+ */
 std::span<const Backend> backends();
 
 /** @returns The backend named `name`, or nullptr. */
 const Backend* find_backend(std::string_view name);
 
-/** @returns The best available, selectable backend. */
+/**
+ * @returns The best available, selectable backend. It is always a CPU
+ *     backend (the CPU variants come first in backends() and scalar is
+ *     always available), so callers that want the best CPU kernels
+ *     take it, not backends().front().
+ */
 const Backend& best_backend();
 
 /**
