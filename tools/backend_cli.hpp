@@ -321,9 +321,9 @@ inline constexpr const char* kCommonHelp =
     "                   each has its own prefix cache, so a prompt goes\n"
     "                   to the engine its longest prefix last went to\n"
     "                   (unless that one is busier)\n"
-    "  --kv-type T      KV cache precision: f32 (default, exact),\n"
-    "                   f16 (half the cache and attention reads;\n"
-    "                   GPU-accelerated for GQA models), q8, q4\n"
+    "  --kv-type T      KV cache precision: f32 (the default, but on\n"
+    "                   Metal), f16 (half the cache and attention\n"
+    "                   reads; the default on Metal), q8, q4\n"
     "  --prefix-cache-dir DIR  keep evicted prompt-prefix KV in DIR and\n"
     "                   read it back on a later match, also after a\n"
     "                   restart (off unless set; use fast storage)\n"
@@ -544,6 +544,8 @@ struct BackendArgs {
     /** From --kv-type T: KV cache precision (kv_type_ok false when
      * T names no type; kv_type_name keeps it for the error). */
     locus::kv::KvType kv_type = locus::kv::KvType::kF32;
+    /** Whether --kv-type was given; else default_kv_type() picks. */
+    bool kv_type_set = false;
     bool kv_type_ok = true;
     std::string kv_type_name;
     /** From --prefix-cache-dir DIR: the disk tier of the prefix cache
@@ -602,6 +604,18 @@ struct BackendArgs {
     std::string bad_number_flag;
     std::string bad_number_value;
 };
+
+/**
+ * The KV cache type without --kv-type (i#1245): f16 on Metal, where
+ * the decode reads half the K / V bytes and long-context decode gains
+ * most, else f32.
+ * @param backend The backend picked for the model.
+ * @returns The KV type.
+ */
+inline locus::kv::KvType default_kv_type(std::string_view backend) {
+    return backend == "metal" ? locus::kv::KvType::kF16
+                              : locus::kv::KvType::kF32;
+}
 
 /**
  * Parses a --kv-type value.
@@ -838,6 +852,7 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.kv_type_name =
                 a == "--kv-type" ? argv[++i] : std::string(a.substr(10));
             out.kv_type_ok = parse_kv_type(out.kv_type_name, out.kv_type);
+            out.kv_type_set = true;
         } else if (a == "--prefix-cache-dir" && i + 1 < argc) {
             out.prefix_cache_dir = argv[++i];
         } else if (a.rfind("--prefix-cache-dir=", 0) == 0) {

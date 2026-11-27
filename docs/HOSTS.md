@@ -98,7 +98,11 @@ efficiency), 32 GPU cores; arm64 with neon, dotprod and i8mm; 36 GB;
 macOS.
 
 Recommended: `--backend metal` for text, the default since #1042: it
-leads Vulkan on every prefill and on most decode rows. On the decode
+leads Vulkan on every prefill and on most decode rows. Its KV cache is
+f16 by default (#1245): Llama 1B decode after a 2101-token prompt,
+Q8_0 191.2 -> 200.8 and Q4_K_M 244.8 -> 260.8 tok/s against f32
+(llama.cpp at depth 2048: 206.2 and 278.9), prefill and short-context
+decode level. On the decode
 of Orpheus and Qwen3-Coder the two are within 1%. Concurrent clients
 decode together since #1184; locus-server, Llama 1B, 128 tokens a
 client, tok/s in all:

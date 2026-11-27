@@ -251,6 +251,9 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         std::string why;
         const auto& backend =
             model.use_backend_for(args.choice, args.kv_type, &why);
+        if (!args.kv_type_set) {
+            args.kv_type = locus_tools::default_kv_type(backend.name);
+        }
         // Which backend and why (i#867): the default's reason too.
         std::fprintf(stderr, "locus-server: backend: %s (%s)\n",
                      std::string(backend.name).c_str(), why.c_str());

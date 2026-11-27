@@ -468,7 +468,7 @@ const backend::Backend& TransformerModel::use_backend_for(
         const backend::Backend* mt = backend::find_backend("metal");
         if (usable(mt)) {
             std::string not_taken;
-            if (kv_type == kv::KvType::kF32) {
+            if (kv_type == kv::KvType::kF32 || kv_type == kv::KvType::kF16) {
                 use_backend(*mt);  // metal_forward_why_not reads it
                 not_taken = metal_forward_why_not();
                 if (not_taken.empty()) {
@@ -476,11 +476,10 @@ const backend::Backend& TransformerModel::use_backend_for(
                     return *mt;
                 }
             } else {
-                const char* name = kv_type == kv::KvType::kQ8   ? "q8"
-                                   : kv_type == kv::KvType::kQ4 ? "q4"
-                                                                : "f16";
+                const char* name =
+                    kv_type == kv::KvType::kQ8 ? "q8" : "q4";
                 not_taken = std::string("a ") + name +
-                            " KV cache (metal_forward takes f32)";
+                            " KV cache (metal_forward takes f32 and f16)";
             }
             note = "default; metal_forward does not take this model: " +
                    not_taken + "; metal would be used if it did";

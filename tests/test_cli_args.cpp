@@ -327,9 +327,16 @@ TEST_CASE("the kv-type flag picks the KV cache precision", "[cli]") {
     };
     auto a = parse({"prog", "m.gguf"});
     REQUIRE(a.kv_type_ok);
-    REQUIRE(a.kv_type == KvType::kF32);  // default: exact
+    REQUIRE(a.kv_type == KvType::kF32);
+    // Without the flag the tools take default_kv_type() of the backend
+    // they picked (i#1245): f16 on Metal, f32 elsewhere.
+    REQUIRE_FALSE(a.kv_type_set);
+    REQUIRE(locus_tools::default_kv_type("metal") == KvType::kF16);
+    REQUIRE(locus_tools::default_kv_type("vulkan") == KvType::kF32);
+    REQUIRE(locus_tools::default_kv_type("neon") == KvType::kF32);
     auto b = parse({"prog", "--kv-type", "f16", "m.gguf"});
     REQUIRE(b.kv_type_ok);
+    REQUIRE(b.kv_type_set);
     REQUIRE(b.kv_type == KvType::kF16);
     REQUIRE(b.positional == std::vector<std::string>{"m.gguf"});
     REQUIRE(parse({"prog", "--kv-type=q8"}).kv_type == KvType::kQ8);
