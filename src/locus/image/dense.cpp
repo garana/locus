@@ -7,6 +7,8 @@
 #include <thread>
 #include <vector>
 
+#include "locus/backend/metal/attention.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/sys/thread_pool.hpp"
 
@@ -92,6 +94,13 @@ void attention(const backend::Ops& given, std::span<const float> q,
                std::uint32_t nq, std::span<const float> k,
                std::span<const float> v, std::uint32_t nk,
                std::uint32_t heads, std::uint32_t hd, std::span<float> out) {
+    // The Metal image ops run the whole attention on the GPU from the
+    // token-major q, k and v (seq_attn_mma, i#1056); a head width it
+    // does not take falls through to the CPU below.
+    if (&given == &backend::metal::image_ops() &&
+        backend::metal::attention(q, nq, k, v, nk, heads, hd, out)) {
+        return;
+    }
     const std::uint32_t w = heads * hd;
     std::vector<float> kh(std::size_t{heads} * nk * hd),
         vt(std::size_t{heads} * hd * nk);

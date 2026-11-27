@@ -25,6 +25,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/metal/attention.hpp"
 #include "locus/backend/metal/context.hpp"
 #include "locus/backend/metal/conv.hpp"
 #include "locus/backend/metal/matvec.hpp"
@@ -33,6 +34,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/engine/disk_prefix_key.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/image/dense.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/sys/mmap_file.hpp"
@@ -960,6 +962,85 @@ TEST_CASE("metal forward on a GGUF parsed from memory copies its weights",
         scale = std::max(scale, std::abs(cpu[r]));
     }
     CHECK(worst <= 0.01f * scale);
+}
+
+// i#1056: dense::attention on the Metal image ops runs seq_attn_mma on
+// the GPU; it tracks the CPU's at the head widths the image models use,
+// declines one the kernel does not take, and the image ops take it.
+TEST_CASE("metal dense attention tracks the CPU", "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    struct Shape {
+        std::uint32_t nq, nk, heads, hd;
+    };
+    const Shape shapes[] = {
+        {70, 50, 3, 64}, {7, 300, 2, 32}, {129, 64, 4, 128}, {1, 1, 1, 72}};
+    std::mt19937 rng(1056);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    const auto& cpu = locus::backend::best_backend().ops;
+    for (const Shape& s : shapes) {
+        CAPTURE(s.nq, s.nk, s.heads, s.hd);
+        const std::size_t w = std::size_t{s.heads} * s.hd;
+        std::vector<float> q(s.nq * w), k(s.nk * w), v(s.nk * w);
+        for (auto* x : {&q, &k, &v}) {
+            for (auto& f : *x) f = dist(rng);
+        }
+        std::vector<float> want(q.size()), got(q.size()), via(q.size());
+        locus::image::dense::attention(cpu, q, s.nq, k, v, s.nk, s.heads,
+                                       s.hd, want);
+        REQUIRE(locus::backend::metal::attention(q, s.nq, k, v, s.nk,
+                                                 s.heads, s.hd, got));
+        locus::image::dense::attention(locus::backend::metal::image_ops(), q,
+                                       s.nq, k, v, s.nk, s.heads, s.hd, via);
+        float worst = 0.0f;
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            worst = std::max(worst, std::abs(got[i] - want[i]));
+        }
+        CHECK(worst < 1e-4f);
+        CHECK(via == got);  // the image ops took the GPU path
+    }
+    // A head width the kernel does not take: false, the CPU runs it.
+    std::vector<float> q(12), k(12), v(12), out(12);
+    CHECK_FALSE(locus::backend::metal::attention(q, 1, k, v, 1, 1, 12, out));
+    CHECK_THROWS_AS(
+        locus::backend::metal::attention(q, 2, k, v, 1, 1, 8, out),
+        std::invalid_argument);
+}
+
+// i#1056: dense::attention's time on the CPU and on the Metal image ops,
+// the best of 3, at a vision tower's window (Qwen2.5-VL: 16 heads of 80,
+// 1024 patches) and a video DiT's token count (4096). Hidden: a
+// benchmark.
+TEST_CASE("bench: metal dense attention", "[.bench][metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    const auto& cpu = locus::backend::best_backend().ops;
+    const auto& gpu = locus::backend::metal::image_ops();
+    for (const std::uint32_t n : {1024u, 4096u}) {
+        const std::uint32_t heads = 16, hd = 80;
+        std::vector<float> q(std::size_t{n} * heads * hd), out(q.size());
+        std::mt19937 rng(1056);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto& f : q) f = dist(rng);
+        for (const auto* ops : {&cpu, &gpu}) {
+            locus::image::dense::attention(*ops, q, n, q, q, n, heads, hd,
+                                           out);  // warm-up
+            double best = 1e30;
+            for (int r = 0; r < 3; ++r) {
+                const auto t0 = std::chrono::steady_clock::now();
+                locus::image::dense::attention(*ops, q, n, q, q, n, heads, hd,
+                                               out);
+                best = std::min(best, std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() -
+                                          t0)
+                                          .count());
+            }
+            WARN(n << " tokens, " << (ops == &cpu ? "cpu " : "metal ")
+                   << best << " ms");
+        }
+    }
 }
 
 // i#1050: the Metal conv2d (implicit GEMM) against the CPU's, on the
