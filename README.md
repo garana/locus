@@ -342,7 +342,7 @@ measurements behind each choice: [docs/HOSTS.md](docs/HOSTS.md).
 | scalar  | portable reference, every weight type                                                    |
 | vulkan  | the whole forward pass on the GPU: matmuls, norms, RoPE, paged attention, MoE routing    |
 | cuda    | matvec and attention on the GPU (paged weight pool, KV cache copy); the rest on the CPU  |
-| metal   | Apple GPUs (#10): llama, qwen2 and MoE on the GPU, else CPU; image DiTs not served yet   |
+| metal   | Apple GPUs (#10): llama, qwen2, qwen3 and MoE on the GPU, else CPU; no image DiTs yet    |
 
 Without `--backend` or `LOCUS_BACKEND`, a Mac runs a model on metal
 when metal's whole-token forward takes it (and the KV cache is f32),
