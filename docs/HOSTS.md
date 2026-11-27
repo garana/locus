@@ -213,8 +213,8 @@ Qwen2.5's decode leaves its small matmuls' launch overhead bare.
   4 threads, and a CUDA build for sm_50), median of 3 runs. Decode
   follows the prompt "1, 2, 3, 4, 5,", on which every model decodes all
   127 tokens.
-- On the CPU, decode is at 0.89x to 0.98x of llama.cpp and prefill at
-  0.69x to 0.87x (#1198). Decode is bound by memory bandwidth: with 16
+- On the CPU (the "Against llama.cpp" table is the current ratio),
+  decode is bound by memory bandwidth: with 16
   GB (one module out) it ran 32% to 40% slower on both. The MoE rows
   have the 9.5 GB file in the page cache; a cold first prefill runs at
   8.5.
@@ -254,7 +254,8 @@ Automatic: `neon` (it uses its dotprod kernels on this CPU).
 Recommended: no flags; leave `--kv-type` at f32 and `--engines` at 1.
 
 Against llama.cpp (a956a85, CPU build, `-ngl 0`, 4 threads;
-2026-11-27, each run from under 60 C, not throttled), main 6e13558f,
+2026-11-27, started from under 60 C, 69 C at the end, not
+throttled), main 6e13558f,
 `--backend neon`. llama.cpp has no Vulkan build here. tok/s:
 
 | model                      | phase                   | CPU (neon) | llama.cpp CPU | share |
