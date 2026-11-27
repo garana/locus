@@ -214,10 +214,9 @@ Qwen2.5's decode leaves its small matmuls' launch overhead bare.
   follows the prompt "1, 2, 3, 4, 5,", on which every model decodes all
   127 tokens.
 - On the CPU (the "Against llama.cpp" table is the current ratio),
-  decode is bound by memory bandwidth: with 16
-  GB (one module out) it ran 32% to 40% slower on both. The MoE rows
-  have the 9.5 GB file in the page cache; a cold first prefill runs at
-  8.5.
+  decode is bound by memory bandwidth: with 16 GB (one module out) it
+  ran 32% to 40% slower on both. The MoE rows have the 9.5 GB file in
+  the page cache; a cold first prefill runs at 8.5.
 - On CUDA, prefill is at 0.71x to 0.80x of llama.cpp: chunks of 32
   tokens or more run as a cuBLAS GEMM (#1200; its rows on main
   c65a89b9 plus that change). Decode is at 0.88x on Q4_K_M, 1.04x on
