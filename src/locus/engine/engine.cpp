@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "locus/model/expert_metrics.hpp"
 #include "locus/model/speculative.hpp"
 
 namespace locus::engine {
@@ -15,12 +16,18 @@ namespace locus::engine {
 namespace {
 
 /** Runs one forward call `f` and records it in the step histograms
- *  (i#1220): its phase, the tokens it computed and its wall time. */
+ *  (i#1220): its phase, the tokens it computed and its wall time. The
+ *  call's expert runs see the phase (model::run_phase(), i#1219). */
 template <typename F>
 void timed_step(EngineMetrics& m, EngineMetrics::Phase p,
                 std::uint32_t tokens, F&& f) {
+    static_assert(static_cast<int>(EngineMetrics::Phase::kVerify) ==
+                  static_cast<int>(model::RunPhase::kVerify));
     const auto t0 = std::chrono::steady_clock::now();
-    f();
+    {
+        const model::RunPhaseScope scope(static_cast<model::RunPhase>(p));
+        f();
+    }
     m.observe_step(
         p, tokens,
         static_cast<std::uint64_t>(

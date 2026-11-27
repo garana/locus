@@ -144,6 +144,34 @@ void advise_willneed(const void* p, std::size_t n) {
                     n + (addr - base), MADV_WILLNEED);
 }
 
+std::uint64_t nonresident_bytes(const void* p, std::size_t n) {
+    if (p == nullptr || n == 0) {
+        return 0;
+    }
+    static const std::size_t page =
+        static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    const auto addr = reinterpret_cast<std::uintptr_t>(p);
+    const std::uintptr_t base = addr & ~(page - 1);
+    const std::size_t len = n + (addr - base);
+    const std::size_t pages = (len + page - 1) / page;
+    // macOS declares the vector char *, Linux unsigned char *. One
+    // buffer a thread, grown as needed (three calls a pick).
+#if defined(__APPLE__)
+    thread_local std::vector<char> vec;
+#else
+    thread_local std::vector<unsigned char> vec;
+#endif
+    if (vec.size() < pages) vec.resize(pages);
+    if (::mincore(reinterpret_cast<void*>(base), len, vec.data()) != 0) {
+        return 0;
+    }
+    std::uint64_t out = 0;
+    for (std::size_t i = 0; i < pages; ++i) {
+        if ((static_cast<unsigned char>(vec[i]) & 1u) == 0) out += page;
+    }
+    return out;
+}
+
 void advise_dontneed(const void* p, std::size_t n) {
     if (p == nullptr || n == 0) {
         return;

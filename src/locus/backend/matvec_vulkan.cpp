@@ -3620,10 +3620,13 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             // on the CPU). LOCUS_VK_HOST_EXPERTS=0 keeps the uploads.
             const bool cpu_experts = host_experts(s, m);
             for (const auto& [e, wgt] : picked) {
-                model::ExpertCalls::record(
-                    l, e, hp.n_layers, hp.n_expert, !cpu_experts,
-                    cpu_experts ? host_cpu_backend().name
-                                : vulkan_api_name());
+                const std::string_view api = cpu_experts
+                                                 ? host_cpu_backend().name
+                                                 : vulkan_api_name();
+                model::ExpertCalls::record(l, e, hp.n_layers, hp.n_expert,
+                                           !cpu_experts, api);
+                // Its bytes not in RAM, before it runs (i#1219).
+                m.record_expert_disk(l, e, !cpu_experts, api);
             }
             if (cpu_experts) {
                 const backend::Backend& cpu = host_cpu_backend();
@@ -3634,7 +3637,16 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                 const std::span<const float> xb(xb_host.data(), hp.n_embd);
                 // In moe_select order, x += wgt * d, as moe_ffn adds.
                 for (const auto& [e, wgt] : picked) {
+                    // One run of one token on the host CPU (i#1219).
+                    const auto t0 = std::chrono::steady_clock::now();
                     m.expert_out_on(cpu, l, e, xb, g, u, d);
+                    model::ExpertCalls::record_run(
+                        l, e, hp.n_layers, hp.n_expert, false, cpu.name, 1,
+                        static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count()));
                     for (std::uint32_t i = 0; i < hp.n_embd; ++i) {
                         x_host[i] += wgt * d[i];
                     }
