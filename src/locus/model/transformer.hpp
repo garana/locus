@@ -976,7 +976,7 @@ class TransformerModel {
                        std::span<float> logits, LogitRows rows_out) const;
 
     /** @returns 1 when the Metal forwards pair RoPE NEOX-style (qwen2's
-     *  and qwen3moe's attention), else 0. */
+     *  and Qwen3's attention: qwen3moe and dense qwen3), else 0. */
     std::uint32_t metal_neox() const;
 
     /**

@@ -365,7 +365,7 @@ struct MetalRec {
     MetalWeights& mw;
     const Hparams& hp;
     std::uint32_t hd;
-    /** RoPE's NEOX pairing (qwen2's and qwen3moe's attention). */
+    /** RoPE's NEOX pairing (qwen2's and Qwen3's attention). */
     std::uint32_t neox;
 
     /** @returns m's bytes on the device. */
@@ -766,8 +766,9 @@ std::string TransformerModel::metal_forward_why_not() const {
     }();
     // The plain llama attention, qwen2's (q / k / v biases, NEOX RoPE;
     // not qwen2vl's M-RoPE, whose text positions are not the
-    // sequence's), or qwen3moe's (per-head q / k norm, NEOX RoPE).
-    const bool qwen3 = spec_->name == "qwen3moe";
+    // sequence's), or Qwen3's (per-head q / k norm, NEOX RoPE): qwen3moe
+    // and dense qwen3 (Qwen3Guard, i#1218).
+    const bool qwen3 = spec_->name == "qwen3moe" || spec_->qwen3_attention;
     const std::string arch(spec_->name);
     if (off) return "LOCUS_METAL_FORWARD=0";
     if (backend_->name != "metal") return "the backend is not metal";
@@ -832,7 +833,7 @@ std::string TransformerModel::metal_forward_why_not() const {
             return "q / k / v biases outside qwen2's attention";
         }
         if (lay.has_qk_norm() && !qwen3) {
-            return "q / k norms outside qwen3moe's attention";
+            return "q / k norms outside Qwen3's attention";
         }
         if (!lay.post_attn_norm.empty() || !lay.post_ffw_norm.empty()) {
             return "post-attention or post-FFN norms";
@@ -851,7 +852,10 @@ bool TransformerModel::metal_forward_supported() const {
 }
 
 std::uint32_t TransformerModel::metal_neox() const {
-    return spec_->qwen2_attention || spec_->name == "qwen3moe" ? 1u : 0u;
+    return spec_->qwen2_attention || spec_->name == "qwen3moe" ||
+                   spec_->qwen3_attention
+               ? 1u
+               : 0u;
 }
 
 bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
