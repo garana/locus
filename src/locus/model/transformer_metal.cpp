@@ -655,7 +655,32 @@ struct BatchRec : MetalRec {
             std::uint32_t out_stride, bool acc, std::uint32_t m,
             std::uint64_t out_off = 0) const {
         const auto r = w(wt);
-        if (metal::record_matmul(ctx, wt.type, wt.rows, wt.cols, m, *r.buf,
+        // Up to 8 rows: the decode's columns kernel reads each weight
+        // block once for all of them, where the matmul computes a
+        // whole 32-token tile (i#1074; Q8_0, and Q6_K from 4 rows).
+        // LOCUS_METAL_PREFILL_COLS=0 keeps the matmul (tests, benches).
+        static const bool cols_on = [] {
+            const char* e = std::getenv("LOCUS_METAL_PREFILL_COLS");
+            return e == nullptr || std::string_view(e) != "0";
+        }();
+        if (cols_on && m <= 8 &&
+            metal::record_matvec_cols(ctx, wt.type, wt.rows, wt.cols, *r.buf,
+                                      r.off, in, 0, in_stride, out, out_off,
+                                      out_stride, m, acc, nullptr, 0.0f,
+                                      true)) {
+            return;
+        }
+        // Without a columns kernel (Q4_K), up to 3 rows run faster as a
+        // matvec each than as a 32-token tile (M4 Max, Llama 1B Q4_K_M:
+        // 3 tokens 14.1 to 9.1 ms; at 4 to 7 it is about level).
+        // LOCUS_METAL_PREFILL_MV_ROWS=N moves the cut (benches).
+        static const std::uint32_t mv_rows = [] {
+            const char* e = std::getenv("LOCUS_METAL_PREFILL_MV_ROWS");
+            return e != nullptr ? static_cast<std::uint32_t>(std::atoi(e))
+                                : 3u;
+        }();
+        if (!(cols_on && m <= mv_rows) &&
+            metal::record_matmul(ctx, wt.type, wt.rows, wt.cols, m, *r.buf,
                                  r.off, in, 0, in_stride, out, out_off,
                                  out_stride, acc)) {
             return;
