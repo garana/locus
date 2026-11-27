@@ -2089,7 +2089,9 @@ TEST_CASE("expert runs land under their forward call's phase",
     auto img = moe.build(4, 2);
     auto g = locus::gguf::GgufFile::parse(img);
     auto model = TransformerModel::load(g);
-    model.use_backend(locus::backend::backends().front());  // best CPU
+    // The best available CPU variant (backends() lists every one built,
+    // runnable here or not).
+    model.use_backend(locus::backend::best_backend());
     REQUIRE(model.supports_batch_prefill());
     ExpertCalls::reset();
     locus::engine::Engine engine(model, static_cast<locus::tok::TokenId>(-1),
