@@ -231,10 +231,12 @@ Qwen2.5's decode leaves its small matmuls' launch overhead bare.
 - Tests on this host run with the Vulkan drivers hidden
   (`VK_LOADER_DRIVERS_DISABLE='*'`): Vulkan compute on this card
   faulted (Xid 13) and froze the host twice.
-- `LOCUS_CPU_FAST=1` gained 1 to 7% on the dense rows (#1059), near the
-  noise: the default stays, as it reproduces the goldens. On the DiT
-  step it cuts the self attention (12.2 to 10.4 s, #1062) but not the
-  whole step (one run each).
+- What `LOCUS_CPU_FAST=1` used to switch on this host is the default
+  now: the polynomial-exp softmax and SiLU (#1251; prefill 1 to 2%
+  faster, and the DiT step's self attention 12.2 to 10.4 s, #1062) and
+  llama.cpp's AVX Q4_K / Q6_K rows for one token (#1252; Llama 3.2 1B
+  Q4_K_M decode 9% faster through `forward()`). The flag has nothing
+  left to switch here.
 - Vulkan on this card has 2 GB of device memory and no host import:
   an MoE whose experts do not fit routes on the host and runs the
   picked experts on the CPU (i#1174), the rest on the GPU. Qwen1.5-MoE
