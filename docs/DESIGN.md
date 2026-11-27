@@ -1101,8 +1101,9 @@ guarding the default path.
   one (`verify`), with its wall time; a phase not seen yet has no
   series. So a decode slowdown does not hide behind a prefill in the
   per-layer counters. The engine
-  writes them as relaxed atomics, a few clock reads per request and
-  two per step, plus one pass over the pool's blocks per step, and
+  writes them as relaxed atomics, a few clock reads per request, two
+  per step and two per forward call, plus one pass over the pool's
+  blocks per step, and
   `/metrics` reads them without the engine lock;
   decode speed is unchanged within noise. The HTTP layer adds, per
   route (the server's routes, anything else as `other`):
