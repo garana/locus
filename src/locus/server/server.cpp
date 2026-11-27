@@ -2495,6 +2495,39 @@ void OpenAiServer::install_routes() {
             mt.histogram("locus_request_seconds",
                          "Submit to done, per completed request.",
                          hist(&EM::request));
+            // Per forward call, by phase (i#1220); a phase with no
+            // observation yet has no series.
+            const auto step_hist =
+                [&](const char* name, const char* help,
+                    std::array<engine::Histogram, EM::kPhases>
+                        EM::*field) {
+                    bool head = false;
+                    for (std::size_t p = 0; p < EM::kPhases; ++p) {
+                        engine::Histogram::Snapshot s;
+                        for (std::size_t e = 0; e < loop_.size(); ++e) {
+                            s.add((loop_.metrics(e).*field)[p].snapshot());
+                        }
+                        if (s.count == 0) continue;
+                        if (!head) {
+                            mt.family(name, help, "histogram");
+                            head = true;
+                        }
+                        mt.histogram_series(
+                            name,
+                            MetricsText::label(
+                                "phase", EM::phase_name(
+                                             static_cast<EM::Phase>(p))),
+                            s);
+                    }
+                };
+            step_hist("locus_step_tokens",
+                      "Tokens computed per forward call, by phase "
+                      "(prefill chunk, decode of the running requests, "
+                      "speculative verify).",
+                      &EM::step_tokens);
+            step_hist("locus_step_seconds",
+                      "Wall time per forward call, by phase.",
+                      &EM::step_seconds);
             counter("locus_prefill_tokens_total",
                     "Prompt tokens computed (not reused) by completed "
                     "requests.",

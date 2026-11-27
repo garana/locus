@@ -1107,9 +1107,16 @@ guarding the default path.
   verify; 0 once the engine is idle) and `locus_kv_blocks_used{state}`: each block in use counted
   once, as held by a sequence still prefilling, else by one decoding,
   else only by the prefix cache, so the three and
-  `locus_kv_blocks_free` sum to `locus_kv_blocks_total`. The engine
-  writes them as relaxed atomics, a few clock reads per request and
-  two per step, plus one pass over the pool's blocks per step, and
+  `locus_kv_blocks_free` sum to `locus_kv_blocks_total`. Each forward
+  call adds one observation to `locus_step_tokens{phase}` and
+  `locus_step_seconds{phase}`: a prompt chunk's tokens (`prefill`),
+  the requests in a decode call (`decode`), or a verify's drafts plus
+  one (`verify`), with its wall time; a phase not seen yet has no
+  series. So a decode slowdown does not hide behind a prefill in the
+  per-layer counters. The engine
+  writes them as relaxed atomics, a few clock reads per request, two
+  per step and two per forward call, plus one pass over the pool's
+  blocks per step, and
   `/metrics` reads them without the engine lock;
   decode speed is unchanged within noise. The HTTP layer adds, per
   route (the server's routes, anything else as `other`):

@@ -282,6 +282,59 @@ TEST_CASE("engine reports step tokens and kv blocks by state",
             engine.total_blocks() - engine.free_blocks());
 }
 
+// i#1220: each forward call records its tokens and wall time under its
+// phase: a 40-token prompt as one prefill chunk (le="64", not le="32"),
+// each later token as a one-request decode (le="1"); no verify.
+TEST_CASE("engine records tokens and seconds per forward call by phase",
+          "[engine][metrics]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
+    }
+    using EM = locus::engine::EngineMetrics;
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    std::string text;
+    for (int i = 0; i < 8; ++i) {
+        text += "Once upon a time, there was a little girl. ";
+    }
+    auto prompt = tok.encode(text, true);
+    REQUIRE(prompt.size() > 40);
+    prompt.resize(40);
+    for (const bool batched : {true, false}) {
+        CAPTURE(batched);
+        Engine::Config cfg;
+        cfg.batched_decode = batched;  // step_batched() or step()
+        Engine engine(model, tok.eos_id(), cfg);
+        const auto id = engine.submit(prompt, 4);
+        engine.run_to_completion();
+        REQUIRE(engine.get(id)->status == Status::kDone);
+        const auto& m = engine.metrics();
+        const auto tokens = [&](EM::Phase p) {
+            return m.step_tokens[static_cast<std::size_t>(p)].snapshot();
+        };
+        const auto secs = [&](EM::Phase p) {
+            return m.step_seconds[static_cast<std::size_t>(p)].snapshot();
+        };
+        // Bounds 1, 2, 4, ..., 2048: le="32" is index 5, le="64" 6.
+        const auto pre = tokens(EM::Phase::kPrefill);
+        REQUIRE(pre.count == 1);
+        REQUIRE(pre.sum == 40);
+        REQUIRE(pre.cumulative[5] == 0);
+        REQUIRE(pre.cumulative[6] == 1);
+        // The first token comes from the prompt's logits: 3 decodes.
+        const auto dec = tokens(EM::Phase::kDecode);
+        REQUIRE(dec.count == 3);
+        REQUIRE(dec.sum == 3);
+        REQUIRE(dec.cumulative[0] == 3);  // le="1"
+        // The seconds count every call of their phase.
+        REQUIRE(secs(EM::Phase::kPrefill).count == 1);
+        REQUIRE(secs(EM::Phase::kDecode).count == 3);
+        REQUIRE(secs(EM::Phase::kDecode).sum > 0);
+        REQUIRE(tokens(EM::Phase::kVerify).count == 0);
+    }
+}
+
 // i#617: a short prompt behind a long one goes first (the shortest
 // remainder does), so it reaches its first token in one or two steps,
 // not after the whole long prefill; while it decodes, the long prompt
@@ -443,6 +496,15 @@ TEST_CASE("speculative decoding matches greedy output",
             verifies += n;
         }
         REQUIRE(verifies == engine.spec_steps());
+        // i#1220: one verify-phase observation a verify, of its drafts
+        // plus the pending token (at least 2).
+        const auto& vt = engine.metrics()
+                             .step_tokens[static_cast<std::size_t>(
+                                 locus::engine::EngineMetrics::Phase::
+                                     kVerify)]
+                             .snapshot();
+        REQUIRE(vt.count == engine.spec_steps());
+        REQUIRE(vt.cumulative[0] == 0);  // le="1": none
     }
 }
 

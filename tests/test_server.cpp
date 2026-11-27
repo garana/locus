@@ -2510,6 +2510,25 @@ TEST_CASE("metrics carry labels and timings in well-formed histograms",
         REQUIRE(b.find(std::string("\n") + h + "_sum{") != std::string::npos);
     }
 
+    // Per forward call by phase (i#1220): both prompts' prefill and the
+    // decodes after them, each phase one series set; no speculative
+    // decoding, so no verify series.
+    for (const char* h : {"locus_step_tokens", "locus_step_seconds"}) {
+        INFO(h);
+        REQUIRE(b.find(std::string("# TYPE ") + h + " histogram\n") !=
+                std::string::npos);
+        for (const char* phase : {"prefill", "decode"}) {
+            INFO(phase);
+            const std::string count = std::string("\n") + h + "_count{" +
+                                      labels + ",phase=\"" + phase + "\"} ";
+            const std::size_t p = b.find(count);
+            REQUIRE(p != std::string::npos);
+            REQUIRE(std::atol(b.c_str() + p + count.size()) >= 2);
+        }
+        REQUIRE(b.find(std::string(h) + "_count{" + labels +
+                       ",phase=\"verify\"}") == std::string::npos);
+    }
+
     // The HTTP layer's per-route series (i#285): both completions as
     // 200s with their body sizes, and this /metrics request in flight.
     const auto series = [&](const std::string& name,
