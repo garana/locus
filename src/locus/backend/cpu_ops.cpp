@@ -2266,46 +2266,25 @@ float unpack_block32(gguf::TensorType type, const std::byte* row,
 
 /**
  * dot(block-32 weight row, Q8_0 activation), in the order of ggml's
- * non-repacked NEON vec_dot_q8_0_q8_0: two blocks per step, each
- * folding its int sums into four float lanes (lane l holds quants
- * 4l..4l+3 of both halves); a pairwise lane reduction; then a scalar
- * tail for an odd last block. Q4_0 and IQ4_NL weights reuse it; ggml's
- * own kernels for those group the scale products differently (and its
- * repacked kernels have orders of their own), so they match llama.cpp
- * to rounding, not bit for bit.
+ * repacked kernels (ggml_gemm_q8_0_4x4_q8_0, i#1076): per block, the
+ * exact int dot of its 32 quants, then sum = sum + dot * (w_d * x_d),
+ * one rounded multiply and one rounded add, blocks in order. A row's
+ * work is then one int per block, so SIMD kernels can take several
+ * rows (or tokens) in one vector and still give these bits. Q4_0,
+ * Q5_0 and IQ4_NL weights reuse it.
  */
 float vec_dot_block32_q8_0(gguf::TensorType type, const std::byte* row,
                            const BlockQ8_0Act* xq, std::size_t nb) {
-    float s0[4] = {}, s1[4] = {};
-    std::int8_t q0[32], q1[32];
-    std::size_t b = 0;
-    auto lanes = [](const std::int8_t* q, const std::int8_t* x, int l) {
-        int p = 0;
-        for (int k = 0; k < 4; ++k) {
-            p += q[4 * l + k] * x[4 * l + k] + q[16 + 4 * l + k] * x[16 + 4 * l + k];
-        }
-        return p;
-    };
-    for (; b + 1 < nb; b += 2) {
-        const float d0 = unpack_block32(type, row, b, q0) * xq[b].d;
-        const float d1 = unpack_block32(type, row, b + 1, q1) * xq[b + 1].d;
-        for (int l = 0; l < 4; ++l) {
-            const float m0 = static_cast<float>(lanes(q0, xq[b].qs, l)) * d0;
-            s0[l] = s0[l] + m0;
-            const float m1 =
-                static_cast<float>(lanes(q1, xq[b + 1].qs, l)) * d1;
-            s1[l] = s1[l] + m1;
-        }
-    }
-    float sum = ((s0[0] + s0[1]) + (s0[2] + s0[3])) +
-                ((s1[0] + s1[1]) + (s1[2] + s1[3]));
-    for (; b < nb; ++b) {
-        const float d = unpack_block32(type, row, b, q0) * xq[b].d;
+    float sum = 0.0f;
+    std::int8_t q[32];
+    for (std::size_t b = 0; b < nb; ++b) {
+        const float d = unpack_block32(type, row, b, q) * xq[b].d;
         int p = 0;
         for (int j = 0; j < 32; ++j) {
-            p += q0[j] * xq[b].qs[j];
+            p += q[j] * xq[b].qs[j];
         }
-        sum += static_cast<float>(p) * d;
+        const float m = static_cast<float>(p) * d;
+        sum = sum + m;
     }
     return sum;
 }

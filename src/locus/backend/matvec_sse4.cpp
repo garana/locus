@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 #include "iq_grids.h"
@@ -1032,8 +1033,8 @@ __m128i block32_lanes_sse4(const std::int8_t* q, const std::int8_t* x) {
 /**
  * One row of 32-weight blocks (an f16 scale first, kBlk bytes each)
  * dotted with a Q8_0-quantized activation, in the float order of scalar
- * vec_dot_block32_q8_0: two blocks per step, four float lanes each, the
- * pairwise lane reduction, then a scalar tail block.
+ * vec_dot_block32_q8_0 (i#1076): per block the exact int dot, then
+ * sum = sum + dot * (w_d * x_d), a multiply then an add.
  *
  * @param lanes `lanes(blk, x)` gives one block's four int32 lane sums
  *     against the activation's 32 int8 at x.
@@ -1042,47 +1043,13 @@ template <std::size_t kBlk, class Lanes>
 float row_block32_q8_0_sse4(const std::byte* row, const float* xd,
                             const std::int8_t* xq, std::size_t nb,
                             const Lanes& lanes) {
-    __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
-    std::size_t b = 0;
-#if defined(LOCUS_SSE4_AVX_VARIANT)
-    // Block b in lanes 0-3 and b + 1 in 4-7 of one 256-bit sum: the same
-    // adds as s0 and s1 below.
-    __m256 s8 = _mm256_setzero_ps();
-    for (; b + 1 < nb; b += 2) {
-        const std::byte* b0 = row + b * kBlk;
-        const std::byte* b1 = b0 + kBlk;
-        const __m256 d = _mm256_set_m128(
-            _mm_set1_ps(f16_to_f32(load_u16(b1)) * xd[b + 1]),
-            _mm_set1_ps(f16_to_f32(load_u16(b0)) * xd[b]));
-        const __m256i p = _mm256_set_m128i(lanes(b1, xq + (b + 1) * 32),
-                                           lanes(b0, xq + b * 32));
-        s8 = _mm256_add_ps(s8, _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
-    }
-    s0 = _mm256_castps256_ps128(s8);
-    s1 = _mm256_extractf128_ps(s8, 1);
-#else
-    for (; b + 1 < nb; b += 2) {
-        const std::byte* b0 = row + b * kBlk;
-        const std::byte* b1 = b0 + kBlk;
-        const float d0 = f16_to_f32(load_u16(b0)) * xd[b];
-        const float d1 = f16_to_f32(load_u16(b1)) * xd[b + 1];
-        const __m128i p0 = lanes(b0, xq + b * 32);
-        const __m128i p1 = lanes(b1, xq + (b + 1) * 32);
-        s0 = _mm_add_ps(s0, _mm_mul_ps(_mm_cvtepi32_ps(p0), _mm_set1_ps(d0)));
-        s1 = _mm_add_ps(s1, _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
-    }
-#endif
-    alignas(16) float l0[4], l1[4];
-    _mm_store_ps(l0, s0);
-    _mm_store_ps(l1, s1);
-    float sum = ((l0[0] + l0[1]) + (l0[2] + l0[3])) +
-                ((l1[0] + l1[1]) + (l1[2] + l1[3]));
-    for (; b < nb; ++b) {
+    float sum = 0.0f;
+    for (std::size_t b = 0; b < nb; ++b) {
         const std::byte* blk = row + b * kBlk;
         const float d = f16_to_f32(load_u16(blk)) * xd[b];
-        alignas(16) std::int32_t p[4];
-        _mm_store_si128(reinterpret_cast<__m128i*>(p), lanes(blk, xq + b * 32));
-        sum += static_cast<float>(p[0] + p[1] + p[2] + p[3]) * d;
+        const int p = hsum_epi32_sse4(lanes(blk, xq + b * 32));
+        const float m = static_cast<float>(p) * d;
+        sum = sum + m;
     }
     return sum;
 }
@@ -1187,11 +1154,159 @@ float row_q5_0_q8_0_sse4(const std::byte* row, const float* xd,
     return row_block32_q8_0_sse4<22>(row, xd, xq, nb, lanes);
 }
 
+/** One block-32 block's 32 int8 weights in two vectors, and their
+ *  absolute values (lanes16_sse4 takes both). */
+struct Blk32 {
+    __m128i q[2], abs_q[2];
+};
+
+/** @returns The block's four int32 lane sums against 32 int8 at x, as
+ *  block32_lanes_sse4 gives them. */
+inline __m128i blk32_lanes(const Blk32& w, const std::int8_t* x) {
+    const __m128i xa = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x));
+    const __m128i xb =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + 16));
+    return _mm_add_epi32(lanes16_sse4(w.abs_q[0], w.q[0], xa),
+                         lanes16_sse4(w.abs_q[1], w.q[1], xb));
+}
+
+/** @returns Blk32 of two weight vectors. */
+inline Blk32 blk32_of(__m128i a, __m128i b) {
+    return Blk32{{a, b}, {_mm_abs_epi8(a), _mm_abs_epi8(b)}};
+}
+
+/** Q8_0 (34 B blocks): the int8 weights after the f16 scale. */
+struct DecQ8_0 {
+    static constexpr std::size_t kBlk = 34;
+    Blk32 operator()(const std::byte* blk) const {
+        const auto* q = reinterpret_cast<const __m128i*>(blk + 2);
+        return blk32_of(_mm_loadu_si128(q), _mm_loadu_si128(q + 1));
+    }
+};
+
+/** Q4_0 and IQ4_NL (18 B blocks), as row_nibble32_q8_0_sse4 decodes. */
+struct DecNib32 {
+    static constexpr std::size_t kBlk = 18;
+    bool iq4nl;
+    Blk32 operator()(const std::byte* blk) const {
+        const __m128i lo4 = _mm_set1_epi8(0x0f);
+        const __m128i b =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
+        __m128i w0 = _mm_and_si128(b, lo4);
+        __m128i w1 = _mm_and_si128(_mm_srli_epi16(b, 4), lo4);
+        if (iq4nl) {
+            const __m128i table = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+            w0 = _mm_shuffle_epi8(table, w0);
+            w1 = _mm_shuffle_epi8(table, w1);
+        } else {
+            const __m128i eight = _mm_set1_epi8(8);
+            w0 = _mm_sub_epi8(w0, eight);
+            w1 = _mm_sub_epi8(w1, eight);
+        }
+        return blk32_of(w0, w1);
+    }
+};
+
+/** Q5_0 (22 B blocks), as row_q5_0_q8_0_sse4 decodes. */
+struct DecQ5_0 {
+    static constexpr std::size_t kBlk = 22;
+    Blk32 operator()(const std::byte* blk) const {
+        const __m128i lo4 = _mm_set1_epi8(0x0f);
+        const __m128i sixteen = _mm_set1_epi8(16);
+        const __m128i bit10 = _mm_set1_epi8(0x10);
+        const __m128i bits = _mm_set_epi8(
+            static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02,
+            0x01, static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04,
+            0x02, 0x01);
+        const __m128i rep_lo =
+            _mm_set_epi8(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+        const __m128i rep_hi =
+            _mm_set_epi8(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2);
+        std::uint32_t qh;
+        std::memcpy(&qh, blk + 2, 4);
+        const __m128i h = _mm_cvtsi32_si128(static_cast<int>(qh));
+        const auto high = [&](const __m128i rep) {
+            const __m128i v = _mm_and_si128(_mm_shuffle_epi8(h, rep), bits);
+            return _mm_and_si128(_mm_cmpeq_epi8(v, bits), bit10);
+        };
+        const __m128i b =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 6));
+        const __m128i w0 = _mm_sub_epi8(
+            _mm_or_si128(_mm_and_si128(b, lo4), high(rep_lo)), sixteen);
+        const __m128i w1 = _mm_sub_epi8(
+            _mm_or_si128(_mm_and_si128(_mm_srli_epi16(b, 4), lo4),
+                         high(rep_hi)),
+            sixteen);
+        return blk32_of(w0, w1);
+    }
+};
+
+/**
+ * Four rows of block-32 weights (row r at row0 + r * row_bytes) dotted
+ * with one Q8_0 activation: per block, the four rows' exact int dots in
+ * one vector (an hadd tree of the lane sums), then lane r does row r's
+ * multiply and add, d = w_d * x_d as the one-row kernels take it. So
+ * out[r] is the bits row_block32_q8_0_sse4 gives, without its serial
+ * scalar chain.
+ */
+template <class Dec>
+void rows4_block32_sse4(const std::byte* row0, std::size_t row_bytes,
+                        const float* xd, const std::int8_t* xq,
+                        std::size_t nb, const Dec& dec, float* out) {
+    constexpr std::size_t kBlk = Dec::kBlk;
+    __m128 sum = _mm_setzero_ps();
+    for (std::size_t b = 0; b < nb; ++b) {
+        const std::byte* b0 = row0 + b * kBlk;
+        const std::byte* b1 = b0 + row_bytes;
+        const std::byte* b2 = b1 + row_bytes;
+        const std::byte* b3 = b2 + row_bytes;
+        const std::int8_t* x = xq + b * 32;
+        const __m128i p = _mm_hadd_epi32(
+            _mm_hadd_epi32(blk32_lanes(dec(b0), x), blk32_lanes(dec(b1), x)),
+            _mm_hadd_epi32(blk32_lanes(dec(b2), x), blk32_lanes(dec(b3), x)));
+        const float xs = xd[b];
+        const __m128 d = _mm_set_ps(
+            f16_to_f32(load_u16(b3)) * xs, f16_to_f32(load_u16(b2)) * xs,
+            f16_to_f32(load_u16(b1)) * xs, f16_to_f32(load_u16(b0)) * xs);
+        sum = _mm_add_ps(sum, _mm_mul_ps(_mm_cvtepi32_ps(p), d));
+    }
+    _mm_storeu_ps(out, sum);
+}
+
+/**
+ * One row of block-32 weights dotted with four tokens' Q8_0 activations
+ * (row_q8_0_q8_0_sse4_xt<4> for any block-32 type): each block decoded
+ * once, the four tokens' exact dots in one vector, then lane t does
+ * token t's multiply and add. out[t] has the one-row kernel's bits.
+ */
+template <class Dec>
+void row_block32_xt4_sse4(const std::byte* row, const float* const* xd,
+                          const std::int8_t* const* xq, std::size_t nb,
+                          const Dec& dec, float* out) {
+    constexpr std::size_t kBlk = Dec::kBlk;
+    __m128 sum = _mm_setzero_ps();
+    for (std::size_t b = 0; b < nb; ++b) {
+        const std::byte* blk = row + b * kBlk;
+        const float w = f16_to_f32(load_u16(blk));
+        const Blk32 v = dec(blk);
+        const __m128i p = _mm_hadd_epi32(
+            _mm_hadd_epi32(blk32_lanes(v, xq[0] + b * 32),
+                           blk32_lanes(v, xq[1] + b * 32)),
+            _mm_hadd_epi32(blk32_lanes(v, xq[2] + b * 32),
+                           blk32_lanes(v, xq[3] + b * 32)));
+        const __m128 d = _mm_set_ps(w * xd[3][b], w * xd[2][b], w * xd[1][b],
+                                    w * xd[0][b]);
+        sum = _mm_add_ps(sum, _mm_mul_ps(_mm_cvtepi32_ps(p), d));
+    }
+    _mm_storeu_ps(out, sum);
+}
+
 /**
  * row_q8_0_q8_0_sse4 for kT tokens: each weight block and its absolute
- * values are loaded once and dotted with every token's quants; each token's
- * float lanes and reduction keep the one-token order, so out[t] is the
- * bits row_q8_0_q8_0_sse4 gives for token t.
+ * values are loaded once and dotted with every token's quants; each
+ * token's exact block dot and float steps keep the one-token order, so
+ * out[t] is the bits row_q8_0_q8_0_sse4 gives for token t.
  */
 template <int kT>
 void row_q8_0_q8_0_sse4_xt(const std::byte* row, const float* const* xd,
@@ -1217,72 +1332,44 @@ void row_q8_0_q8_0_sse4_xt(const std::byte* row, const float* const* xd,
         return _mm_add_epi32(lanes16_sse4(w.abs_q[0], w.q[0], xa),
                              lanes16_sse4(w.abs_q[1], w.q[1], xb));
     };
-    __m128 s0[kT], s1[kT];
-    std::size_t b = 0;
-#if defined(LOCUS_SSE4_AVX_VARIANT)
-    // One 256-bit sum per token: block b in lanes 0-3 and b + 1 in lanes
-    // 4-7, the same adds as s0 and s1 below, so the same bits.
-    __m256 s8[kT];
-    for (int t = 0; t < kT; ++t) {
-        s8[t] = _mm256_setzero_ps();
-    }
-    for (; b + 1 < nb; b += 2) {
-        const std::byte* b0 = row + b * kBlk;
-        const std::byte* b1 = b0 + kBlk;
-        const float w0 = f16_to_f32(load_u16(b0));
-        const float w1 = f16_to_f32(load_u16(b1));
-        const W16 v0 = widen(b0), v1 = widen(b1);
+    if constexpr (kT == 4) {
+        // The four tokens' exact block dots in one vector (hadd of the
+        // lane sums), then lane t does token t's float steps: the same
+        // multiply and add as the one-token loop, so the same bits.
+        __m128 sum = _mm_setzero_ps();
+        for (std::size_t b = 0; b < nb; ++b) {
+            const std::byte* blk = row + b * kBlk;
+            const float w = f16_to_f32(load_u16(blk));
+            const W16 v = widen(blk);
+            const __m128i p = _mm_hadd_epi32(
+                _mm_hadd_epi32(lanes(v, xq[0] + b * 32),
+                               lanes(v, xq[1] + b * 32)),
+                _mm_hadd_epi32(lanes(v, xq[2] + b * 32),
+                               lanes(v, xq[3] + b * 32)));
+            const __m128 d = _mm_set_ps(w * xd[3][b], w * xd[2][b],
+                                        w * xd[1][b], w * xd[0][b]);
+            sum = _mm_add_ps(sum, _mm_mul_ps(_mm_cvtepi32_ps(p), d));
+        }
+        _mm_storeu_ps(out, sum);
+    } else {
+        float sum[kT];
         for (int t = 0; t < kT; ++t) {
-            const __m256 d = _mm256_set_m128(_mm_set1_ps(w1 * xd[t][b + 1]),
-                                             _mm_set1_ps(w0 * xd[t][b]));
-            const __m256i p = _mm256_set_m128i(
-                lanes(v1, xq[t] + (b + 1) * 32), lanes(v0, xq[t] + b * 32));
-            s8[t] = _mm256_add_ps(s8[t],
-                                  _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
+            sum[t] = 0.0f;
         }
-    }
-    for (int t = 0; t < kT; ++t) {
-        s0[t] = _mm256_castps256_ps128(s8[t]);
-        s1[t] = _mm256_extractf128_ps(s8[t], 1);
-    }
-#else
-    for (int t = 0; t < kT; ++t) {
-        s0[t] = _mm_setzero_ps();
-        s1[t] = _mm_setzero_ps();
-    }
-    for (; b + 1 < nb; b += 2) {
-        const std::byte* b0 = row + b * kBlk;
-        const std::byte* b1 = b0 + kBlk;
-        const float w0 = f16_to_f32(load_u16(b0));
-        const float w1 = f16_to_f32(load_u16(b1));
-        const W16 v0 = widen(b0), v1 = widen(b1);
+        for (std::size_t b = 0; b < nb; ++b) {
+            const std::byte* blk = row + b * kBlk;
+            const float w = f16_to_f32(load_u16(blk));
+            const W16 v = widen(blk);
+            for (int t = 0; t < kT; ++t) {
+                const float d = w * xd[t][b];
+                const int p = hsum_epi32_sse4(lanes(v, xq[t] + b * 32));
+                const float m = static_cast<float>(p) * d;
+                sum[t] = sum[t] + m;
+            }
+        }
         for (int t = 0; t < kT; ++t) {
-            const float d0 = w0 * xd[t][b];
-            const float d1 = w1 * xd[t][b + 1];
-            const __m128i p0 = lanes(v0, xq[t] + b * 32);
-            const __m128i p1 = lanes(v1, xq[t] + (b + 1) * 32);
-            s0[t] = _mm_add_ps(
-                s0[t], _mm_mul_ps(_mm_cvtepi32_ps(p0), _mm_set1_ps(d0)));
-            s1[t] = _mm_add_ps(
-                s1[t], _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
+            out[t] = sum[t];
         }
-    }
-#endif
-    for (int t = 0; t < kT; ++t) {
-        alignas(16) float l0[4], l1[4];
-        _mm_store_ps(l0, s0[t]);
-        _mm_store_ps(l1, s1[t]);
-        float sum = ((l0[0] + l0[1]) + (l0[2] + l0[3])) +
-                    ((l1[0] + l1[1]) + (l1[2] + l1[3]));
-        for (std::size_t bt = b; bt < nb; ++bt) {
-            const std::byte* blk = row + bt * kBlk;
-            const float d = f16_to_f32(load_u16(blk)) * xd[t][bt];
-            alignas(16) std::int32_t p[4];
-            _mm_store_si128(reinterpret_cast<__m128i*>(p),
-                            lanes(widen(blk), xq[t] + bt * 32));
-            sum += static_cast<float>(p[0] + p[1] + p[2] + p[3]) * d;
-        }
-        out[t] = sum;
     }
 }
 
@@ -2472,16 +2559,31 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
         std::vector<std::int8_t> xq(cols);
         quantize_activation_q8_0(x, xd.data(), xq.data());
         const bool iq4nl = w.type == gguf::TensorType::kIQ4_NL;
-        for (std::uint32_t r = 0; r < w.rows; ++r) {
-            out[r] = path == Q8Path::kBlock32
-                         ? row_q8_0_q8_0_sse4(w.data + r * nb * 34,
-                                              xd.data(), xq.data(), nb)
-                     : path == Q8Path::kBlock32Q5
-                         ? row_q5_0_q8_0_sse4(w.data + r * nb * 22,
-                                              xd.data(), xq.data(), nb)
-                         : row_nibble32_q8_0_sse4(iq4nl,
-                                                  w.data + r * nb * 18,
-                                                  xd.data(), xq.data(), nb);
+        // Four rows a step (rows4_block32_sse4), the last 0 to 3 alone.
+        const auto rows = [&](const auto& dec, const auto& one) {
+            const std::size_t rb = nb * std::decay_t<decltype(dec)>::kBlk;
+            std::uint32_t r = 0;
+            for (; r + 4 <= w.rows; r += 4) {
+                rows4_block32_sse4(w.data + r * rb, rb, xd.data(), xq.data(),
+                                   nb, dec, out.data() + r);
+            }
+            for (; r < w.rows; ++r) {
+                out[r] = one(w.data + r * rb);
+            }
+        };
+        if (path == Q8Path::kBlock32) {
+            rows(DecQ8_0{}, [&](const std::byte* row) {
+                return row_q8_0_q8_0_sse4(row, xd.data(), xq.data(), nb);
+            });
+        } else if (path == Q8Path::kBlock32Q5) {
+            rows(DecQ5_0{}, [&](const std::byte* row) {
+                return row_q5_0_q8_0_sse4(row, xd.data(), xq.data(), nb);
+            });
+        } else {
+            rows(DecNib32{iq4nl}, [&](const std::byte* row) {
+                return row_nibble32_q8_0_sse4(iq4nl, row, xd.data(),
+                                              xq.data(), nb);
+            });
         }
         return;
     }
@@ -2539,9 +2641,9 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
         std::max<std::size_t>(1, (std::size_t{96} << 10) / cols));
     const std::size_t row_bytes = mat_row_bytes(w);
     if (path == Q8Path::kBlock32Nib || path == Q8Path::kBlock32Q5) {
-        // Q4_0 / IQ4_NL / Q5_0: each token quantized once, then the
-        // per-token row kernel over a tile of tokens while the row is in
-        // cache.
+        // Q4_0 / IQ4_NL / Q5_0: each token quantized once, then each
+        // row over a tile of tokens while it is in cache, four tokens a
+        // decoded block (row_block32_xt4_sse4), the rest one by one.
         const bool q5 = path == Q8Path::kBlock32Q5;
         const std::size_t nb = cols / 32;
         thread_local std::vector<float> xd;
@@ -2558,7 +2660,23 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
             for (std::uint32_t r = 0; r < w.rows; ++r) {
                 const std::byte* row = w.data + r * row_bytes;
                 float* o = out_batch.data() + std::size_t{r} * n;
-                for (std::uint32_t t = t0; t < t1; ++t) {
+                std::uint32_t t = t0;
+                for (; t + 4 <= t1; t += 4) {
+                    const float* d4[4];
+                    const std::int8_t* q4[4];
+                    for (int k = 0; k < 4; ++k) {
+                        d4[k] = xd.data() + (t + k) * nb;
+                        q4[k] = xq.data() + (t + k) * cols;
+                    }
+                    if (q5) {
+                        row_block32_xt4_sse4(row, d4, q4, nb, DecQ5_0{},
+                                             o + t);
+                    } else {
+                        row_block32_xt4_sse4(row, d4, q4, nb,
+                                             DecNib32{iq4nl}, o + t);
+                    }
+                }
+                for (; t < t1; ++t) {
                     o[t] = q5 ? row_q5_0_q8_0_sse4(row, xd.data() + t * nb,
                                                    xq.data() + t * cols, nb)
                               : row_nibble32_q8_0_sse4(iq4nl, row,

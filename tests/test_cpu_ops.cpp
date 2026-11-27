@@ -939,7 +939,8 @@ TEST_CASE("sse4_avx kernels give the sse4 bits", "[ops][batch][sse4]") {
     if (!locus::sys::detect().avx) {
         SKIP("CPU lacks AVX");
     }
-    constexpr std::uint32_t rows = 3;
+    // 7 rows: the block-32 kernels' four-row step and a 3-row tail.
+    constexpr std::uint32_t rows = 7;
     std::mt19937 rng(706);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
     const auto check = [&](const Mat& m, std::uint32_t n) {
@@ -1072,7 +1073,8 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
     if (!locus::sys::detect().sse4) {
         SKIP("CPU lacks SSE4.1");
     }
-    constexpr std::uint32_t rows = 3;
+    // 7 rows: the block-32 kernels' four-row step and a 3-row tail.
+    constexpr std::uint32_t rows = 7;
     std::mt19937 rng(211);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
     const auto check = [&](const Mat& m, std::uint32_t n) {
@@ -1924,6 +1926,13 @@ TEST_CASE("neon dotprod fast Q8_0 follows llama.cpp's order alone and "
         quantize_activation_q8_0(xt, xd.data(), xq.data());
         std::vector<float> one(rows);
         neon_dotprod_fast::matvec_neon_q8k(m, xt, one);
+        // i#1076: the baseline one-row kernel and the scalar reference
+        // take the same order, so all three agree bit for bit.
+        std::vector<float> base(rows), scal(rows);
+        matvec_neon_q8k(m, xt, base);
+        matvec_q8k(m, xt, scal);
+        REQUIRE(base == one);
+        REQUIRE(scal == one);
         for (std::uint32_t r = 0; r < rows; ++r) {
             float sum = 0.0f;
             for (std::size_t b = 0; b < nb; ++b) {

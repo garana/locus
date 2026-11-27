@@ -149,14 +149,16 @@ features are opt-in per request. A request whose client disconnects
 is cancelled. On the CPU, quantized weights use 8-bit activations
 where the backend's int8 dot is the fast path (neon, sse4, scalar),
 as llama.cpp does; `LOCUS_F32_ACTIVATIONS=1` selects f32 activations.
+Block-32 weights (Q8_0, Q4_0, Q5_0, IQ4_NL) take llama.cpp's repacked
+float order on every CPU kernel (per block an exact integer dot, then
+one multiply and one add), so on ARM CPUs with dotprod a Q8_0 prefill
+dots four interleaved weight rows per `sdot` lane, with the bits of
+the one-token kernel.
 `LOCUS_CPU_FAST=1` opts in to CPU kernels with a different float order
 (today every CPU softmax: attention, including the image and video
 models', MoE routing and the image encoders, about 2x faster; and on
 ARM CPUs with i8mm, such as the M2 and later, Q8_0 weights through
-`smmla`, about 27% faster prefill on an M2 Pro; on ARM CPUs with
-dotprod but no i8mm, such as the Raspberry Pi 5, Q8_0 weights by `sdot`
-lane on four interleaved rows, in the `smmla` path's float order, about
-51% faster prefill and 10% slower decode on Qwen2.5 0.5B; on Apple, prefill
+`smmla`, about 27% faster prefill on an M2 Pro; on Apple, prefill
 matmuls of 32 tokens or more through Accelerate's `cblas_sgemm` in
 2048-token chunks, about 26% faster on a 1680-token prompt on an M2
 Pro; on x86 CPUs with AVX but not AVX2, one-token Q4_K and Q6_K rows

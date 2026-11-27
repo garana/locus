@@ -539,34 +539,21 @@ inline int32x4_t lanes32(int8x16_t qlo, int8x16_t qhi, const std::int8_t* x) {
 
 /**
  * dot(block-32 weight row, Q8_0 activation), bit-identical to the
- * scalar vec_dot_block32_q8_0 (ggml's non-repacked NEON
- * vec_dot_q8_0_q8_0 order): two blocks per step into four float lanes
- * each (a mul, then an add), the pairwise lane reduction, a scalar
- * tail for an odd last block.
+ * scalar vec_dot_block32_q8_0 (ggml's repacked order, i#1076): per
+ * block the exact int dot of its 32 quants, then
+ * sum = sum + dot * (w_d * x_d), a multiply then an add.
  */
 float row_block32_q8_0_neon(gguf::TensorType type, const std::byte* row,
                             std::size_t bb, std::size_t nb, const float* yd,
                             const std::int8_t* yq) {
-    float32x4_t s0 = vdupq_n_f32(0.0f), s1 = vdupq_n_f32(0.0f);
-    std::size_t b = 0;
+    float sum = 0.0f;
     int8x16_t lo, hi;
-    for (; b + 1 < nb; b += 2) {
-        const float d0 = unpack_block32_neon(type, row + b * bb, lo, hi) *
-                         yd[b];
-        const int32x4_t p0 = lanes32(lo, hi, yq + b * 32);
-        const float d1 =
-            unpack_block32_neon(type, row + (b + 1) * bb, lo, hi) *
-            yd[b + 1];
-        const int32x4_t p1 = lanes32(lo, hi, yq + (b + 1) * 32);
-        s0 = vaddq_f32(s0, vmulq_n_f32(vcvtq_f32_s32(p0), d0));
-        s1 = vaddq_f32(s1, vmulq_n_f32(vcvtq_f32_s32(p1), d1));
-    }
-    float sum = vaddvq_f32(s0) + vaddvq_f32(s1);
-    for (; b < nb; ++b) {
+    for (std::size_t b = 0; b < nb; ++b) {
         const float d =
             unpack_block32_neon(type, row + b * bb, lo, hi) * yd[b];
         const int p = vaddvq_s32(lanes32(lo, hi, yq + b * 32));
-        sum += static_cast<float>(p) * d;
+        const float m = static_cast<float>(p) * d;
+        sum = sum + m;
     }
     return sum;
 }
@@ -574,47 +561,31 @@ float row_block32_q8_0_neon(gguf::TensorType type, const std::byte* row,
 
 /**
  * row_block32_q8_0_neon for T tokens: each weight block is unpacked
- * once and dotted against every token, each token with its own lanes
- * and float steps in the same order, so out[t] is bit-identical to
- * row_block32_q8_0_neon on token t (scales at yd + t * nb, quants at
- * yq + t * qs).
+ * once and dotted against every token, each token with its own exact
+ * int dot and float steps in the same order, so out[t] is
+ * bit-identical to row_block32_q8_0_neon on token t (scales at
+ * yd + t * nb, quants at yq + t * qs).
  */
 template <int T>
 void rows_block32_q8_0_xt(gguf::TensorType type, const std::byte* row,
                           std::size_t bb, std::size_t nb, const float* yd,
                           const std::int8_t* yq, std::size_t qs, float* out) {
-    float32x4_t s0[T], s1[T];
+    float sum[T];
     for (int t = 0; t < T; ++t) {
-        s0[t] = vdupq_n_f32(0.0f);
-        s1[t] = vdupq_n_f32(0.0f);
+        sum[t] = 0.0f;
     }
-    std::size_t b = 0;
-    int8x16_t lo0, hi0, lo1, hi1;
-    for (; b + 1 < nb; b += 2) {
-        const float w0 = unpack_block32_neon(type, row + b * bb, lo0, hi0);
-        const float w1 =
-            unpack_block32_neon(type, row + (b + 1) * bb, lo1, hi1);
+    int8x16_t lo, hi;
+    for (std::size_t b = 0; b < nb; ++b) {
+        const float w = unpack_block32_neon(type, row + b * bb, lo, hi);
         for (int t = 0; t < T; ++t) {
-            const float* d = yd + t * nb;
-            const std::int8_t* q = yq + t * qs;
-            const float d0 = w0 * d[b];
-            const int32x4_t p0 = lanes32(lo0, hi0, q + b * 32);
-            const float d1 = w1 * d[b + 1];
-            const int32x4_t p1 = lanes32(lo1, hi1, q + (b + 1) * 32);
-            s0[t] = vaddq_f32(s0[t], vmulq_n_f32(vcvtq_f32_s32(p0), d0));
-            s1[t] = vaddq_f32(s1[t], vmulq_n_f32(vcvtq_f32_s32(p1), d1));
+            const float d = w * yd[t * nb + b];
+            const int p = vaddvq_s32(lanes32(lo, hi, yq + t * qs + b * 32));
+            const float m = static_cast<float>(p) * d;
+            sum[t] = sum[t] + m;
         }
     }
     for (int t = 0; t < T; ++t) {
-        out[t] = vaddvq_f32(s0[t]) + vaddvq_f32(s1[t]);
-    }
-    for (; b < nb; ++b) {
-        const float w0 = unpack_block32_neon(type, row + b * bb, lo0, hi0);
-        for (int t = 0; t < T; ++t) {
-            const float d = w0 * yd[t * nb + b];
-            const int p = vaddvq_s32(lanes32(lo0, hi0, yq + t * qs + b * 32));
-            out[t] += static_cast<float>(p) * d;
-        }
+        out[t] = sum[t];
     }
 }
 
