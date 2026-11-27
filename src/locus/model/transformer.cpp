@@ -2281,13 +2281,6 @@ bool batch_dequant_enabled() {
     return on;
 }
 
-/**
- * Runs body(r0, r1) over row-slices of a rows-row matvec: threaded
- * across mt_slices() when the backend is re-entrant, else inline.
- * Each slice carries the full n-token batch, so the weight rows in
- * that slice stay hot across all n tokens (weight-stationary) while
- * the slices themselves fan out over cores.
- */
 /** The calling thread's QuantBatch (i#1198): reused across matmuls, so
  *  its buffers grow to the largest batch once. */
 backend::QuantBatch& quant_batch() {
@@ -2295,6 +2288,13 @@ backend::QuantBatch& quant_batch() {
     return qb;
 }
 
+/**
+ * Runs body(r0, r1) over row-slices of a rows-row matvec: threaded
+ * across mt_slices() when the backend is re-entrant, else inline.
+ * Each slice carries the full n-token batch, so the weight rows in
+ * that slice stay hot across all n tokens (weight-stationary) while
+ * the slices themselves fan out over cores.
+ */
 template <typename Body>
 void for_row_slices(const backend::Ops& op, std::uint32_t rows,
                     Body&& body) {
