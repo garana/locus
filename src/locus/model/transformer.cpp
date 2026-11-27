@@ -508,8 +508,8 @@ const backend::Backend& TransformerModel::use_backend_for(
                 mb(weight_bytes_) + " MB of weights, a " + mb(budget) +
                 " MB weight pool";
             if (kv_type != kv::KvType::kF32) {
-                note = "default; a quantized KV cache (cuda_forward takes "
-                       "f32): the best backend here";
+                note = "default; a KV cache that is not f32 (cuda_forward "
+                       "takes f32): the best backend here";
             } else {
                 use_backend(*cu);  // cuda_forward_supported reads it
                 if (cuda_forward_supported()) {

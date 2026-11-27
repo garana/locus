@@ -152,10 +152,11 @@ TEST_CASE("the default backend is CUDA when the model fits the GPU",
     // Fits (0.5 GB of weights): CUDA.
     CHECK(std::string_view(got.name) == "cuda");
     CHECK(why.find("fits the CUDA device") != std::string::npos);
-    // A quantized KV cache: cuda_forward declines it, so the CPU.
+    // A KV cache that is not f32 (q8 here): cuda_forward declines it,
+    // so the CPU.
     const auto& q8 = model.use_backend_for("", KvType::kQ8, &why);
     CHECK(&q8 == &locus::backend::best_backend());
-    CHECK(why.find("quantized KV cache") != std::string::npos);
+    CHECK(why.find("KV cache that is not f32") != std::string::npos);
     // Weights over the pool's budget (Orpheus 3B, 1.9 GB, on a 2 GB
     // card): the CPU.
     const std::string big = models + "orpheus-3b-0.1-ft-Q4_K_M.gguf";
