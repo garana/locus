@@ -939,7 +939,8 @@ TEST_CASE("sse4_avx kernels give the sse4 bits", "[ops][batch][sse4]") {
     if (!locus::sys::detect().avx) {
         SKIP("CPU lacks AVX");
     }
-    constexpr std::uint32_t rows = 3;
+    // 7 rows: the block-32 kernels' four-row step and a 3-row tail.
+    constexpr std::uint32_t rows = 7;
     std::mt19937 rng(706);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
     const auto check = [&](const Mat& m, std::uint32_t n) {
@@ -1072,7 +1073,8 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
     if (!locus::sys::detect().sse4) {
         SKIP("CPU lacks SSE4.1");
     }
-    constexpr std::uint32_t rows = 3;
+    // 7 rows: the block-32 kernels' four-row step and a 3-row tail.
+    constexpr std::uint32_t rows = 7;
     std::mt19937 rng(211);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
     const auto check = [&](const Mat& m, std::uint32_t n) {
