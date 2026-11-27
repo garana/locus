@@ -1670,6 +1670,132 @@ MM_KERNEL(mm_f32, MmLoadF32)
 MM_KERNEL(mm_f16, MmLoadF16)
 MM_KERNEL(mm_bf16, MmLoadBF16)
 
+// mm_tile 128 rows tall (i#1074): 128 weight rows x 32 tokens, a
+// threadgroup of 256 (8 simdgroups), so each staged token tile serves
+// 128 rows instead of 64. On the M2 (Apple family 8) it runs Llama 1B's
+// prefill matmuls about 5% faster than mm_tile, and the 512-row k / v
+// shapes about 6%. Simdgroup sg takes rows 32 (sg & 3) .. + 32 and
+// tokens 16 (sg >> 2) .. + 16, mc[i] token block i / 4 and row block
+// i % 4, as many sums a simdgroup as mm_tile. A: row tid / 2, 16 k at
+// (tid & 1) * 16, [k][row] blocks, block (kb, rb) at 64 (16 kb + rb);
+// B: token tid / 8, 4 k at (tid & 7) * 4, [token][k] blocks, block
+// (kb, tb) at 64 (4 kb + tb). The output tile reuses A's memory. Not
+// grouped (mm_*_id keeps mm_tile).
+constant constexpr uint kMmTM128 = 128;
+
+template <typename L>
+inline void mm_tile128(device const uchar* wbase, device const float* xbase,
+                       device float* ybase, constant MmParams& p, uint tgi,
+                       uint tid, uint sg, threadgroup float* sa,
+                       threadgroup float* sb) {
+    const uint2 tg = uint2(tgi % p.row_tiles, tgi / p.row_tiles);
+    device const uchar* w = wbase + p.w_off;
+    device const float* x = xbase + p.x_off;
+    device float* y = ybase + p.out_off;
+    const uint m0 = tg.x * kMmTM128, n0 = tg.y * kMmTN;
+    const bool full = m0 + kMmTM128 <= p.rows && n0 + kMmTN <= p.n_tok;
+    const bool direct = full && p.scale == 1.0f;
+    device float* yt = y + ulong(n0 + 16 * (sg >> 2)) * p.out_stride + m0 +
+                       32 * (sg & 3);
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8; ++i) {
+        if (direct && p.accumulate != 0) {
+            simdgroup_load(mc[i], yt + 8 * (i % 4) + 8 * p.out_stride * (i / 4),
+                           p.out_stride);
+        } else {
+            mc[i] = simdgroup_float8x8(0.0f);
+        }
+    }
+    const uint ar = tid >> 1, ah = (tid & 1) * 16;
+    const uint bt = tid >> 3, bk = (tid & 7) * 4;
+    const bool a_in = m0 + ar < p.rows;
+    const bool b_in = n0 + bt < p.n_tok;
+    device const uchar* wrow =
+        w + (a_in ? ulong(m0 + ar) * L::row_bytes(p.cols) : 0);
+    device const float* xrow = x + ulong(b_in ? n0 + bt : 0) * p.x_stride;
+    threadgroup float* da = sa + 64 * (16 * (ah / 8) + ar / 8) + ar % 8;
+    threadgroup float* db =
+        sb + 64 * (4 * (bk / 8) + bt / 8) + 8 * (bt % 8) + bk % 8;
+    threadgroup const float* lsa0 = sa + 4 * 64 * (sg & 3);
+    threadgroup const float* lsb0 = sb + 2 * 64 * (sg >> 2);
+    for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
+        float va[16];
+        if (a_in) {
+            L::load(wrow, k0, ah, va);
+        } else {
+            for (uint i = 0; i < 16; ++i) va[i] = 0.0f;
+        }
+        float4 vb = float4(0.0f);
+        if (b_in) {
+            vb = float4(*(device const packed_float4*)(xrow + k0 + bk));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 8; ++i) da[8 * i] = va[i];
+        for (uint i = 0; i < 8; ++i) da[64 * 16 + 8 * i] = va[8 + i];
+        *((threadgroup float4*)db) = vb;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const float* lsa = lsa0;
+        threadgroup const float* lsb = lsb0;
+        for (uint kk = 0; kk < kMmTK / 8; ++kk) {
+            simdgroup_float8x8 ma[4], mb[2];
+            for (uint i = 0; i < 4; ++i) simdgroup_load(ma[i], lsa + 64 * i, 8);
+            for (uint i = 0; i < 2; ++i) simdgroup_load(mb[i], lsb + 64 * i, 8);
+            for (uint i = 0; i < 8; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4],
+                                              mc[i]);
+            }
+            lsa += 16 * 64;
+            lsb += 4 * 64;
+        }
+    }
+    if (direct) {
+        for (uint i = 0; i < 8; ++i) {
+            simdgroup_store(mc[i],
+                            yt + 8 * (i % 4) + 8 * p.out_stride * (i / 4),
+                            p.out_stride);
+        }
+        return;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* so = sa;
+    threadgroup float* st = so + 16 * (sg >> 2) * kMmTM128 + 32 * (sg & 3);
+    for (uint i = 0; i < 8; ++i) {
+        simdgroup_store(mc[i], st + 8 * (i % 4) + 8 * kMmTM128 * (i / 4),
+                        kMmTM128);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < kMmTM128 * kMmTN; e += 256) {
+        const uint t = e / kMmTM128, r = e % kMmTM128;
+        if (n0 + t < p.n_tok && m0 + r < p.rows) {
+            device float* o = y + ulong(n0 + t) * p.out_stride + m0 + r;
+            const float v = p.scale * so[t * kMmTM128 + r];
+            *o = p.accumulate != 0 ? *o + v : v;
+        }
+    }
+}
+
+#define MM128_KERNEL(name, loader)                                       \
+    kernel void name##_r128(device const uchar* wbase [[buffer(0)]],    \
+                            device const float* xbase [[buffer(1)]],    \
+                            device float* ybase [[buffer(2)]],          \
+                            constant MmParams& p [[buffer(3)]],         \
+                            uint tgi [[threadgroup_position_in_grid]],  \
+                            uint tid [[thread_index_in_threadgroup]],   \
+                            uint sg [[simdgroup_index_in_threadgroup]]) { \
+        threadgroup float sa[kMmTM128 * kMmTK];                         \
+        threadgroup float sb[kMmTN * kMmTK];                            \
+        mm_tile128<loader>(wbase, xbase, ybase, p, tgi, tid, sg, sa, sb); \
+    }
+
+MM128_KERNEL(mm_q4_k, MmLoadQ4K)
+MM128_KERNEL(mm_q6_k, MmLoadQ6K)
+MM128_KERNEL(mm_q8_0, MmLoadQ8_0)
+MM128_KERNEL(mm_q4_0, MmLoadQ4_0)
+MM128_KERNEL(mm_q5_0, MmLoadQ5_0)
+MM128_KERNEL(mm_f32, MmLoadF32)
+MM128_KERNEL(mm_f16, MmLoadF16)
+MM128_KERNEL(mm_bf16, MmLoadBF16)
+
 // mm_tile 8 tokens wide (i#1191): 2 to 8 activation columns (decode
 // sequences, or a short prefill chunk) without the 32-token tile's 24
 // empty ones. A threadgroup of 128 takes 64 weight rows x 8 tokens: the
