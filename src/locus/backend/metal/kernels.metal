@@ -1670,6 +1670,107 @@ MM_KERNEL(mm_f32, MmLoadF32)
 MM_KERNEL(mm_f16, MmLoadF16)
 MM_KERNEL(mm_bf16, MmLoadBF16)
 
+// mm_tile 8 tokens wide (i#1191): 2 to 8 activation columns (decode
+// sequences, or a short prefill chunk) without the 32-token tile's 24
+// empty ones. A threadgroup of 128 takes 64 weight rows x 8 tokens: the
+// weight tile is dequantized and staged as mm_tile does (each block read
+// once for the 8 columns), the 8 tokens' activations staged beside it,
+// and simdgroup sg runs rows 16 sg .. + 16 as two 8 x 8 MMAs a k step.
+// Not grouped (no mm_id form).
+constant constexpr uint kMmTN8 = 8;
+
+template <typename L>
+inline void mm_tile_n8(device const uchar* wbase, device const float* xbase,
+                       device float* ybase, constant MmParams& p, uint tgi,
+                       uint tid, uint sg, threadgroup float* sa,
+                       threadgroup float* sb) {
+    const uint2 tg = uint2(tgi % p.row_tiles, tgi / p.row_tiles);
+    device const uchar* w = wbase + p.w_off;
+    device const float* x = xbase + p.x_off;
+    device float* y = ybase + p.out_off;
+    const uint m0 = tg.x * kMmTM, n0 = tg.y * kMmTN8;
+    simdgroup_float8x8 mc[2] = {simdgroup_float8x8(0.0f),
+                                simdgroup_float8x8(0.0f)};
+    // A as mm_tile stages it: row tid / 2, 16 k at (tid & 1) * 16, as
+    // [k][row] blocks, block (kb, rb) at sa + 64 (8 kb + rb). B: the
+    // first 32 threads, token tid / 4, 8 k at (tid & 3) * 8, as [token][k]
+    // blocks, block kb at sb + 64 kb.
+    const uint ar = tid >> 1, ah = (tid & 1) * 16;
+    const uint bt = tid >> 2, bk = (tid & 3) * 8;
+    const bool a_in = m0 + ar < p.rows;
+    const bool b_load = tid < 32;
+    const bool b_in = b_load && n0 + bt < p.n_tok;
+    device const uchar* wrow =
+        w + (a_in ? ulong(m0 + ar) * L::row_bytes(p.cols) : 0);
+    device const float* xrow = x + ulong(b_in ? n0 + bt : 0) * p.x_stride;
+    threadgroup float* da = sa + 64 * (8 * (ah / 8) + ar / 8) + ar % 8;
+    threadgroup float* db = sb + 64 * (bk / 8) + 8 * (bt % 8);
+    threadgroup const float* lsa0 = sa + 2 * 64 * sg;
+    for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
+        float va[16];
+        if (a_in) {
+            L::load(wrow, k0, ah, va);
+        } else {
+            for (uint i = 0; i < 16; ++i) va[i] = 0.0f;
+        }
+        float4 vb0 = float4(0.0f), vb1 = float4(0.0f);
+        if (b_in) {
+            device const packed_float4* src =
+                (device const packed_float4*)(xrow + k0 + bk);
+            vb0 = float4(src[0]);
+            vb1 = float4(src[1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 8; ++i) da[8 * i] = va[i];
+        for (uint i = 0; i < 8; ++i) da[64 * 8 + 8 * i] = va[8 + i];
+        if (b_load) {
+            ((threadgroup float4*)db)[0] = vb0;
+            ((threadgroup float4*)db)[1] = vb1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const float* lsa = lsa0;
+        for (uint kk = 0; kk < kMmTK / 8; ++kk) {
+            simdgroup_float8x8 ma0, ma1, mb;
+            simdgroup_load(ma0, lsa, 8);
+            simdgroup_load(ma1, lsa + 64, 8);
+            simdgroup_load(mb, sb + 64 * kk, 8);
+            simdgroup_multiply_accumulate(mc[0], mb, ma0, mc[0]);
+            simdgroup_multiply_accumulate(mc[1], mb, ma1, mc[1]);
+            lsa += 8 * 64;
+        }
+    }
+    // The 8 x 64 tile as [token][row] in sa, then a thread an output.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(mc[0], sa + 16 * sg, kMmTM);
+    simdgroup_store(mc[1], sa + 16 * sg + 8, kMmTM);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < kMmTM * kMmTN8; e += 128) {
+        const uint t = e / kMmTM, r = e % kMmTM;
+        if (n0 + t < p.n_tok && m0 + r < p.rows) {
+            device float* o = y + ulong(n0 + t) * p.out_stride + m0 + r;
+            const float v = p.scale * sa[t * kMmTM + r];
+            *o = p.accumulate != 0 ? *o + v : v;
+        }
+    }
+}
+
+#define MM_N8_KERNEL(name, loader)                                      \
+    kernel void name(device const uchar* wbase [[buffer(0)]],           \
+                     device const float* xbase [[buffer(1)]],           \
+                     device float* ybase [[buffer(2)]],                 \
+                     constant MmParams& p [[buffer(3)]],                \
+                     uint tgi [[threadgroup_position_in_grid]],         \
+                     uint tid [[thread_index_in_threadgroup]],          \
+                     uint sg [[simdgroup_index_in_threadgroup]]) {      \
+        threadgroup float sa[kMmTM * kMmTK];                            \
+        threadgroup float sb[kMmTN8 * kMmTK];                           \
+        mm_tile_n8<loader>(wbase, xbase, ybase, p, tgi, tid, sg, sa,    \
+                           sb);                                         \
+    }
+MM_N8_KERNEL(mm8_q4_k, MmLoadQ4K)
+MM_N8_KERNEL(mm8_q6_k, MmLoadQ6K)
+MM_N8_KERNEL(mm8_q8_0, MmLoadQ8_0)
+
 struct MoeTilesParams {
     uint n_slots;    // m k: the route's ids at route[0 .. n_slots)
     uint n_expert;

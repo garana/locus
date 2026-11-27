@@ -198,6 +198,23 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    bool accumulate, float scale = 1.0f);
 
 /**
+ * record_matmul with a tile 8 tokens wide (i#1191): for 2 to 8
+ * activation columns (decode sequences, a short prefill chunk) each
+ * weight block is dequantized once for all of them and the MMA does the
+ * columns, without the 32-token tile's empty ones. Any n_tok works
+ * (tiles of 8). The caller holds device_mutex().
+ * @returns false, recording nothing, for a type other than Q4_K, Q6_K
+ *     and Q8_0 or columns that are not whole blocks.
+ */
+bool record_matmul8(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                    std::uint32_t cols, std::uint32_t n_tok,
+                    const Context::Buffer& w, std::uint64_t w_off,
+                    const Context::Buffer& x, std::uint64_t x_off,
+                    std::uint32_t x_stride, const Context::Buffer& out,
+                    std::uint64_t out_off, std::uint32_t out_stride,
+                    bool accumulate);
+
+/**
  * The device copy of w, from the matvec weight cache (uploaded on
  * first use, keyed by its address and a fingerprint of its bytes). The
  * caller holds device_mutex(); the buffer lives until drop_weights().
