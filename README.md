@@ -348,7 +348,10 @@ measurements behind each choice: [docs/HOSTS.md](docs/HOSTS.md).
 
 Without `--backend` or `LOCUS_BACKEND`, a Mac runs a model on metal
 when metal's whole-token forward takes it (and the KV cache is f32),
-else on vulkan where usable, else on neon (#867). locus-server and
+else on vulkan where usable, else on neon (#867). A host with a usable
+CUDA device runs it on cuda when cuda's whole-token forward takes it
+(a dense llama or qwen2, an f32 KV cache, weights within the weight
+pool), else on the CPU (#1253). locus-server and
 locus-run print the pick and why at start, e.g. `backend: vulkan
 (default; metal_forward does not take this model: qwen2vl's M-RoPE;
 metal would be used if it did)`, or `backend: neon (--backend)`.

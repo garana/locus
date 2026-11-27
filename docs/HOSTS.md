@@ -169,12 +169,12 @@ GPU of compute capability 5.0. Measured on an Intel Core i5-2400
 (Sandy Bridge, 4 cores), 32 GB RAM without ECC, and a GTX 750 Ti (2
 GB; driver 580.178.04, CUDA 12.6); Ubuntu 24.04, GCC 13.
 
-Automatic: the CPU backend `sse4` (its AVX build). locus does not move
-to CUDA by itself: pass `--backend cuda`.
-
-Recommended: `--backend cuda` for dense models that fit in 2 GB (1.7x
-to 3.2x the CPU's decode, 9.7x to 12x its prefill); the CPU default
-for larger ones.
+Automatic: CUDA when its one-submit forward takes the model (a dense
+llama or qwen2, an f32 KV cache, weights within the weight pool, about
+80% of free VRAM: 1.7x to 3.2x the CPU's decode, 9.7x to 12x its
+prefill); else the CPU backend `sse4` (its AVX build), which beats
+CUDA's per-op path on models that do not fit the 2 GB card. The
+`backend:` line at startup says which and why.
 
 Against llama.cpp (e8e6c7a, built here: CUDA for sm_50 with `-ngl 99`,
 and CPU-only, 4 threads; 2026-11-27), main 6e13558f, `--backend cuda`

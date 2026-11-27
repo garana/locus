@@ -490,6 +490,36 @@ const backend::Backend& TransformerModel::use_backend_for(
                 use_backend(*vk);
                 return *vk;
             }
+        } else if (const backend::Backend* cu = backend::find_backend("cuda");
+                   usable(cu)) {
+            // i#1253: CUDA when its one-submit forward takes the model
+            // (an f32 KV cache, a plain llama or qwen2 with no MoE, and
+            // weights within the pool's budget, about 80% of free
+            // VRAM). Else the CPU: the per-op CUDA path paged a model
+            // over the budget and ran slower than the CPU on a 2 GB card
+            // (Orpheus 3B decode 1.6 against 6.5 tok/s).
+            const auto mb = [](std::uint64_t b) {
+                return std::to_string(b >> 20);
+            };
+            const std::size_t budget = cu->ops.pool_budget != nullptr
+                                           ? cu->ops.pool_budget()
+                                           : 0;
+            const std::string size =
+                mb(weight_bytes_) + " MB of weights, a " + mb(budget) +
+                " MB weight pool";
+            if (kv_type != kv::KvType::kF32) {
+                note = "default; a quantized KV cache (cuda_forward takes "
+                       "f32): the best backend here";
+            } else {
+                use_backend(*cu);  // cuda_forward_supported reads it
+                if (cuda_forward_supported()) {
+                    note = "default; the model fits the CUDA device (" +
+                           size + ")";
+                    return *cu;
+                }
+                note = "default; cuda_forward does not take this model (" +
+                       size + "): the best backend here";
+            }
         } else {
             note = "default; the best backend here";
         }

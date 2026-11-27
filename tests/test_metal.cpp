@@ -1795,15 +1795,20 @@ TEST_CASE("the default backend follows metal_forward's gate",
             ? "vulkan"
             : std::string(locus::backend::best_backend().name);
 
+    // Off Apple, a usable CUDA device takes what cuda_forward takes
+    // (i#1253), qwen2 among them.
+    const auto* cu = locus::backend::find_backend("cuda");
+    const bool cuda = cu != nullptr && cu->available && cu->selectable;
+    const std::string first = metal ? "metal" : cuda ? "cuda" : best;
+
     const auto img = qwen_tiny::lm("qwen2");
     const auto g = locus::gguf::GgufFile::parse(img);
     auto model = locus::model::TransformerModel::load(g);
     // qwen2's attention is one metal_forward takes. The boot line's
     // reason comes with the pick.
     std::string why;
-    CHECK(model.use_backend_for("", KvType::kF32, &why).name ==
-          (metal ? "metal" : best));
-    CHECK(model.active_backend().name == (metal ? "metal" : best));
+    CHECK(model.use_backend_for("", KvType::kF32, &why).name == first);
+    CHECK(model.active_backend().name == first);
     if (metal) {
         CHECK(why == "default; metal_forward takes this model");
     }

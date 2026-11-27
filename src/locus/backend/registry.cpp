@@ -250,7 +250,10 @@ std::string gpu_idle_warning(bool defaulted, const Backend& picked,
         return {};
     }
     for (const Backend& b : list) {
-        if (b.name == "vulkan" && !vulkan_beats) {
+        // CUDA is not suggested either: the default takes it whenever
+        // cuda_forward takes the model (i#1253), and leaves on the CPU
+        // the models its per-op path runs slower than the CPU.
+        if ((b.name == "vulkan" && !vulkan_beats) || b.name == "cuda") {
             continue;
         }
         if (is_gpu(b.name) && b.available && b.selectable) {
