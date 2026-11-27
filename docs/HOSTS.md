@@ -39,7 +39,21 @@ on MoltenVK.
 
 Recommended: `--backend metal` for text, the default since #1042
 (metal for the models its forward takes, else vulkan). Images and
-video take the GPU through Vulkan by themselves. Concurrent clients
+video take the GPU through Vulkan by themselves. Its KV cache stays
+f32 by default: f16 (`--kv-type f16`, the M4's default, #1245) is no
+gain on this GPU family. Decode tok/s after the prompt, main 6e13558f,
+f32 against f16, 3 rounds:
+
+| model, prompt         | f32               | f16               |
+|-----------------------|-------------------|-------------------|
+| Llama 1B Q8_0, 501    | 105.6 105.7 105.7 | 105.1 104.9 105.2 |
+| Llama 1B Q8_0, 2101   | 94.3 82.9 93.8    | 94.8 92.4 94.3    |
+| Llama 1B Q4_K_M, 501  | 153.9 155.5 155.8 | 152.3 155.0 153.9 |
+| Llama 1B Q4_K_M, 2101 | 131.1 129.0 129.7 | 131.6 133.6 133.0 |
+| Qwen2.5 Q8_0, 501     | 184.6 186.8 183.6 | 183.1 184.6 183.5 |
+| Qwen2.5 Q8_0, 2123    | 163.5 161.3 164.1 | 159.2 144.4 154.5 |
+
+Concurrent clients
 decode together since #1184; locus-server, Llama 1B, 128 tokens a
 client, tok/s in all:
 
@@ -102,10 +116,9 @@ leads Vulkan on every prefill and on most decode rows. Its KV cache is
 f16 by default (#1245): Llama 1B decode after a 2101-token prompt,
 Q8_0 191.2 -> 200.8 and Q4_K_M 244.8 -> 260.8 tok/s against f32
 (llama.cpp at depth 2048: 206.2 and 278.9), prefill and short-context
-decode level. On the decode
-of Orpheus and Qwen3-Coder the two are within 1%. Concurrent clients
-decode together since #1184; locus-server, Llama 1B, 128 tokens a
-client, tok/s in all:
+decode level. On the decode of Orpheus and Qwen3-Coder the two are
+within 1%. Concurrent clients decode together since #1184;
+locus-server, Llama 1B, 128 tokens a client, tok/s in all:
 
 | model  | clients | Metal before #1184 | Metal, invariant | Metal, not invariant | Vulkan |
 |--------|---------|--------------------|------------------|----------------------|--------|

@@ -329,11 +329,13 @@ TEST_CASE("the kv-type flag picks the KV cache precision", "[cli]") {
     REQUIRE(a.kv_type_ok);
     REQUIRE(a.kv_type == KvType::kF32);
     // Without the flag the tools take default_kv_type() of the backend
-    // they picked (i#1245): f16 on Metal, f32 elsewhere.
+    // they picked (i#1245): f16 on Metal from Apple family 9, f32 below
+    // it and elsewhere.
     REQUIRE_FALSE(a.kv_type_set);
-    REQUIRE(locus_tools::default_kv_type("metal") == KvType::kF16);
-    REQUIRE(locus_tools::default_kv_type("vulkan") == KvType::kF32);
-    REQUIRE(locus_tools::default_kv_type("neon") == KvType::kF32);
+    REQUIRE(locus_tools::default_kv_type("metal", 9) == KvType::kF16);
+    REQUIRE(locus_tools::default_kv_type("metal", 8) == KvType::kF32);
+    REQUIRE(locus_tools::default_kv_type("vulkan", 9) == KvType::kF32);
+    REQUIRE(locus_tools::default_kv_type("neon", 0) == KvType::kF32);
     auto b = parse({"prog", "--kv-type", "f16", "m.gguf"});
     REQUIRE(b.kv_type_ok);
     REQUIRE(b.kv_type_set);

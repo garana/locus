@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "locus/backend/metal/context.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
@@ -322,8 +323,8 @@ inline constexpr const char* kCommonHelp =
     "                   to the engine its longest prefix last went to\n"
     "                   (unless that one is busier)\n"
     "  --kv-type T      KV cache precision: f32 (the default, but on\n"
-    "                   Metal), f16 (half the cache and attention\n"
-    "                   reads; the default on Metal), q8, q4\n"
+    "                   Metal on an M3 or later), f16 (half the cache\n"
+    "                   and attention reads; the default there), q8, q4\n"
     "  --prefix-cache-dir DIR  keep evicted prompt-prefix KV in DIR and\n"
     "                   read it back on a later match, also after a\n"
     "                   restart (off unless set; use fast storage)\n"
@@ -606,15 +607,27 @@ struct BackendArgs {
 };
 
 /**
- * The KV cache type without --kv-type (i#1245): f16 on Metal, where
- * the decode reads half the K / V bytes and long-context decode gains
- * most, else f32.
+ * The KV cache type without --kv-type (i#1245): f16 on Metal from Apple
+ * family 9 (the M4 Max: decode at 2101 positions +5% Q8_0, +6.5%
+ * Q4_K_M), f32 below it (the M2 Pro, family 8: -4% to +2%) and on
+ * other backends.
  * @param backend The backend picked for the model.
+ * @param apple_family The Metal GPU's Apple family (0 if none).
  * @returns The KV type.
  */
+inline locus::kv::KvType default_kv_type(std::string_view backend,
+                                         int apple_family) {
+    return backend == "metal" && apple_family >= 9 ? locus::kv::KvType::kF16
+                                                   : locus::kv::KvType::kF32;
+}
+
+/** default_kv_type for the backend picked, reading the Metal GPU's
+ *  family when it is Metal. */
 inline locus::kv::KvType default_kv_type(std::string_view backend) {
-    return backend == "metal" ? locus::kv::KvType::kF16
-                              : locus::kv::KvType::kF32;
+    return default_kv_type(
+        backend, backend == "metal"
+                     ? locus::backend::metal::Context::get().apple_family()
+                     : 0);
 }
 
 /**
