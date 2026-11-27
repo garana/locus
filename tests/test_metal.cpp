@@ -464,6 +464,130 @@ TEST_CASE("metal matmuls match the CPU matvec per token",
     ctx.free(none);
 }
 
+// i#1191: the 8-token-wide matmul against the CPU matvec per column,
+// at 1 to 13 columns (tails of the 8-wide tile), rows off the 64-row
+// tile, strided columns, plain and accumulated.
+TEST_CASE("metal 8-wide matmul matches the CPU matvec per column",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    Context& ctx = Context::get();
+    std::mt19937 rng(1191);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const TensorType ty :
+         {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0}) {
+        CAPTURE(static_cast<int>(ty));
+        for (const auto& [rows, cols, n] :
+             {std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>{
+                  200, 512, 3},
+              {64, 256, 1}, {1027, 3072, 8}, {130, 256, 13}}) {
+            CAPTURE(rows, cols, n);
+            const auto w = random_weights(ty, rows, cols, rows);
+            const locus::backend::Mat m{ty, w.data(), rows, cols};
+            const std::uint32_t xs = cols + 8, os = rows + 4;
+            std::vector<float> x(std::size_t{n} * xs), init(std::size_t{n} * os);
+            for (auto& v : x) v = dist(rng);
+            for (auto& v : init) v = dist(rng);
+            Context::Buffer wb = ctx.upload(w);
+            Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
+            for (const bool acc : {false, true}) {
+                CAPTURE(acc);
+                Context::Buffer ob = ctx.upload(std::as_bytes(std::span(init)));
+                {
+                    std::lock_guard lk(mb::device_mutex());
+                    REQUIRE(mb::record_matmul8(ctx, ty, rows, cols, n, wb, 0,
+                                               xb, 0, xs, ob, 0, os, acc));
+                }
+                const auto* got = static_cast<const float*>(ob.data);
+                std::vector<float> want(rows);
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    locus::backend::matvec(
+                        m, {x.data() + std::size_t{t} * xs, cols}, want);
+                    for (std::uint32_t r = 0; r < rows; ++r) {
+                        const float base =
+                            acc ? init[std::size_t{t} * os + r] : 0.0f;
+                        REQUIRE(got[std::size_t{t} * os + r] ==
+                                Catch::Approx(base + want[r])
+                                    .margin(1e-3)
+                                    .epsilon(1e-4));
+                    }
+                    for (std::uint32_t r = rows; r < os; ++r) {
+                        REQUIRE(got[std::size_t{t} * os + r] ==
+                                init[std::size_t{t} * os + r]);
+                    }
+                }
+                ctx.free(ob);
+            }
+            ctx.free(wb);
+            ctx.free(xb);
+        }
+    }
+    Context::Buffer none = ctx.alloc(64);
+    std::lock_guard lk(mb::device_mutex());
+    CHECK_FALSE(mb::record_matmul8(ctx, TensorType::kQ5_K, 4, 256, 2, none,
+                                   0, none, 0, 256, none, 0, 4, false));
+    ctx.free(none);
+}
+
+// i#1191: µs per dispatch group for N activation columns, the 8-wide
+// matmul against N matvecs, at the issue's shapes. Hidden: a benchmark.
+TEST_CASE("bench: metal 8-wide matmul against N matvecs",
+          "[.bench][metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    Context& ctx = Context::get();
+    constexpr int kReps = 200;
+    for (const auto& [ty, rows, cols] :
+         {std::tuple<TensorType, std::uint32_t, std::uint32_t>{
+              TensorType::kQ4_K, 2048, 2048},
+          {TensorType::kQ4_K, 8192, 2048},
+          {TensorType::kQ6_K, 8192, 2048}}) {
+        const auto w = random_weights(ty, rows, cols, 7);
+        Context::Buffer wb = ctx.upload(w);
+        std::vector<float> x(std::size_t{8} * cols, 0.5f);
+        Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
+        Context::Buffer ob = ctx.alloc(std::size_t{8} * rows * 4);
+        for (const std::uint32_t n : {1u, 2u, 4u, 8u}) {
+            double us[2];
+            for (const bool narrow : {false, true}) {
+                std::lock_guard lk(mb::device_mutex());
+                const auto t0 = std::chrono::steady_clock::now();
+                ctx.begin_batch();
+                for (int i = 0; i < kReps; ++i) {
+                    if (narrow) {
+                        REQUIRE(mb::record_matmul8(ctx, ty, rows, cols, n, wb,
+                                                   0, xb, 0, cols, ob, 0,
+                                                   rows, false));
+                    } else {
+                        for (std::uint32_t c = 0; c < n; ++c) {
+                            mb::record_matvec(ctx, ty, rows, cols, wb, 0, xb,
+                                              c * cols, ob,
+                                              std::uint64_t{c} * rows, false);
+                        }
+                    }
+                }
+                ctx.end_batch();
+                us[narrow ? 1 : 0] =
+                    std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count() /
+                    kReps;
+            }
+            WARN(locus::gguf::tensor_type_name(ty)
+                 << " " << rows << "x" << cols << " n=" << n
+                 << ": matvecs " << us[0] << " us, 8-wide " << us[1]
+                 << " us");
+        }
+        ctx.free(wb);
+        ctx.free(xb);
+        ctx.free(ob);
+    }
+}
+
 TEST_CASE("metal grouped matmul matches a matvec a slot", "[metal]") {
     if (!Context::usable()) {
         SKIP("no Metal device");

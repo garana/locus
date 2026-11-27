@@ -1401,6 +1401,26 @@ bool TransformerModel::metal_forward_multi(
                 }
                 return;
             }
+            // Q4_K and Q6_K: the 8-wide matmul dequantizes each weight
+            // block once for all n rows, at a cost flat in n (i#1191; M4
+            // Max, Q4_K 8192 x 2048: 64 us against 87 for 4 matvecs and
+            // 174 for 8; at 2048 x 2048, 42 against 38 and 74). So from
+            // 4 rows on tall matrices and 6 on the others. Its bits
+            // differ from the matvec's, so not in the batch-invariant
+            // mode. LOCUS_METAL_MM8=0 keeps the matvecs (benches).
+            static const bool mm8_on = [] {
+                const char* e = std::getenv("LOCUS_METAL_MM8");
+                return e == nullptr || std::string_view(e) != "0";
+            }();
+            const std::uint32_t mm8_from = wt.rows >= 4096 ? 4 : 6;
+            if (mm8_on && kquant && norm == nullptr && n >= mm8_from &&
+                (wt.type == gguf::TensorType::kQ4_K ||
+                 wt.type == gguf::TensorType::kQ6_K) &&
+                metal::record_matmul8(ctx, wt.type, wt.rows, wt.cols, n,
+                                      *wb.buf, wb.off, in, 0, in_stride, out,
+                                      out_off, out_stride, acc)) {
+                return;
+            }
             if (metal::record_matvec_cols(ctx, wt.type, wt.rows, wt.cols,
                                           *wb.buf, wb.off, in, 0, in_stride,
                                           out, out_off, out_stride, n, acc,

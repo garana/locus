@@ -476,6 +476,35 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
     return true;
 }
 
+bool record_matmul8(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                    std::uint32_t cols, std::uint32_t n_tok,
+                    const Context::Buffer& w, std::uint64_t w_off,
+                    const Context::Buffer& x, std::uint64_t x_off,
+                    std::uint32_t x_stride, const Context::Buffer& out,
+                    std::uint64_t out_off, std::uint32_t out_stride,
+                    bool accumulate) {
+    using gguf::TensorType;
+    const char* k = t == TensorType::kQ4_K   ? "mm8_q4_k"
+                    : t == TensorType::kQ6_K ? "mm8_q6_k"
+                    : t == TensorType::kQ8_0 ? "mm8_q8_0"
+                                             : nullptr;
+    const std::uint32_t block = t == TensorType::kQ8_0 ? 32u : 256u;
+    if (k == nullptr || cols % block != 0 || n_tok == 0) {
+        return false;
+    }
+    const std::uint32_t row_tiles = (rows + 63) / 64;
+    const std::uint32_t tok_tiles = (n_tok + 7) / 8;
+    const MmParams p{w_off,    x_off,      out_off,
+                     rows,     cols,       n_tok,
+                     x_stride, out_stride, accumulate ? 1u : 0u,
+                     1.0f,     row_tiles,  1,
+                     0};
+    const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
+    ctx.dispatch(k, args, std::as_bytes(std::span(&p, 1)),
+                 row_tiles * tok_tiles * 128, 128);
+    return true;
+}
+
 std::uint32_t moe_max_tiles(std::uint32_t n_slots, std::uint32_t n_expert) {
     return n_slots / 32 + n_expert;
 }
