@@ -302,6 +302,16 @@ backend::Ops TransformerModel::ops() const {
     return effective_ops(backend_, q8k_activations());
 }
 
+void TransformerModel::use_backend(const backend::Backend& b) {
+    // A variant the CPU lacks would fault in its kernels (SIGILL), so
+    // refuse it here with its name, as resolve_backend() does (i#1226).
+    if (!b.available) {
+        throw std::invalid_argument(
+            "backend not available on this machine: " + std::string(b.name));
+    }
+    backend_ = &b;
+}
+
 namespace {
 
 /**

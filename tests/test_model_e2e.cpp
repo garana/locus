@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -85,6 +86,34 @@ TEST_CASE("loads a real Llama-family GGUF model", "[e2e]") {
 
     auto text = tok.decode(ids);
     REQUIRE(text.find("Once upon a time") != std::string::npos);
+}
+
+// i#1226: a backend built in but not runnable here (an x86 build's
+// avx2 on a CPU without AVX2) is refused by name, not run into SIGILL,
+// and the model keeps the backend it had.
+TEST_CASE("use_backend refuses a backend this machine cannot run",
+          "[e2e][backend]") {
+    const std::string path = model_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    const locus::backend::Backend& best = locus::backend::best_backend();
+    model.use_backend(best);
+    const locus::backend::Backend* off = nullptr;
+    for (const auto& b : locus::backend::backends()) {
+        if (!b.available) {
+            off = &b;
+            break;
+        }
+    }
+    if (off == nullptr) {
+        SKIP("every backend built here is available on this machine");
+    }
+    CAPTURE(off->name);
+    REQUIRE_THROWS_AS(model.use_backend(*off), std::invalid_argument);
+    CHECK(&model.active_backend() == &best);
 }
 
 namespace {

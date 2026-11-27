@@ -24,6 +24,11 @@ TEST_CASE("registry lists and resolves backends", "[backend]") {
     const Backend& best = best_backend();
     REQUIRE(best.available);
     REQUIRE(best.selectable);
+    // Always a CPU backend (i#1226): tests take it as the best CPU one.
+    REQUIRE(best.ops.cpu);
+    REQUIRE(best.name != "vulkan");
+    REQUIRE(best.name != "cuda");
+    REQUIRE(best.name != "metal");
 #if defined(__aarch64__)
     REQUIRE(best.name == "neon");
 #endif

@@ -343,7 +343,7 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
         };
         {
             // Extend ids with 12 greedy CPU tokens.
-            model.use_backend(locus::backend::backends().front());
+            model.use_backend(locus::backend::best_backend());
             auto cache = model.make_cache();
             auto ws = model.make_workspace();
             locus::kv::PagedKvCache::Seq seq;
@@ -359,7 +359,7 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
             }
             cache.release(seq);
         }
-        const auto cpu = run(locus::backend::backends().front().name);
+        const auto cpu = run(locus::backend::best_backend().name);
         const std::uint64_t before =
             locus::model::TransformerModel::metal_forward_tokens();
         // The one-kernel attention (the default at this length), then
@@ -722,7 +722,7 @@ TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
             }
             CHECK(worst <= 0.01f * scale);
         };
-        const auto cpu = prefill(locus::backend::backends().front().name,
+        const auto cpu = prefill(locus::backend::best_backend().name,
                                  false);
         // The tiled causal attention (the default), then attn_rows.
         for (const bool tiled : {true, false}) {
@@ -950,7 +950,7 @@ TEST_CASE("metal forward on a GGUF parsed from memory copies its weights",
         cache.release(seq);
         return logits;
     };
-    const auto cpu = last(locus::backend::backends().front().name);
+    const auto cpu = last(locus::backend::best_backend().name);
     const std::uint64_t before =
         locus::model::TransformerModel::metal_forward_tokens();
     const auto gpu = last("metal");
@@ -2295,7 +2295,7 @@ TEST_CASE("metal f16 KV tracks the CPU's f16 path", "[metal][e2e]") {
             cache.release(seq);
             return std::pair(lg, next);
         };
-        const auto cpu = run(locus::backend::backends().front().name,
+        const auto cpu = run(locus::backend::best_backend().name,
                              KvType::kF16);
         const std::uint64_t before =
             locus::model::TransformerModel::metal_forward_tokens();
