@@ -109,6 +109,25 @@ struct Ops {
     void (*matvec_q8k_batch)(const Mat&, std::span<const float>,
                              std::span<float>, std::uint32_t n) = nullptr;
     /**
+     * Optional, with matvec_q8k_batch (i#1198): its quantize and dot
+     * halves, so a batch is quantized once for all of a matrix's row
+     * slices (and by token slices in parallel) instead of once per row
+     * slice. q8k_batch_size sizes a QuantBatch for n tokens of w's type
+     * and width (false: not split for this type; use
+     * matvec_q8k_batch); q8k_batch_quantize fills its tokens
+     * [t0, t1), which callers may run concurrently on disjoint ranges;
+     * matvec_q8k_batch_pre dots w's rows (a row slice of the matrix it
+     * was sized for) against all n tokens, in matvec_q8k_batch's
+     * output layout and bits.
+     */
+    bool (*q8k_batch_size)(const Mat&, std::uint32_t n,
+                           QuantBatch&) = nullptr;
+    void (*q8k_batch_quantize)(const Mat&, std::span<const float> x_batch,
+                               std::uint32_t t0, std::uint32_t t1,
+                               QuantBatch&) = nullptr;
+    void (*matvec_q8k_batch_pre)(const Mat&, const QuantBatch&,
+                                 std::span<float>, std::uint32_t n) = nullptr;
+    /**
      * True when the backend parallelizes the weight rows itself and
      * wants the WHOLE matrix in each matvec, matvec_q8k and
      * matvec_batch call (a GPU backend: its kernel grids over all

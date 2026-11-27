@@ -146,6 +146,19 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
 
 /**
+ * matvec_batch_sse4_q8k in its two halves (Ops::q8k_batch_size,
+ * q8k_batch_quantize and matvec_q8k_batch_pre, i#1198): the same
+ * quantization and row kernels, so the same bits, with the batch
+ * quantized once for every row slice.
+ */
+bool q8k_batch_size_sse4(const Mat& w, std::uint32_t n, QuantBatch& b);
+void q8k_batch_quantize_sse4(const Mat& w, std::span<const float> x_batch,
+                             std::uint32_t t0, std::uint32_t t1,
+                             QuantBatch& b);
+void matvec_q8k_batch_pre_sse4(const Mat& w, const QuantBatch& b,
+                               std::span<float> out_batch, std::uint32_t n);
+
+/**
  * SSE4 batched matvec (R11 Ops::matvec_batch): Q4_K/Q6_K use a
  * register-blocked kernel (weight block dequanted once, FMA'd into n
  * token accumulators -- byte-identical to n matvec_sse4() calls but
@@ -174,6 +187,12 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out);
 void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
+bool q8k_batch_size_sse4(const Mat& w, std::uint32_t n, QuantBatch& b);
+void q8k_batch_quantize_sse4(const Mat& w, std::span<const float> x_batch,
+                             std::uint32_t t0, std::uint32_t t1,
+                             QuantBatch& b);
+void matvec_q8k_batch_pre_sse4(const Mat& w, const QuantBatch& b,
+                               std::span<float> out_batch, std::uint32_t n);
 void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n);
 void quantize_activation_q8k_sse4(std::span<const float> x, float* d,
