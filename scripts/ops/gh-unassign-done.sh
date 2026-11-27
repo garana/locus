@@ -19,7 +19,7 @@
 #   --prefix P    the label prefix (default "assigned:")
 #   --closed-prs  also clear closed PRs that were not merged
 #
-# Needs: gh (logged in) with write access to the repository.
+# Needs: jq, and gh (logged in) with write access to the repository.
 
 set -euo pipefail
 
