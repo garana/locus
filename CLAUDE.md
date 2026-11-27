@@ -95,4 +95,11 @@ and an x86 host tests every code PR.
   the CPU's features, `backend/registry.cpp` marks each variant
   available or not from them and uses the first available one
   (`--backend` or `LOCUS_BACKEND` overrides). Each variant is tested
-  against the scalar kernels.
+  against the scalar kernels within a tolerance.
+- Numerics (DESIGN.md 16): speed over exact bits. A kernel change
+  needs its tolerance tests and the goldens, not bit equality with
+  another kernel, variant or batch size (the batch-invariant mode
+  excepted). Variants are picked per GPU family or CPU feature set
+  from measurements; weights may be reordered at load where it pays.
+  A perf PR reports main against the PR (and llama.cpp) with the miner
+  stopped.

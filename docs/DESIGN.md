@@ -1480,3 +1480,22 @@ logit (0.75 at DeepSeek-V4.1's one known near-tie, #467).
   counts back to zero after every workload.
 - Tests that need a model file skip without it; heavy ones also need
   `LOCUS_HEAVY_TESTS=1`.
+
+### Numerics: speed over exact bits
+
+A kernel is judged by its error and its speed, not by matching another
+kernel's bits (the owner's call, #1240). A kernel change passes:
+- its tests against the scalar reference within a stated tolerance
+  (matmuls 1e-4 relative, 1e-3 absolute; a looser bound only with a
+  reason in the PR);
+- the goldens: greedy output token for token, or a near-tie
+  teacher-forced or re-pinned, named in the PR;
+- the batch-invariant mode, which stays bit-exact when it is on.
+
+What no longer binds: a batched forward equal to the per-token one,
+CPU variants equal to each other, llama.cpp's non-repacked float
+order, f32 staging on the GPU, an f32 KV cache by default. Each of
+those moves only with a measured speed gain. Kernel variants are
+picked per GPU family or CPU feature set from a table filled by
+measurements (as `q6k_kernel()` is), and weights may be reordered once
+at load into a kernel's layout where that measures faster.
