@@ -571,8 +571,8 @@ NEON). There it is a capability win, not a speed win.
   (`mat_rows`) on a persistent thread pool, each slice through the
   active backend's matvec into a disjoint output span. Each row's dot
   is the same code, so today logits are bit-identical for every thread
-  count (not required: section 16). `LOCUS_THREADS` caps the fan-out (default: the performance
-  cores; 1 runs single-threaded). Parallel slices also issue parallel
+  count (not required: section 16). `LOCUS_THREADS` caps the fan-out
+  (default: the performance cores; 1 runs single-threaded). Parallel slices also issue parallel
   page faults, a deeper NVMe queue on streamed models. Independent
   matvecs reading the same input (q/k/v, gate/up) share one pool
   dispatch, and decode attention spreads its heads across the pool.
@@ -646,8 +646,8 @@ before the next weight. Each output $y_{r,t} = W_r \cdot x_t$ comes
 from the same backend matvec as in the per-token path, so
 `forward_batch` gives a KV cache and logits equal to N `forward()`
 calls within the matmul tolerance (byte-identical where the kernels
-share an order, and always in the batch-invariant mode; section 16). Attention reads no large
-weights, so it stays per token, each against its own sequence's KV.
+share an order, and always in the batch-invariant mode; section 16).
+Attention reads no large weights, so it stays per token, each against its own sequence's KV.
 MoE layers route per token, then apply each picked expert once to all
 the tokens that chose it. Activations go N wide; the attention scores
 buffer stays one wide (an N-wide one would be N x n_ctx).
@@ -1387,8 +1387,8 @@ and a device-select seam (#47).
 
 Exit test: a two-host split gives byte-identical output to the
 single-host run on hosts of one architecture, and token-exact output
-(within the kernels' tolerance) across architectures; at concurrency at or above the pipeline depth,
-throughput approaches the single-box ceiling, with only the hop
+(within the kernels' tolerance) across architectures; at concurrency
+at or above the pipeline depth, throughput approaches the single-box ceiling, with only the hop
 latency added.
 
 `locus-server` serves the same way from several engines
