@@ -75,11 +75,12 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   unified memory, whatever backend the language model uses, the
   PixArt and FLUX DiTs run each whole step on the GPU with their
   activations resident, and the VAE convolutions run on the GPU
-  (T5's attention stays on the CPU). On Apple the FLUX DiT runs on
-  Metal instead, CLIP, T5 and the VAE on Vulkan (LOCUS_FLUX_METAL=0
-  keeps the DiT on Vulkan): on an M4 Max a 256 x 256 image with 4
-  steps takes about 11 s, 1024 x 1024 about 65 s; elsewhere FLUX runs
-  on the CPU, minutes per image. Request fields:
+  (T5's attention stays on the CPU). On Apple the FLUX and PixArt
+  DiTs run on Metal instead, their text encoders and VAEs on Vulkan
+  (LOCUS_FLUX_METAL=0 or LOCUS_PIXART_METAL=0 keeps a DiT on Vulkan):
+  on an M4 Max a 256 x 256 FLUX image with 4 steps takes about 11 s,
+  1024 x 1024 about 65 s, and a 20-step PixArt image about 9 s;
+  elsewhere FLUX runs on the CPU, minutes per image. Request fields:
   docs/CLIENTS.md.
 - **Video output:** `/v1/videos` with LTX-Video 2B distilled (T5-XXL,
   the 3D DiT, rectified flow, the causal 3D VAE), text to video or
