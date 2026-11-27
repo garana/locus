@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -10,6 +11,28 @@
 #include "locus/model/speculative.hpp"
 
 namespace locus::engine {
+
+namespace {
+
+/** Runs one forward call `f` and records it in the step histograms
+ *  (i#1220): its phase, the tokens it computed and its wall time. */
+template <typename F>
+void timed_step(EngineMetrics& m, EngineMetrics::Phase p,
+                std::uint32_t tokens, F&& f) {
+    const auto t0 = std::chrono::steady_clock::now();
+    f();
+    m.observe_step(
+        p, tokens,
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count()));
+}
+
+constexpr auto kPrefillStep = EngineMetrics::Phase::kPrefill;
+constexpr auto kDecodeStep = EngineMetrics::Phase::kDecode;
+
+}  // namespace
 
 Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
                Config cfg)
@@ -428,10 +451,12 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
             if (nb >= 2 &&
                 r.n_fed + nb <= model_.hparams().n_ctx &&
                 cache_.ensure_capacity(r.seq, nb)) {
-                model_.forward_batch(
-                    std::span<const tok::TokenId>(
-                        r.prompt.data() + r.n_fed, nb),
-                    cache_, r.seq, ws_, logits_);
+                timed_step(metrics_, kPrefillStep, nb, [&] {
+                    model_.forward_batch(
+                        std::span<const tok::TokenId>(
+                            r.prompt.data() + r.n_fed, nb),
+                        cache_, r.seq, ws_, logits_);
+                });
                 r.n_fed += nb;
                 step_tokens_ += nb;
                 budget -= nb;
@@ -464,17 +489,23 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
             r.n_fed < n_prompt
                 ? r.prompt[r.n_fed]
                 : r.generated[r.n_fed - n_prompt];
+        // One token: a prompt token's prefill or one request's decode.
+        const auto phase = prefilling ? kPrefillStep : kDecodeStep;
         if (cfg_.speculative && !prefilling) {
             // A plain decode step's time prices drafts against it
             // (model::choose_draft).
             const auto t_dec = std::chrono::steady_clock::now();
-            model_.forward(input, cache_, r.seq, ws_, logits_);
+            timed_step(metrics_, phase, 1, [&] {
+                model_.forward(input, cache_, r.seq, ws_, logits_);
+            });
             spec_cost_.observe(
                 0, std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t_dec)
                        .count());
         } else {
-            model_.forward(input, cache_, r.seq, ws_, logits_);
+            timed_step(metrics_, phase, 1, [&] {
+                model_.forward(input, cache_, r.seq, ws_, logits_);
+            });
         }
         ++r.n_fed;
         ++step_tokens_;
@@ -962,9 +993,12 @@ bool Engine::spec_decode_step(Request& r) {
     // The verify's cost covers the forward and the logit scans, the
     // work a draft adds over a plain decode step.
     const auto t_verify = std::chrono::steady_clock::now();
-    model_.forward_batch(batch, cache_, r.seq, ws_,
-                         {batched_logits_.data(), need},
-                         /*all_logits=*/true);
+    timed_step(metrics_, EngineMetrics::Phase::kVerify,
+               static_cast<std::uint32_t>(batch.size()), [&] {
+                   model_.forward_batch(batch, cache_, r.seq, ws_,
+                                        {batched_logits_.data(), need},
+                                        /*all_logits=*/true);
+               });
     // pred[i] is the model's token after batch[i]: it equals the
     // draft batch[i + 1] while drafts pass, then corrects the first
     // one that fails, or is the bonus token after the last draft.
@@ -1100,10 +1134,12 @@ bool Engine::prefill_only(Request& r, std::uint32_t& budget) {
             if (nb >= 2 &&
                 r.n_fed + nb <= model_.hparams().n_ctx &&
                 cache_.ensure_capacity(r.seq, nb)) {
-                model_.forward_batch(
-                    std::span<const tok::TokenId>(
-                        r.prompt.data() + r.n_fed, nb),
-                    cache_, r.seq, ws_, r.logits);
+                timed_step(metrics_, kPrefillStep, nb, [&] {
+                    model_.forward_batch(
+                        std::span<const tok::TokenId>(
+                            r.prompt.data() + r.n_fed, nb),
+                        cache_, r.seq, ws_, r.logits);
+                });
                 r.n_fed += nb;
                 step_tokens_ += nb;
                 budget -= nb;
@@ -1127,8 +1163,10 @@ bool Engine::prefill_only(Request& r, std::uint32_t& budget) {
             preempt(victim);
             continue;
         }
-        model_.forward(r.prompt[r.n_fed], cache_, r.seq, ws_,
-                       r.logits);
+        timed_step(metrics_, kPrefillStep, 1, [&] {
+            model_.forward(r.prompt[r.n_fed], cache_, r.seq, ws_,
+                           r.logits);
+        });
         ++r.n_fed;
         ++step_tokens_;
         --budget;
@@ -1235,10 +1273,14 @@ bool Engine::step_batched() {
         if (batched_logits_.size() < need) {
             batched_logits_.assign(need, 0.0f);
         }
-        model_.forward_batch_decode(
-            toks, cache_,
-            std::span<kv::PagedKvCache::Seq* const>(seqs), ws_,
-            std::span<float>(batched_logits_.data(), need));
+        timed_step(metrics_, kDecodeStep,
+                   static_cast<std::uint32_t>(toks.size()), [&] {
+                       model_.forward_batch_decode(
+                           toks, cache_,
+                           std::span<kv::PagedKvCache::Seq* const>(seqs),
+                           ws_,
+                           std::span<float>(batched_logits_.data(), need));
+                   });
         step_tokens_ += static_cast<std::uint32_t>(toks.size());
         for (std::size_t j = 0; j < ids.size(); ++j) {
             Request& r = *requests_.at(ids[j]);

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 #include "locus/sys/histogram.hpp"
@@ -19,6 +21,20 @@ using Histogram = sys::Histogram;
  */
 struct EngineMetrics {
     EngineMetrics();
+
+    /** What a forward call computed (i#1220): a prompt chunk (or one
+     *  prompt token), a decode of the running requests, or a
+     *  speculative verify. */
+    enum class Phase : std::uint8_t { kPrefill, kDecode, kVerify };
+    static constexpr std::size_t kPhases = 3;
+    /** The phase's label value: prefill, decode, verify. */
+    static const char* phase_name(Phase p);
+
+    /** Records one forward call in step_tokens and step_seconds. */
+    void observe_step(Phase p, std::uint32_t tokens, std::uint64_t ns) {
+        step_tokens[static_cast<std::size_t>(p)].observe(tokens);
+        step_seconds[static_cast<std::size_t>(p)].observe(ns);
+    }
 
     /** Submit to first admission. */
     Histogram queue;
@@ -57,6 +73,12 @@ struct EngineMetrics {
     std::atomic<std::uint32_t> kv_blocks_prefilling{0};
     std::atomic<std::uint32_t> kv_blocks_decoding{0};
     std::atomic<std::uint32_t> kv_blocks_cached{0};
+
+    /** Per forward call, by phase: the tokens it computed (prefill: the
+     *  chunk's tokens; decode: the requests in the call; verify: the
+     *  drafts plus one), and its wall time in nanoseconds. */
+    std::array<Histogram, kPhases> step_tokens;
+    std::array<Histogram, kPhases> step_seconds;
 };
 
 }  // namespace locus::engine
