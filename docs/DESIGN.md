@@ -570,10 +570,11 @@ NEON). There it is a capability win, not a speed win.
 - R9.1, threaded matvec: a large matvec splits into row slices
   (`mat_rows`) on a persistent thread pool, each slice through the
   active backend's matvec into a disjoint output span. Each row's dot
-  is the same code, so logits are bit-identical for every thread
-  count. `LOCUS_THREADS` caps the fan-out (default: the performance
-  cores; 1 runs single-threaded). Parallel slices also issue parallel
-  page faults, a deeper NVMe queue on streamed models. Independent
+  is the same code, so today logits are bit-identical for every thread
+  count (not required: section 16). `LOCUS_THREADS` caps the fan-out
+  (default: the performance cores; 1 runs single-threaded). Parallel
+  slices also issue parallel page faults, a deeper NVMe queue on
+  streamed models. Independent
   matvecs reading the same input (q/k/v, gate/up) share one pool
   dispatch, and decode attention spreads its heads across the pool.
 - R9.2, static pinning: `LOCUS_PIN_STATIC=1` mlocks every non-expert
@@ -644,9 +645,11 @@ The weight-bearing ops (projections, dense and expert FFN, output
 head) run weight-stationary: each weight is used for all N tokens
 before the next weight. Each output $y_{r,t} = W_r \cdot x_t$ comes
 from the same backend matvec as in the per-token path, so
-`forward_batch` gives a KV cache and logits byte-identical to N
-`forward()` calls; the tests assert it. Attention reads no large
-weights, so it stays per token, each against its own sequence's KV.
+`forward_batch` gives a KV cache and logits equal to N `forward()`
+calls within the matmul tolerance (byte-identical where the kernels
+share an order, and always in the batch-invariant mode; section 16).
+Attention reads no large weights, so it stays per token, each against
+its own sequence's KV.
 MoE layers route per token, then apply each picked expert once to all
 the tokens that chose it. Activations go N wide; the attention scores
 buffer stays one wide (an N-wide one would be N x n_ctx).
@@ -762,9 +765,10 @@ Batched decode is a skinny GEMM, $Y = W X^\top$ with $X$ of N rows.
 Looping the per-token matvec streams $W$ from DRAM N times. The
 register-blocked kernels load and dequantize each weight block once
 and keep N accumulators, so weight traffic drops about N-fold. They
-keep matvec's per-block reduction order, so each token's dot is
+keep matvec's per-block reduction order, so today each token's dot is
 bitwise unchanged (a single end-of-row reduction would differ: float
-addition is not associative).
+addition is not associative); that is a property of these kernels, not
+a requirement (section 16).
 
 `Ops::matvec_batch` is the hook. Kernels exist for Q4_K and Q6_K on
 sse4 and neon, and on CUDA (one launch for up to 32 tokens) for Q4_K,
@@ -1385,9 +1389,10 @@ A Vulkan executor needs a batched, layer-range Vulkan forward (#48)
 and a device-select seam (#47).
 
 Exit test: a two-host split gives byte-identical output to the
-single-host run; at concurrency at or above the pipeline depth,
-throughput approaches the single-box ceiling, with only the hop
-latency added.
+single-host run on hosts of one architecture, and token-exact output
+(within the kernels' tolerance) across architectures; at concurrency
+at or above the pipeline depth, throughput approaches the single-box
+ceiling, with only the hop latency added.
 
 `locus-server` serves the same way from several engines
 (`server::EngineGroup`, #929): each an `EngineLoop` with its own
@@ -1420,8 +1425,9 @@ locus ports those dots (`backend::matvec_q8k`):
 | sse4    | all 15 QK_K types and the block-32 types                      |
 | cuda    | all 15 QK_K types                                             |
 
-The sse4 and CUDA dots, and the neon ones but Q4_K and Q6_K, replay
-the scalar accumulation order, so they are bit-identical to it. The
+Today the sse4 and CUDA dots, and the neon ones but Q4_K and Q6_K,
+replay the scalar accumulation order, so they are bit-identical to it
+(a property of these kernels, not a requirement: section 16). The
 neon Q4_K and Q6_K dots do not (below). The build turns off implicit
 fused multiply-add (`-ffp-contract=off`), so the scalar path rounds
 the same on x86-64 and arm64, and a stage chain that mixes the two is
@@ -1480,3 +1486,25 @@ logit (0.75 at DeepSeek-V4.1's one known near-tie, #467).
   counts back to zero after every workload.
 - Tests that need a model file skip without it; heavy ones also need
   `LOCUS_HEAVY_TESTS=1`.
+
+### Numerics: speed over exact bits
+
+A kernel is judged by its error and its speed, not by matching another
+kernel's bits (the owner's call, #1240). A kernel change passes:
+- its tests against the scalar reference within a stated tolerance
+  (matmuls 1e-4 relative, 1e-3 absolute; a looser bound only with a
+  reason in the PR);
+- the goldens: greedy output token for token, or a near-tie
+  teacher-forced or re-pinned, named in the PR;
+- the batch-invariant mode, which stays bit-exact when it is on.
+
+What no longer binds: a batched forward equal to the per-token one,
+CPU variants equal to each other, llama.cpp's non-repacked float
+order, f32 staging on the GPU, an f32 KV cache by default. Each of
+those moves only with a measured speed gain. Kernel variants are
+picked per GPU family or CPU feature set from a table filled by
+measurements (as `q6k_kernel()` is), and weights may be reordered once
+at load into a kernel's layout where that measures faster. The build
+keeps `-ffp-contract=off` for now, so the scalar reference rounds the
+same on every compiler; allowing fused multiply-adds is a perf item
+like any other, taken when it measures faster.

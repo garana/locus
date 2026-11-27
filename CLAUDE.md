@@ -78,7 +78,8 @@ and an x86 host tests every code PR.
   punctuation (GitHub strips it: use `\ `, not `\,`) and `\lt`, not
   `<`.
 - Unit tests with vendored Catch2 for every component; all tests
-  green before any commit.
+  green before a merge (the batched integration run covers the PRs it
+  holds; a PR needs no run of its own first).
 - Commit as each unit of work completes. No Co-Authored-By lines.
 - Dependency policy (DESIGN.md 6): no FetchContent, no network at
   build time; vendor pinned single-file deps with recorded sha256.
@@ -95,4 +96,11 @@ and an x86 host tests every code PR.
   the CPU's features, `backend/registry.cpp` marks each variant
   available or not from them and uses the first available one
   (`--backend` or `LOCUS_BACKEND` overrides). Each variant is tested
-  against the scalar kernels.
+  against the scalar kernels within a tolerance.
+- Numerics (DESIGN.md 16): speed over exact bits. A kernel change
+  needs its tolerance tests and the goldens, not bit equality with
+  another kernel, variant or batch size (the batch-invariant mode
+  excepted). Variants are picked per GPU family or CPU feature set
+  from measurements; weights may be reordered at load where it pays.
+  A perf PR reports main against the PR (and llama.cpp) with the miner
+  stopped.
