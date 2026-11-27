@@ -1286,6 +1286,22 @@ void matvec_batch(const backend::Ops& op, const backend::Mat& w,
                   std::span<float> out_batch, std::uint32_t n);
 
 /**
+ * Several independent batched matvecs over the same n tokens (q / k /
+ * v, gate / up) in one thread pool dispatch, as matvec_mt_group does
+ * for one token: their rows are sliced together, each job getting
+ * slices in proportion to its rows. Only the row-sliced Q8 batch path
+ * groups; any other path runs matvec_batch job by job. Each row runs
+ * the same kernel over the same tokens, so the bits equal issuing the
+ * jobs one by one.
+ * @param op The backend's ops.
+ * @param jobs The matvecs: each x is n * w.cols floats, each out
+ *     n * w.rows, token-major.
+ * @param n The token count.
+ */
+void matvec_batch_group(const backend::Ops& op,
+                        std::span<const MatvecJob> jobs, std::uint32_t n);
+
+/**
  * Dequant-amortized batched matvec (R10 step 5): dequantizes each
  * weight row to f32 once via op.dequant_row, then dots it against
  * all n token columns in plain scalar f32. Cuts dequant work from

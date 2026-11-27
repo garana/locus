@@ -1036,9 +1036,9 @@ void TransformerModel::attend_plain_batch(
                    {b.xbf.data() + o, E});
     }
     lap.lap(l, Stage::kNorm);
-    matvec_batch(op, lay.wq, b.xbf, b.q, n);
-    matvec_batch(op, lay.wk, b.xbf, b.k, n);
-    matvec_batch(op, lay.wv, b.xbf, b.v, n);
+    const MatvecJob qkv[] = {
+        {lay.wq, b.xbf, b.q}, {lay.wk, b.xbf, b.k}, {lay.wv, b.xbf, b.v}};
+    matvec_batch_group(op, qkv, n);
     for (std::uint32_t t = 0; t < n; ++t) {
         const kv::PagedKvCache::Seq& s = *seqs[t];
         const std::span<float> q(b.q.data() + std::size_t{t} * E, E);
@@ -1114,8 +1114,9 @@ void TransformerModel::ffn_batch(const backend::Ops& op, const Layer& lay,
     });
     lap.lap(l, Stage::kNorm);
     if (!lay.is_moe()) {
-        matvec_batch(op, lay.w_gate, b.xbf, b.gate, n);
-        matvec_batch(op, lay.w_up, b.xbf, b.up, n);
+        const MatvecJob gu[] = {{lay.w_gate, b.xbf, b.gate},
+                                {lay.w_up, b.xbf, b.up}};
+        matvec_batch_group(op, gu, n);
         for_tokens(n, [&](std::uint32_t t) {
             const std::size_t o = static_cast<std::size_t>(t) * ff;
             backend::silu_mul({b.gate.data() + o, ff}, {b.up.data() + o, ff},
@@ -1715,9 +1716,9 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             });
             lap.lap(l, Stage::kNorm);
             const std::span<float> qall(qb.data(), std::size_t{n} * q_dim);
-            matvec_batch(op, lay.wq, xbf, qall, n);
-            matvec_batch(op, lay.wk, xbf, kb, n);
-            matvec_batch(op, lay.wv, xbf, vb, n);
+            const MatvecJob qkv[] = {
+                {lay.wq, xbf, qall}, {lay.wk, xbf, kb}, {lay.wv, xbf, vb}};
+            matvec_batch_group(op, qkv, n);
             // qwen2: the biases after the projections, as
             // qwen2moe_attention adds them.
             auto add_bias = [n](std::vector<float>& d,
@@ -1828,8 +1829,9 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                         hp_.rms_eps, {xbf.data() + o, E});
             });
             lap.lap(l, Stage::kNorm);
-            matvec_batch(op, lay.w_gate, xbf, gate, n);
-            matvec_batch(op, lay.w_up, xbf, up, n);
+            const MatvecJob gu[] = {{lay.w_gate, xbf, gate},
+                                    {lay.w_up, xbf, up}};
+            matvec_batch_group(op, gu, n);
             for_tokens(n, [&](std::uint32_t t) {
                 const std::size_t o =
                     static_cast<std::size_t>(t) * ff;
@@ -2297,6 +2299,32 @@ void matvec_batch_deq(const backend::Ops& op, const Mat& w,
     });
 }
 
+namespace {
+
+/**
+ * Rows r0..r1 of w over n tokens through op.matvec_q8k_batch, written
+ * token-major into out_batch (n * w.rows). Each slice transposes its
+ * own rows, so no thread waits on a serial transpose.
+ */
+void q8k_batch_rows(const backend::Ops& op, const Mat& w,
+                    std::span<const float> x_batch,
+                    std::span<float> out_batch, std::uint32_t n,
+                    std::uint32_t r0, std::uint32_t r1) {
+    const std::uint32_t oc = w.rows;
+    const Mat sub = backend::mat_rows(w, r0, r1 - r0);
+    thread_local std::vector<float> rt;
+    rt.resize(static_cast<std::size_t>(r1 - r0) * n);
+    op.matvec_q8k_batch(sub, x_batch, rt, n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        float* o = out_batch.data() + static_cast<std::size_t>(t) * oc + r0;
+        for (std::uint32_t r = 0; r < r1 - r0; ++r) {
+            o[r] = rt[static_cast<std::size_t>(r) * n + t];
+        }
+    }
+}
+
+}  // namespace
+
 void matvec_batch(const backend::Ops& op, const Mat& w,
                   std::span<const float> x_batch,
                   std::span<float> out_batch, std::uint32_t n) {
@@ -2320,22 +2348,9 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     if (op.matvec_q8k != nullptr &&
         backend::uses_quantized_activation(w.type)) {
         if (op.matvec_q8k_batch != nullptr && !op.self_parallel) {
-            // Each slice transposes its own rows into the token-major
-            // output, so no thread waits on a serial transpose.
             for_row_slices(
                 op, oc, n, [&](std::uint32_t r0, std::uint32_t r1) {
-                    const Mat sub = backend::mat_rows(w, r0, r1 - r0);
-                    thread_local std::vector<float> rt;
-                    rt.resize(static_cast<std::size_t>(r1 - r0) * n);
-                    op.matvec_q8k_batch(sub, x_batch, rt, n);
-                    for (std::uint32_t t = 0; t < n; ++t) {
-                        float* o =
-                            out_batch.data() +
-                            static_cast<std::size_t>(t) * oc + r0;
-                        for (std::uint32_t r = 0; r < r1 - r0; ++r) {
-                            o[r] = rt[static_cast<std::size_t>(r) * n + t];
-                        }
-                    }
+                    q8k_batch_rows(op, w, x_batch, out_batch, n, r0, r1);
                 });
             return;
         }
@@ -2403,6 +2418,56 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     } else {
         per_token(0u, oc);
     }
+}
+
+void matvec_batch_group(const backend::Ops& op,
+                        std::span<const MatvecJob> jobs, std::uint32_t n) {
+    // One dispatch only on the row-sliced Q8 batch path, the one CPU
+    // prefill takes; anything else runs matvec_batch job by job.
+    bool grouped = backend::splits_rows(op) && op.matvec_q8k != nullptr &&
+                   op.matvec_q8k_batch != nullptr &&
+                   !(n >= kSgemmMinTokens && op.cpu &&
+                     backend::sgemm_prefill_on());
+    std::uint64_t total = 0;
+    for (const MatvecJob& j : jobs) {
+        grouped = grouped && backend::uses_quantized_activation(j.w.type);
+        total += j.w.rows;
+    }
+    const std::size_t t =
+        grouped ? mt_slices(static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                total, UINT32_MAX)),
+                            n)
+                : 0;
+    if (t <= 1) {
+        for (const MatvecJob& j : jobs) {
+            matvec_batch(op, j.w, j.x, j.out, n);
+        }
+        return;
+    }
+    // (job, first row, row count) per slice, at least one per job, as
+    // matvec_mt_group cuts them.
+    struct Slice {
+        std::size_t job;
+        std::uint32_t r0, rows;
+    };
+    std::vector<Slice> sl;
+    for (std::size_t k = 0; k < jobs.size(); ++k) {
+        const std::uint64_t rows = jobs[k].w.rows;
+        const std::uint64_t s =
+            std::max<std::uint64_t>(1, (rows * t + total / 2) / total);
+        for (std::uint64_t i = 0; i < s; ++i) {
+            const auto r0 = static_cast<std::uint32_t>(rows * i / s);
+            const auto r1 = static_cast<std::uint32_t>(rows * (i + 1) / s);
+            if (r1 > r0) {
+                sl.push_back({k, r0, r1 - r0});
+            }
+        }
+    }
+    sys::ThreadPool::instance().parallel_for(sl.size(), [&](std::size_t i) {
+        const MatvecJob& j = jobs[sl[i].job];
+        q8k_batch_rows(op, j.w, j.x, j.out, n, sl[i].r0,
+                       sl[i].r0 + sl[i].rows);
+    });
 }
 
 std::vector<std::pair<std::uint32_t, float>> moe_select(

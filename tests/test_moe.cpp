@@ -1346,6 +1346,57 @@ TEST_CASE("a small weight over a token chunk splits across threads, "
     }
 }
 
+// i#1198: q / k / v (and gate / up) in one pool dispatch give the bits
+// of three matvec_batch calls, at every thread count, on the best CPU
+// backend's Q8 batch path (sse4 or neon; scalar has none, so there the
+// group runs job by job).
+TEST_CASE("matvec_batch_group is matvec_batch job by job, bit-exact",
+          "[batch]") {
+    using locus::backend::Mat;
+    using locus::model::MatvecJob;
+    constexpr std::uint32_t cols = 64, n = 24;
+    const auto& op = locus::backend::best_backend().ops;
+    const std::uint32_t rows[] = {128, 32, 32};
+    std::vector<std::vector<std::byte>> q;
+    std::vector<Mat> mats;
+    for (std::uint32_t k = 0; k < 3; ++k) {
+        q.push_back(quantize_q8_0(
+            weights(static_cast<std::size_t>(rows[k]) * cols, 93 + k),
+            rows[k], cols));
+    }
+    for (std::uint32_t k = 0; k < 3; ++k) {
+        mats.push_back(
+            {locus::gguf::TensorType::kQ8_0, q[k].data(), rows[k], cols});
+    }
+    const std::vector<float> xb =
+        weights(static_cast<std::size_t>(n) * cols, 96);
+    std::vector<std::vector<float>> ref(3);
+    for (std::uint32_t k = 0; k < 3; ++k) {
+        ref[k].resize(static_cast<std::size_t>(n) * rows[k]);
+        locus::model::matvec_batch(op, mats[k], xb, ref[k], n);
+    }
+    const char* had = std::getenv("LOCUS_THREADS");
+    const std::string saved = had != nullptr ? had : "";
+    for (const char* nt : {"1", "2", "4"}) {
+        setenv("LOCUS_THREADS", nt, 1);
+        std::vector<std::vector<float>> got(3);
+        for (std::uint32_t k = 0; k < 3; ++k) {
+            got[k].resize(ref[k].size());
+        }
+        const MatvecJob jobs[] = {{mats[0], xb, got[0]},
+                                  {mats[1], xb, got[1]},
+                                  {mats[2], xb, got[2]}};
+        locus::model::matvec_batch_group(op, jobs, n);
+        if (had != nullptr) {
+            setenv("LOCUS_THREADS", saved.c_str(), 1);
+        } else {
+            unsetenv("LOCUS_THREADS");
+        }
+        CAPTURE(nt);
+        REQUIRE(got == ref);
+    }
+}
+
 TEST_CASE("qwen2moe gated shared expert scales only the shared "
           "expert",
           "[moe]") {
