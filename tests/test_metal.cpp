@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -1436,6 +1437,37 @@ TEST_CASE("metal::Seq ops match CPU references", "[metal]") {
             REQUIRE(got[at(0, d)] == x[at(0, d)]);
         }
     }
+}
+
+// i#1057: a Seq gives the device lock up between batches, so another
+// thread's Metal call (here metal::conv2d, which takes the lock) runs
+// during the Seq's life, at one of its flushes, not after it.
+TEST_CASE("metal::Seq lets another thread's Metal call run at a flush",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    using Seq = locus::backend::metal::Seq;
+    auto q = std::make_unique<Seq>();
+    q->reserve(0, 16);
+    std::vector<float> in(16, 1.0f), w(9, 1.0f), out(16);
+    auto other = std::async(std::launch::async, [&] {
+        return locus::backend::metal::conv2d(in, 1, 4, 4, w, 1, 3, 3, {}, 1,
+                                             1, 1, out);
+    });
+    bool done = false;
+    for (int i = 0; i < 2000 && !done; ++i) {
+        q->add({0, 0, 16}, {0, 0, 16}, 1, 16);
+        q->flush();
+        done = other.wait_for(std::chrono::milliseconds(1)) ==
+               std::future_status::ready;
+    }
+    // On a failure the Seq goes first, so the other call (and the
+    // future's destructor, which waits for it) can finish.
+    q.reset();
+    REQUIRE(done);  // it ran while q was still alive
+    REQUIRE(other.get());
+    CHECK(out[5] == 9.0f);  // an inner pixel: the 3 x 3 sum of ones
 }
 
 // A Seq that throws mid-step drops its open batch when destroyed (no
