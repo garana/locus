@@ -161,15 +161,15 @@ the one-token kernel.
 Every CPU softmax (attention, including the image and video models',
 MoE routing and the image encoders) and the SiLU activations take a
 polynomial exp four lanes at a time, within a few ulp of `std::exp`.
+On x86 CPUs with AVX, one-token Q4_K and Q6_K rows take llama.cpp's
+float order (Llama 3.2 1B Q4_K_M decode 9% faster on an i5-2400).
 `LOCUS_CPU_FAST=1` opts in to CPU kernels with a different float order
 (today on ARM CPUs with i8mm, such as the M2 and later, Q8_0 weights
-through `smmla`, about 27% faster prefill on an M2 Pro; on Apple, prefill
-matmuls of 32 tokens or more through Accelerate's `cblas_sgemm` in
-2048-token chunks, about 26% faster on a 1680-token prompt on an M2
-Pro; on x86 CPUs with AVX but not AVX2, one-token Q4_K and Q6_K rows
-in llama.cpp's float order, about 17% faster one-thread decode on an
-i5-2400): close to the default results but not bit-identical, so the
-goldens are checked without it.
+through `smmla`, about 27% faster prefill on an M2 Pro; on Apple,
+prefill matmuls of 32 tokens or more through Accelerate's
+`cblas_sgemm` in 2048-token chunks, about 26% faster on a 1680-token
+prompt on an M2 Pro): close to the default results but not
+bit-identical, so the goldens are checked without it.
 
 ### Validated models
 

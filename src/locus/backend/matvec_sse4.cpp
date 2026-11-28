@@ -16,7 +16,6 @@
 #include "iq_grids.h"
 
 namespace locus::backend {
-bool cpu_fast();  // cpu_ops.cpp: LOCUS_CPU_FAST is set
 // matvec_sse4_avx.cpp compiles this file again with AVX enabled, into
 // sse4_avx:: (variants.hpp).
 #if defined(LOCUS_SSE4_AVX_VARIANT)
@@ -2588,9 +2587,10 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
         return;
     }
 #if defined(LOCUS_SSE4_AVX_VARIANT)
-    // i#801: LOCUS_CPU_FAST takes llama.cpp's Q4_K / Q6_K rows (another
-    // float order), before the default path's buffers are allocated.
-    if (cpu_fast() && self::matvec_q8k_llama_avx(w, x, out)) {
+    // i#801, i#1244: one token takes llama.cpp's Q4_K / Q6_K rows (its
+    // float order; Llama 3.2 1B Q4_K_M decode 9% faster on an i5-2400),
+    // before the default path's buffers are allocated.
+    if (self::matvec_q8k_llama_avx(w, x, out)) {
         return;
     }
 #endif

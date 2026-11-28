@@ -377,7 +377,7 @@ The areas built after the MVP:
   IQ lookup tables (`third_party/ggml/iq_grids.h`, MIT) and llama.cpp's
   Unicode tables (`third_party/llama/unicode-data.{h,cpp}`, MIT, commit
   cd959bae9). Ported, not vendored: ggml's x86 AVX Q4_K / Q6_K dots
-  (`backend/matvec_sse4.cpp`, the LOCUS_CPU_FAST rows, from llama.cpp
+  (`backend/matvec_sse4.cpp`, the AVX one-token rows, from llama.cpp
   e8e6c7a), under the same MIT notice (`third_party/ggml/LICENSE`).
 - No FetchContent and no network at configure or build time.
 - Optional system dependencies, found at configure time: the Vulkan
