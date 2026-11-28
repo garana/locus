@@ -584,9 +584,8 @@ NEON). There it is a capability win, not a speed win.
   Idle workers spin 500 us for the next dispatch before sleeping. Where
   the OS reports core tiers (Apple), the count of spinners is the
   performance cores less one; elsewhere it is none. `LOCUS_POOL_SPIN=N`
-  sets the count. On the M4 Max
-  with none (as on Linux), neon decode is 14 to 18% slower and prefill
-  2 to 8% (i#1198).
+  sets the count. On the M4 Max with none (as on Linux), neon decode is
+  14 to 18% slower and prefill 2 to 8% (i#1198).
 - R9.2, static pinning: `LOCUS_PIN_STATIC=1` mlocks every non-expert
   weight at load. Opt-in, because wiring about 13 GB on a 32 GB
   machine is a policy decision.
