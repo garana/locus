@@ -111,18 +111,10 @@ std::vector<float> attention_default(const locus::backend::Ops& op,
             mat_batch(op, km, qb.data(), m, s.data());
             for (std::uint32_t t = 0; t < m; ++t) {
                 float* pt = &p[std::size_t{t} * nk];
-                float mx = -INFINITY;
                 for (std::uint32_t j = 0; j < nk; ++j) {
                     pt[j] = s[std::size_t{j} * m + t] * scale;
-                    mx = std::max(mx, pt[j]);
                 }
-                float sum = 0.0f;
-                for (std::uint32_t j = 0; j < nk; ++j) {
-                    pt[j] = std::exp(pt[j] - mx);
-                    sum += pt[j];
-                }
-                const float inv = 1.0f / sum;
-                for (std::uint32_t j = 0; j < nk; ++j) pt[j] *= inv;
+                locus::backend::softmax_fast_inplace({pt, nk});
             }
             mat_batch(op, vm, p.data(), m, ob.data());
             for (std::uint32_t t = 0; t < m; ++t) {
@@ -138,13 +130,10 @@ std::vector<float> attention_default(const locus::backend::Ops& op,
 
 }  // namespace
 
-// i#1035: without LOCUS_CPU_FAST the attention keeps the bits of its
-// std::exp softmax (the goldens were checked on them).
-TEST_CASE("dense attention without LOCUS_CPU_FAST keeps its bits",
+// i#1035, i#1244: the attention is the batched matmuls around
+// softmax_fast_inplace, bit for bit.
+TEST_CASE("dense attention is its matmuls and the fast softmax",
           "[image][fast]") {
-    if (locus::backend::cpu_fast()) {
-        SKIP("LOCUS_CPU_FAST is set");
-    }
     const auto& op = locus::backend::best_backend().ops;
     std::mt19937 rng(10351);
     std::uniform_real_distribution<float> d(-2.0f, 2.0f);
@@ -159,8 +148,7 @@ TEST_CASE("dense attention without LOCUS_CPU_FAST keeps its bits",
     REQUIRE(std::memcmp(out.data(), ref.data(), out.size() * 4) == 0);
 }
 
-// i#1035: the attention's softmax is softmax_fast_inplace under
-// LOCUS_CPU_FAST and the std::exp loop otherwise; both track the
+// i#1035: the attention (softmax_fast_inplace, i#1244) tracks the
 // double reference. Span 4 gives scaled scores of several units, far
 // down the polynomial exp's range; 70 keys leave a tail past 8 lanes.
 TEST_CASE("dense attention tracks a double reference", "[image][fast]") {
@@ -184,8 +172,7 @@ TEST_CASE("dense attention tracks a double reference", "[image][fast]") {
                 worst = std::max(worst, std::abs(out[i] - ref[i]) /
                                             (1.0 + std::abs(ref[i])));
             }
-            INFO("span " << span << ", nq " << nq << ", nk " << nk
-                         << ", fast " << locus::backend::cpu_fast());
+            INFO("span " << span << ", nq " << nq << ", nk " << nk);
             REQUIRE(worst < 1e-5 * span);
         }
     }

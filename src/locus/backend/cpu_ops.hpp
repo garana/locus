@@ -80,10 +80,8 @@ void layernorm(std::span<const float> x, std::span<const float> w,
                float eps, std::span<float> out);
 
 /**
- * In-place numerically-stable softmax over x. Bit-identical to the
- * std::exp form by default; under LOCUS_CPU_FAST it runs
- * softmax_fast_inplace instead (cpu_fast), for every caller: attention,
- * MoE routing, the image encoders.
+ * In-place numerically-stable softmax over x: softmax_fast_inplace,
+ * for every caller (attention, MoE routing, the image encoders).
  */
 void softmax_inplace(std::span<float> x);
 
@@ -111,7 +109,9 @@ float exp_fast(float x);
 void softmax_fast_inplace(std::span<float> x);
 
 /**
- * out = silu(gate) * up, elementwise (SwiGLU FFN activation).
+ * out = silu(gate) * up, elementwise (SwiGLU FFN activation), with
+ * exp_fast's polynomial four lanes at a time: within a few ulp of the
+ * std::exp form, the same bits on every arch.
  * All three spans have the same length; out may alias gate.
  */
 void silu_mul(std::span<const float> gate, std::span<const float> up,
@@ -508,7 +508,8 @@ void group_norm(std::span<float> x, std::uint32_t ch, std::uint32_t plane,
                 std::uint32_t groups, std::span<const float> gamma,
                 std::span<const float> beta, float eps);
 
-/** SiLU / Swish in place: x = x * sigmoid(x) = x / (1 + exp(-x)). */
+/** SiLU / Swish in place: x = x * sigmoid(x) = x / (1 + exp(-x)),
+ *  exp from exp_fast's polynomial, four lanes at a time. */
 void silu(std::span<float> x);
 
 /**

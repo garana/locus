@@ -154,24 +154,11 @@ void attention(const backend::Ops& given, std::span<const float> q,
         mat_batch(op, km, qb, m, s);  // s[j * m + t]
         for (std::uint32_t t = 0; t < m; ++t) {
             float* pt = &p[std::size_t{t} * nk];
-            float mx = -INFINITY;
             for (std::uint32_t j = 0; j < nk; ++j) {
                 pt[j] = s[std::size_t{j} * m + t] * scale;
-                mx = std::max(mx, pt[j]);
             }
-            // LOCUS_CPU_FAST: the vectorized softmax (another order, so
-            // only there); the default keeps this loop's bits.
-            if (backend::cpu_fast()) {
-                backend::softmax_fast_inplace({pt, nk});
-                continue;
-            }
-            float sum = 0.0f;
-            for (std::uint32_t j = 0; j < nk; ++j) {
-                pt[j] = std::exp(pt[j] - mx);
-                sum += pt[j];
-            }
-            const float inv = 1.0f / sum;
-            for (std::uint32_t j = 0; j < nk; ++j) pt[j] *= inv;
+            // The vectorized softmax, as every CPU softmax (i#1244).
+            backend::softmax_fast_inplace({pt, nk});
         }
         mat_batch(op, vm, p, m, ob);  // ob[e * m + t]
         for (std::uint32_t t = 0; t < m; ++t) {

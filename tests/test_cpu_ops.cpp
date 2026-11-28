@@ -227,19 +227,41 @@ TEST_CASE("softmax_fast_inplace is scalar exp_fast in 8 fixed lanes",
     }
 }
 
-TEST_CASE("softmax_inplace without LOCUS_CPU_FAST keeps the std::exp bits",
-          "[ops][fast]") {
-    if (cpu_fast()) {
-        SKIP("LOCUS_CPU_FAST is set");
-    }
+// i#1244: softmax_inplace is softmax_fast_inplace for every caller.
+TEST_CASE("softmax_inplace is softmax_fast_inplace", "[ops][fast]") {
     for (const auto& row : softmax_rows()) {
-        std::vector<float> ref = row;
+        std::vector<float> fast = row;
         std::vector<float> got = row;
-        softmax_ref(ref);
+        softmax_fast_inplace(fast);
         softmax_inplace(got);
-        REQUIRE(std::memcmp(got.data(), ref.data(),
-                            ref.size() * sizeof(float)) == 0);
+        REQUIRE(std::memcmp(got.data(), fast.data(),
+                            fast.size() * sizeof(float)) == 0);
     }
+}
+
+// i#1244: silu_mul and silu take exp_fast's polynomial, four lanes at a
+// time: within 1e-6 of the std::exp form, and the 4-lane body equals
+// the scalar tail (n = 11: two vectors and 3 alone).
+TEST_CASE("silu_mul and silu track the std::exp form", "[ops][fast]") {
+    std::mt19937 rng(1244);
+    std::uniform_real_distribution<float> d(-30.0f, 30.0f);
+    std::vector<float> g(4099), u(4099);
+    for (auto& v : g) v = d(rng);
+    for (auto& v : u) v = d(rng);
+    std::vector<float> out(g.size()), s = g;
+    silu_mul(g, u, out);
+    silu(s);
+    for (std::size_t i = 0; i < g.size(); ++i) {
+        const float sig = g[i] / (1.0f + std::exp(-g[i]));
+        REQUIRE(s[i] == Approx(sig).epsilon(1e-6).margin(1e-30));
+        REQUIRE(out[i] == Approx(sig * u[i]).epsilon(1e-6).margin(1e-30));
+    }
+    // A lane's value does not depend on where it sits: the same input in
+    // the vector body (index 4) and in the tail (index 9).
+    std::vector<float> a(11, 0.37f), b(11, 2.0f), o(11);
+    a[4] = a[9] = -3.25f;
+    silu_mul(a, b, o);
+    REQUIRE(o[4] == o[9]);
 }
 
 TEST_CASE("silu_mul limits", "[ops]") {
