@@ -333,6 +333,17 @@ void TransformerModel::use_backend(const backend::Backend& b) {
 struct TransformerModel::PackedSet {
     std::vector<std::unique_ptr<backend::PackedQ8_0>> mats;
     std::uint64_t bytes = 0;
+
+    /** The copies as raw pointers, for one register or unregister. */
+    std::vector<backend::PackedQ8_0*> ptrs() const {
+        std::vector<backend::PackedQ8_0*> p;
+        for (const auto& m : mats) {
+            p.push_back(m.get());
+        }
+        return p;
+    }
+    /** Unregisters the whole set in one step, then frees it. */
+    ~PackedSet() { backend::unregister_packed_q8_0(ptrs()); }
 };
 
 std::uint64_t TransformerModel::packed_bytes() const {
@@ -389,6 +400,8 @@ void TransformerModel::prepare_cpu_layout() {
             set->mats[i] = std::make_unique<backend::PackedQ8_0>(*todo[i]);
         });
     set->bytes = bytes;
+    // One publish for the whole model (not one per matrix).
+    backend::register_packed_q8_0(set->ptrs());
     packed_ = std::move(set);
 }
 

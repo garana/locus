@@ -28,10 +28,12 @@ using Snapshot = std::vector<Entry>;
  * The registry: find_packed_q8_0 runs on every matvec call of every
  * thread, so it takes no lock (a shared_mutex there cost the M2 Pro 9%
  * of its neon decode, i#1243): it loads `current` and searches it. A
- * register or unregister (model load, use_backend) builds a new
- * snapshot under `writer` and swaps it in; the old ones stay alive to
- * the end (a few hundred bytes each), so a search never reads freed
- * memory. Never destroyed, so no exit-order race.
+ * register or unregister of a set (a model's load, its use_backend or
+ * its teardown) builds one new snapshot under `writer` and swaps it
+ * in; the old ones stay alive to the end, so a search never reads
+ * freed memory: 32 bytes an entry, about 3.6 KB a snapshot for Llama
+ * 3.2 1B's 113 matrices, one snapshot each load and teardown. Never
+ * destroyed, so no exit-order race.
  */
 struct Registry {
     std::atomic<const Snapshot*> current{nullptr};
@@ -84,33 +86,55 @@ void pack_q8_0_quad(const Mat& w, std::uint32_t r0, std::byte* out) {
 }
 
 PackedQ8_0::PackedQ8_0(const Mat& w)
-    : src_(w.data), src_bytes_(std::size_t{w.rows} * mat_row_bytes(w)) {
-    const std::size_t row_bytes = mat_row_bytes(w);
+    : src_(w.data),
+      src_bytes_(std::size_t{w.rows} * mat_row_bytes(w)),
+      row_bytes_(mat_row_bytes(w)) {
     const std::uint32_t quads = (w.rows + 3) / 4;
-    bytes_.resize(std::size_t{quads} * 4 * row_bytes);
+    bytes_.resize(std::size_t{quads} * 4 * row_bytes_);
     for (std::uint32_t q = 0; q < quads; ++q) {
         pack_q8_0_quad(w, 4 * q,
-                       bytes_.data() + std::size_t{q} * 4 * row_bytes);
+                       bytes_.data() + std::size_t{q} * 4 * row_bytes_);
     }
-    Registry& r = registry();
-    std::lock_guard lk(r.writer);
-    const Entry e{src_, src_bytes_, row_bytes, bytes_.data()};
-    r.publish([&](Snapshot& s) {
-        s.insert(std::upper_bound(s.begin(), s.end(), e,
-                                  [](const Entry& a, const Entry& b) {
-                                      return a.src < b.src;
-                                  }),
-                 e);
-    });
 }
 
 PackedQ8_0::~PackedQ8_0() {
+    if (registered_) {
+        PackedQ8_0* self = this;
+        unregister_packed_q8_0({&self, 1});
+    }
+}
+
+void register_packed_q8_0(std::span<PackedQ8_0* const> set) {
     Registry& r = registry();
     std::lock_guard lk(r.writer);
     r.publish([&](Snapshot& s) {
-        std::erase_if(s, [&](const Entry& e) {
-            return e.packed == bytes_.data();
+        for (PackedQ8_0* p : set) {
+            if (p->registered_) {
+                continue;
+            }
+            p->registered_ = true;
+            s.push_back({p->src_, p->src_bytes_, p->row_bytes_,
+                         p->bytes_.data()});
+        }
+        std::sort(s.begin(), s.end(), [](const Entry& a, const Entry& b) {
+            return a.src < b.src;
         });
+    });
+}
+
+void unregister_packed_q8_0(std::span<PackedQ8_0* const> set) {
+    Registry& r = registry();
+    std::lock_guard lk(r.writer);
+    r.publish([&](Snapshot& s) {
+        for (PackedQ8_0* p : set) {
+            if (!p->registered_) {
+                continue;
+            }
+            p->registered_ = false;
+            std::erase_if(s, [&](const Entry& e) {
+                return e.packed == p->bytes_.data();
+            });
+        }
     });
 }
 

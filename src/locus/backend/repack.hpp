@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "locus/backend/cpu_ops.hpp"
@@ -30,15 +31,16 @@ namespace locus::backend {
 inline constexpr std::size_t kPackedQ8_0Block = 136;
 
 /**
- * A Q8_0 matrix repacked four rows at a time, registered for
- * find_packed_q8_0 for as long as it lives. A last quad short of rows
- * repeats the last row (its extra lanes are never stored).
+ * A Q8_0 matrix repacked four rows at a time. find_packed_q8_0 sees it
+ * once it is registered (register_packed_q8_0); a registered copy that
+ * is destroyed unregisters itself. A last quad short of rows repeats
+ * the last row (its extra lanes are never stored).
  */
 class PackedQ8_0 {
 public:
     /**
      * Copies w (Q8_0, cols a multiple of 32, rows >= 1) into the
-     * packed layout and registers it.
+     * packed layout. Not registered yet.
      *
      * @param w The matrix as mapped; it must outlive this object.
      */
@@ -51,10 +53,26 @@ public:
     std::size_t bytes() const { return bytes_.size(); }
 
 private:
+    friend void register_packed_q8_0(std::span<PackedQ8_0* const>);
+    friend void unregister_packed_q8_0(std::span<PackedQ8_0* const>);
     const std::byte* src_;
     std::size_t src_bytes_;
+    std::size_t row_bytes_;
     std::vector<std::byte> bytes_;
+    bool registered_ = false;
 };
+
+/**
+ * Registers a set of copies in one step (one new table snapshot), so a
+ * model's load publishes once, not once per matrix. A copy already
+ * registered is skipped. Not for concurrent use with a matvec on these
+ * copies' matrices.
+ */
+void register_packed_q8_0(std::span<PackedQ8_0* const> set);
+
+/** Unregisters a set of copies in one step; one not registered is
+ *  skipped. */
+void unregister_packed_q8_0(std::span<PackedQ8_0* const> set);
 
 /**
  * @returns Whether w can be repacked: Q8_0, cols a positive multiple

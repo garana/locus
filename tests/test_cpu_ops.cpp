@@ -2014,8 +2014,11 @@ TEST_CASE("neon dotprod fast Q8_0 gives the same bits from a load-time "
         matvec_q8k(m, {x.data() + std::size_t{tk} * cols, cols}, scal[tk]);
     }
     {
-        const locus::backend::PackedQ8_0 pk(m);
+        locus::backend::PackedQ8_0 pk(m);
         REQUIRE(pk.bytes() == std::size_t{10} * 4 * nb * 34);
+        REQUIRE(locus::backend::find_packed_q8_0(m) == nullptr);  // not yet
+        locus::backend::PackedQ8_0* const one[] = {&pk};
+        locus::backend::register_packed_q8_0(one);
         REQUIRE(locus::backend::find_packed_q8_0(m) != nullptr);
         std::vector<float> got(plain.size());
         neon_dotprod_fast::matvec_batch_neon_q8k(m, x, got, n);
@@ -2086,7 +2089,10 @@ TEST_CASE("pack_q8_0_quad writes llama.cpp's block_q8_0x4 layout",
         }
     }
     // Only a registered matrix's quads are found, at the same width.
-    const locus::backend::PackedQ8_0 pk(m);
+    locus::backend::PackedQ8_0 pk(m);
+    locus::backend::PackedQ8_0* const one[] = {&pk};
+    locus::backend::register_packed_q8_0(one);
+    locus::backend::register_packed_q8_0(one);  // a second is a no-op
     REQUIRE(locus::backend::find_packed_q8_0(m) != nullptr);
     REQUIRE(locus::backend::find_packed_q8_0(
                 locus::backend::mat_rows(m, 4, 2)) ==
@@ -2097,6 +2103,10 @@ TEST_CASE("pack_q8_0_quad writes llama.cpp's block_q8_0x4 layout",
     REQUIRE(locus::backend::find_packed_q8_0(wide) == nullptr);
     const Mat other{TensorType::kQ4_0, w.data(), rows, cols};
     REQUIRE(locus::backend::find_packed_q8_0(other) == nullptr);
+    // A set unregisters in one step; the copy's own destructor then has
+    // nothing left to do.
+    locus::backend::unregister_packed_q8_0(one);
+    REQUIRE(locus::backend::find_packed_q8_0(m) == nullptr);
 }
 
 TEST_CASE("conv1d dense matches a hand-computed same-padded case",
