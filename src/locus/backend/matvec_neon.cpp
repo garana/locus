@@ -558,34 +558,57 @@ float row_block32_q8_0_neon(gguf::TensorType type, const std::byte* row,
     return sum;
 }
 
+/** @returns The four exact int sums of a, b, c and d's lanes, in that
+ *  lane order (each equals vaddvq_s32 of its vector). */
+inline int32x4_t hsum4_s32(int32x4_t a, int32x4_t b, int32x4_t c,
+                           int32x4_t d) {
+    return vpaddq_s32(vpaddq_s32(a, b), vpaddq_s32(c, d));
+}
 
 /**
  * row_block32_q8_0_neon for T tokens: each weight block is unpacked
  * once and dotted against every token, each token with its own exact
  * int dot and float steps in the same order, so out[t] is
  * bit-identical to row_block32_q8_0_neon on token t (scales at
- * yd + t * nb, quants at yq + t * qs).
+ * yd + t * nb, quants at yq + t * qs). For T = 4 the four tokens' dots
+ * share one vector (i#1239): lane t does token t's multiply and add.
  */
 template <int T>
 void rows_block32_q8_0_xt(gguf::TensorType type, const std::byte* row,
                           std::size_t bb, std::size_t nb, const float* yd,
                           const std::int8_t* yq, std::size_t qs, float* out) {
-    float sum[T];
-    for (int t = 0; t < T; ++t) {
-        sum[t] = 0.0f;
-    }
     int8x16_t lo, hi;
-    for (std::size_t b = 0; b < nb; ++b) {
-        const float w = unpack_block32_neon(type, row + b * bb, lo, hi);
-        for (int t = 0; t < T; ++t) {
-            const float d = w * yd[t * nb + b];
-            const int p = vaddvq_s32(lanes32(lo, hi, yq + t * qs + b * 32));
-            const float m = static_cast<float>(p) * d;
-            sum[t] = sum[t] + m;
+    if constexpr (T == 4) {
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        for (std::size_t b = 0; b < nb; ++b) {
+            const float w = unpack_block32_neon(type, row + b * bb, lo, hi);
+            const std::int8_t* x = yq + b * 32;
+            const int32x4_t p = hsum4_s32(
+                lanes32(lo, hi, x), lanes32(lo, hi, x + qs),
+                lanes32(lo, hi, x + 2 * qs), lanes32(lo, hi, x + 3 * qs));
+            const float d[4] = {w * yd[b], w * yd[nb + b], w * yd[2 * nb + b],
+                                w * yd[3 * nb + b]};
+            sum = vaddq_f32(sum, vmulq_f32(vcvtq_f32_s32(p), vld1q_f32(d)));
         }
-    }
-    for (int t = 0; t < T; ++t) {
-        out[t] = sum[t];
+        vst1q_f32(out, sum);
+    } else {
+        float sum[T];
+        for (int t = 0; t < T; ++t) {
+            sum[t] = 0.0f;
+        }
+        for (std::size_t b = 0; b < nb; ++b) {
+            const float w = unpack_block32_neon(type, row + b * bb, lo, hi);
+            for (int t = 0; t < T; ++t) {
+                const float d = w * yd[t * nb + b];
+                const int p =
+                    vaddvq_s32(lanes32(lo, hi, yq + t * qs + b * 32));
+                const float m = static_cast<float>(p) * d;
+                sum[t] = sum[t] + m;
+            }
+        }
+        for (int t = 0; t < T; ++t) {
+            out[t] = sum[t];
+        }
     }
 }
 

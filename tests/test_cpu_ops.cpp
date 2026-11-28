@@ -1768,17 +1768,24 @@ TEST_CASE("neon dotprod variant is bit-identical to the baseline neon",
         mats.push_back(Mat{t, store.back().data(), rows, cols});
     }
     {
+        // Every block-32 type: n 7 runs a four-token step of the batch
+        // kernel and a tail (i#1239).
         std::uniform_int_distribution<int> byte_d(0, 255);
-        std::vector<std::byte> w(std::size_t{rows} * (cols / 32) * 34);
-        for (auto& by : w) {
-            by = static_cast<std::byte>(byte_d(rng));
+        for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
+                                       std::pair{TensorType::kQ4_0, 18u},
+                                       std::pair{TensorType::kQ5_0, 22u},
+                                       std::pair{TensorType::kIQ4_NL, 18u}}) {
+            std::vector<std::byte> w(std::size_t{rows} * (cols / 32) * bytes);
+            for (auto& by : w) {
+                by = static_cast<std::byte>(byte_d(rng));
+            }
+            for (std::size_t bl = 0; bl < w.size() / bytes; ++bl) {
+                const std::uint16_t d = f32_to_f16(0.01f);
+                std::memcpy(w.data() + bl * bytes, &d, 2);
+            }
+            store.push_back(std::move(w));
+            mats.push_back(Mat{t, store.back().data(), rows, cols});
         }
-        for (std::size_t bl = 0; bl < w.size() / 34; ++bl) {
-            const std::uint16_t d = f32_to_f16(0.01f);
-            std::memcpy(w.data() + bl * 34, &d, 2);
-        }
-        store.push_back(std::move(w));
-        mats.push_back(Mat{TensorType::kQ8_0, store.back().data(), rows, cols});
         std::vector<std::byte> f(std::size_t{rows} * cols * 4);
         for (std::size_t i = 0; i < std::size_t{rows} * cols; ++i) {
             const float v = xd(rng);
