@@ -1,9 +1,9 @@
 #include "locus/backend/repack.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
-#include <shared_mutex>
 
 namespace locus::backend {
 
@@ -19,15 +19,38 @@ struct Entry {
     const std::byte* packed;
 };
 
-/** The registered matrices, sorted by src. */
-struct Table {
-    std::shared_mutex mu;
-    std::vector<Entry> entries;
+/** An immutable list of the registered matrices, sorted by src. */
+using Snapshot = std::vector<Entry>;
+
+/**
+ * The registry: find_packed_q8_0 runs on every matvec call of every
+ * thread, so it takes no lock (a shared_mutex there cost the M2 Pro 9%
+ * of its neon decode, i#1243): it loads `current` and searches it. A
+ * register or unregister (model load, use_backend) builds a new
+ * snapshot under `writer` and swaps it in; the old ones stay alive to
+ * the end (a few hundred bytes each), so a search never reads freed
+ * memory. Never destroyed, so no exit-order race.
+ */
+struct Registry {
+    std::atomic<const Snapshot*> current{nullptr};
+    std::mutex writer;
+    std::vector<std::unique_ptr<Snapshot>> all;
+
+    /** Swaps in edit(copy of the current list); callers hold writer. */
+    template <typename Edit>
+    void publish(Edit&& edit) {
+        const Snapshot* cur = current.load(std::memory_order_relaxed);
+        auto next = std::make_unique<Snapshot>(cur ? *cur : Snapshot{});
+        edit(*next);
+        current.store(next->empty() ? nullptr : next.get(),
+                      std::memory_order_release);
+        all.push_back(std::move(next));
+    }
 };
 
-Table& table() {
-    static Table t;
-    return t;
+Registry& registry() {
+    static Registry* r = new Registry;
+    return *r;
 }
 
 }  // namespace
@@ -67,22 +90,25 @@ PackedQ8_0::PackedQ8_0(const Mat& w)
         pack_q8_0_quad(w, 4 * q,
                        bytes_.data() + std::size_t{q} * 4 * row_bytes);
     }
-    Table& t = table();
-    std::unique_lock lk(t.mu);
+    Registry& r = registry();
+    std::lock_guard lk(r.writer);
     const Entry e{src_, src_bytes_, row_bytes, bytes_.data()};
-    t.entries.insert(
-        std::upper_bound(t.entries.begin(), t.entries.end(), e,
-                         [](const Entry& a, const Entry& b) {
-                             return a.src < b.src;
-                         }),
-        e);
+    r.publish([&](Snapshot& s) {
+        s.insert(std::upper_bound(s.begin(), s.end(), e,
+                                  [](const Entry& a, const Entry& b) {
+                                      return a.src < b.src;
+                                  }),
+                 e);
+    });
 }
 
 PackedQ8_0::~PackedQ8_0() {
-    Table& t = table();
-    std::unique_lock lk(t.mu);
-    std::erase_if(t.entries, [&](const Entry& e) {
-        return e.packed == bytes_.data();
+    Registry& r = registry();
+    std::lock_guard lk(r.writer);
+    r.publish([&](Snapshot& s) {
+        std::erase_if(s, [&](const Entry& e) {
+            return e.packed == bytes_.data();
+        });
     });
 }
 
@@ -90,16 +116,16 @@ const std::byte* find_packed_q8_0(const Mat& w) {
     if (!packs_q8_0(w)) {
         return nullptr;
     }
-    Table& t = table();
-    std::shared_lock lk(t.mu);
-    if (t.entries.empty()) {
-        return nullptr;
+    const Snapshot* s =
+        registry().current.load(std::memory_order_acquire);
+    if (s == nullptr) {
+        return nullptr;  // no copy registered: one load, no search
     }
     // The last entry starting at or before w.data.
     auto it = std::upper_bound(
-        t.entries.begin(), t.entries.end(), w.data,
+        s->begin(), s->end(), w.data,
         [](const std::byte* p, const Entry& e) { return p < e.src; });
-    if (it == t.entries.begin()) {
+    if (it == s->begin()) {
         return nullptr;
     }
     const Entry& e = *--it;
