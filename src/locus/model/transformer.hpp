@@ -1183,8 +1183,8 @@ class TransformerModel {
     std::span<const float> out_norm_;
     backend::Mat out_w_;
     std::vector<Layer> layers_;
-    /** The load-time Q8_0 and Q4_0 copies (i#1243), shared by copies of
-     * the model; null when none were made. */
+    /** The load-time Q8_0, Q4_0 and Q4_K copies (i#1243), shared by
+     * copies of the model; null when none were made. */
     struct PackedSet;
     std::shared_ptr<const PackedSet> packed_;
     /** Makes packed_ when backend_ reads it (Ops::packs_block32) and the

@@ -43,6 +43,18 @@ inline constexpr std::size_t kPackedQ8_0Block = 136;
 inline constexpr std::size_t kPackedQ4_0Block = 72;
 
 /**
+ * Bytes of one packed Q4_K quad block (256 columns of 4 rows), its 6-bit
+ * scales and mins decoded at load so the kernel does not unpack them:
+ * d[4] and dmin[4] as f32 (from f16, exact); sc[8][4] and mn[8][4],
+ * sub-block s's scale and min of row j at 32 + 4 s + j and 64 + 4 s +
+ * j; then 512 bytes of quants, byte 96 + 16 v + 4 j + i being byte 4 v
+ * + i of row j's 128 nibble bytes (v 0 .. 31): its low nibble is element
+ * 64 (v / 8) + 4 (v % 8) + i, its high one 32 more. Larger than the
+ * four source blocks (576), so the lookup scales the offset.
+ */
+inline constexpr std::size_t kPackedQ4KBlock = 608;
+
+/**
  * A block-32 matrix (Q8_0 or Q4_0) repacked four rows at a time.
  * find_packed sees it once it is registered (register_packed); a
  * registered copy that is destroyed unregisters itself. A last quad
@@ -72,6 +84,7 @@ private:
     const std::byte* src_;
     std::size_t src_bytes_;
     std::size_t row_bytes_;
+    std::size_t quad_bytes_;  // packed bytes per quad of rows
     std::vector<std::byte> bytes_;
     bool registered_ = false;
 };
@@ -89,17 +102,25 @@ void register_packed(std::span<PackedBlock32* const> set);
 void unregister_packed(std::span<PackedBlock32* const> set);
 
 /**
- * @returns Whether w can be repacked: Q8_0 or Q4_0, cols a positive
- *     multiple of 32, rows >= 1 and data not null.
+ * @returns Whether w can be repacked: Q8_0 or Q4_0 with cols a positive
+ *     multiple of 32, or Q4_K with cols a positive multiple of 256;
+ *     rows >= 1 and data not null.
  */
 bool packs_block32(const Mat& w);
+
+/**
+ * @returns The bytes of w's packed copy: one packed block per 32 (Q8_0,
+ *     Q4_0) or 256 (Q4_K) columns per quad of rows, a last short quad
+ *     counted whole. packs_block32(w) must hold.
+ */
+std::size_t packed_size(const Mat& w);
 
 /**
  * @returns The packed quads of w's rows when w starts on a quad of a
  *     registered matrix of the same type and row width, else nullptr.
  *     Quad q of w (rows 4 q .. 4 q + 3) is at result + q * nb * block,
- *     nb = cols / 32, block kPackedQ8_0Block or kPackedQ4_0Block. Safe
- *     to call from any thread.
+ *     nb = cols / 32 with block kPackedQ8_0Block or kPackedQ4_0Block,
+ *     or cols / 256 with kPackedQ4KBlock. Safe to call from any thread.
  */
 const std::byte* find_packed(const Mat& w);
 
@@ -112,5 +133,8 @@ void pack_q8_0_quad(const Mat& w, std::uint32_t r0, std::byte* out);
 
 /** As pack_q8_0_quad for a Q4_0 w: nb * 72 bytes. */
 void pack_q4_0_quad(const Mat& w, std::uint32_t r0, std::byte* out);
+
+/** As pack_q8_0_quad for a Q4_K w: cols / 256 * 608 bytes. */
+void pack_q4_k_quad(const Mat& w, std::uint32_t r0, std::byte* out);
 
 }  // namespace locus::backend

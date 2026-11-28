@@ -382,15 +382,183 @@ void block32_batch(const Mat& w, const std::byte* pk,
     block32_rows<Q4>(w, pk, d.data(), q.data(), n, out.data(), n);
 }
 
+/** w's load-time Q4_K copy, or null. */
+const std::byte* q4_k_copy(const Mat& w) {
+    return w.type == gguf::TensorType::kQ4_K ? find_packed(w) : nullptr;
+}
+
+/** One sub-block pair's 8 lane dots: lane j is row j's integer dot of
+ *  the 32 quants (lo / hi) with the 32 activations (x0, x1). */
+inline int32x4_t q4k_dot(const int8x16_t w[8], int8x16_t x0, int8x16_t x1) {
+    int32x4_t s = vdupq_n_s32(0);
+    s = vdotq_laneq_s32(s, w[0], x0, 0);
+    s = vdotq_laneq_s32(s, w[1], x0, 1);
+    s = vdotq_laneq_s32(s, w[2], x0, 2);
+    s = vdotq_laneq_s32(s, w[3], x0, 3);
+    s = vdotq_laneq_s32(s, w[4], x1, 0);
+    s = vdotq_laneq_s32(s, w[5], x1, 1);
+    s = vdotq_laneq_s32(s, w[6], x1, 2);
+    s = vdotq_laneq_s32(s, w[7], x1, 3);
+    return s;
+}
+
+/**
+ * A packed Q4_K quad (nb blocks of 608 bytes at pq, repack.hpp) against
+ * T Q8_K tokens (token t's scales at d + t * nb, quants at q + t * cols,
+ * 16-sums at ys + t * nb * 16): lane j of sum[t] is row j's dot with
+ * token t. Per (row, token, block) the integer sums A (the scaled
+ * sub-block dots) and M (the sub-block sums times the mins) are exact,
+ * then sum + ((d * dy) * A - (dmin * dy) * M), a multiply, a multiply,
+ * a subtract and an add, no fma: rows_q4_k_q8k_xt's steps per lane, so
+ * its bits (i#1243).
+ */
+template <int T>
+void quad_q4k_tokens(const std::byte* pq, std::size_t nb, std::size_t cols,
+                     const float* d, const std::int8_t* q,
+                     const std::int16_t* ys, float32x4_t sum[T]) {
+    const uint8x16_t m4b = vdupq_n_u8(0x0f);
+    for (int t = 0; t < T; ++t) {
+        sum[t] = vdupq_n_f32(0.0f);
+    }
+    for (std::size_t b = 0; b < nb; ++b) {
+        const std::byte* o = pq + b * kPackedQ4KBlock;
+        const auto* u8 = reinterpret_cast<const std::uint8_t*>(o);
+        float bdv[4], bmv[4];
+        std::memcpy(bdv, o, sizeof(bdv));
+        std::memcpy(bmv, o + 16, sizeof(bmv));
+        const float32x4_t bd = vld1q_f32(bdv), bdmin = vld1q_f32(bmv);
+        int32x4_t sc[8], mn[8];
+        for (int s = 0; s < 8; s += 2) {
+            const uint16x8_t a = vmovl_u8(vld1_u8(u8 + 32 + 4 * s));
+            const uint16x8_t m = vmovl_u8(vld1_u8(u8 + 64 + 4 * s));
+            sc[s] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(a)));
+            sc[s + 1] = vreinterpretq_s32_u32(vmovl_high_u16(a));
+            mn[s] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(m)));
+            mn[s + 1] = vreinterpretq_s32_u32(vmovl_high_u16(m));
+        }
+        int32x4_t acc[T];
+        for (int t = 0; t < T; ++t) {
+            acc[t] = vdupq_n_s32(0);
+        }
+        for (int p = 0; p < 4; ++p) {
+            int8x16_t lo[8], hi[8];
+            for (int v = 0; v < 8; ++v) {
+                const uint8x16_t wv = vld1q_u8(u8 + 96 + 16 * (8 * p + v));
+                lo[v] = vreinterpretq_s8_u8(vandq_u8(wv, m4b));
+                hi[v] = vreinterpretq_s8_u8(vshrq_n_u8(wv, 4));
+            }
+            for (int t = 0; t < T; ++t) {
+                const std::int8_t* x = q + t * cols + b * 256 + 64 * p;
+                const int32x4_t dl =
+                    q4k_dot(lo, vld1q_s8(x), vld1q_s8(x + 16));
+                const int32x4_t dh =
+                    q4k_dot(hi, vld1q_s8(x + 32), vld1q_s8(x + 48));
+                acc[t] = vmlaq_s32(acc[t], dl, sc[2 * p]);
+                acc[t] = vmlaq_s32(acc[t], dh, sc[2 * p + 1]);
+            }
+        }
+        for (int t = 0; t < T; ++t) {
+            // Sub-block s's activation sum is bs[2s] + bs[2s + 1].
+            const std::int16_t* bs = ys + (t * nb + b) * 16;
+            const int16x8_t bsum =
+                vpaddq_s16(vld1q_s16(bs), vld1q_s16(bs + 8));
+            int32x4_t m = vmulq_n_s32(mn[0], vgetq_lane_s16(bsum, 0));
+            m = vmlaq_n_s32(m, mn[1], vgetq_lane_s16(bsum, 1));
+            m = vmlaq_n_s32(m, mn[2], vgetq_lane_s16(bsum, 2));
+            m = vmlaq_n_s32(m, mn[3], vgetq_lane_s16(bsum, 3));
+            m = vmlaq_n_s32(m, mn[4], vgetq_lane_s16(bsum, 4));
+            m = vmlaq_n_s32(m, mn[5], vgetq_lane_s16(bsum, 5));
+            m = vmlaq_n_s32(m, mn[6], vgetq_lane_s16(bsum, 6));
+            m = vmlaq_n_s32(m, mn[7], vgetq_lane_s16(bsum, 7));
+            const float dy = d[t * nb + b];
+            const float32x4_t a =
+                vmulq_f32(vmulq_n_f32(bd, dy), vcvtq_f32_s32(acc[t]));
+            const float32x4_t mm =
+                vmulq_f32(vmulq_n_f32(bdmin, dy), vcvtq_f32_s32(m));
+            sum[t] = vaddq_f32(sum[t], vsubq_f32(a, mm));
+        }
+    }
+}
+
+/**
+ * out[r * ostride + t] for every row of a Q4_K w with a load-time copy
+ * pk and n Q8_K tokens (scales d at t * nb, quants q at t * cols,
+ * 16-sums ys at t * nb * 16): per token tile, each quad dotted against
+ * the tile's tokens 4 at a time, then one by one.
+ */
+void q4k_rows(const Mat& w, const std::byte* pk, const float* d,
+              const std::int8_t* q, const std::int16_t* ys, std::uint32_t n,
+              float* out, std::size_t ostride) {
+    const std::size_t nb = w.cols / 256;
+    const auto store = [&](std::uint32_t r0, std::uint32_t t,
+                           float32x4_t v4) {
+        float v[4];
+        vst1q_f32(v, v4);
+        for (std::uint32_t k = 0; k < 4 && r0 + k < w.rows; ++k) {
+            out[std::size_t{r0 + k} * ostride + t] = v[k];
+        }
+    };
+    const std::uint32_t tile = token_tile(w.cols);
+    for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
+        const std::uint32_t t1 = std::min(n, t0 + tile);
+        for (std::uint32_t r0 = 0; r0 < w.rows; r0 += 4) {
+            const std::byte* pq = pk + std::size_t{r0 / 4} * nb *
+                                           kPackedQ4KBlock;
+            std::uint32_t t = t0;
+            for (; t + 4 <= t1; t += 4) {
+                float32x4_t sum[4];
+                quad_q4k_tokens<4>(pq, nb, w.cols, d + std::size_t{t} * nb,
+                                   q + std::size_t{t} * w.cols,
+                                   ys + std::size_t{t} * nb * 16, sum);
+                for (int k = 0; k < 4; ++k) {
+                    store(r0, t + k, sum[k]);
+                }
+            }
+            for (; t < t1; ++t) {
+                float32x4_t sum[1];
+                quad_q4k_tokens<1>(pq, nb, w.cols, d + std::size_t{t} * nb,
+                                   q + std::size_t{t} * w.cols,
+                                   ys + std::size_t{t} * nb * 16, sum);
+                store(r0, t, sum[0]);
+            }
+        }
+    }
+}
+
+/** All n tokens of x_batch quantized to Q8_K, then q4k_rows. */
+void q4k_batch(const Mat& w, const std::byte* pk,
+               std::span<const float> x_batch, std::span<float> out,
+               std::uint32_t n) {
+    const std::size_t nb = w.cols / 256;
+    thread_local std::vector<float> d;
+    thread_local std::vector<std::int8_t> q;
+    thread_local std::vector<std::int16_t> ys;
+    d.resize(nb * n);
+    q.resize(std::size_t{w.cols} * n);
+    ys.resize(nb * 16 * n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        quantize_activation_q8k_neon(
+            x_batch.subspan(std::size_t{t} * w.cols, w.cols),
+            d.data() + t * nb, q.data() + std::size_t{t} * w.cols,
+            ys.data() + t * nb * 16);
+    }
+    q4k_rows(w, pk, d.data(), q.data(), ys.data(), n, out.data(), n);
+}
+
 }  // namespace
 
 void matvec_neon_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
     // Without a load-time copy one token takes the one-row sdot kernel,
     // the faster there (same bits); with one, the copy (see
-    // block32_rows), for Q8_0 and Q4_0 alike.
+    // block32_rows), for Q8_0, Q4_0 and Q4_K alike (Q4_K decode on the
+    // Pi 5: the copy and the rows as stored level, 5 rounds).
     if (const std::byte* pk = q4_0_copy(w)) {
         block32_batch<true>(w, pk, x, out, 1);
+        return;
+    }
+    if (const std::byte* pk = q4_k_copy(w)) {
+        q4k_batch(w, pk, x, out, 1);
         return;
     }
     const std::byte* pk = takes(w) ? find_packed(w) : nullptr;
@@ -405,6 +573,10 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n) {
     if (const std::byte* pk = q4_0_copy(w)) {
         block32_batch<true>(w, pk, x_batch, out_batch, n);
+        return;
+    }
+    if (const std::byte* pk = q4_k_copy(w)) {
+        q4k_batch(w, pk, x_batch, out_batch, n);
         return;
     }
     if (!takes(w)) {
@@ -451,6 +623,13 @@ void matvec_q8k_batch_pre_neon(const Mat& w, const QuantBatch& b,
     if (const std::byte* pk = q4_0_copy(w)) {
         block32_rows<true>(w, pk, b.d.data(), b.qs.data(), n,
                            out_batch.data(), n);
+        return;
+    }
+    // Q4_K's Q8_K activations are the dotprod build's layout too (d at
+    // t * nb, qs at t * cols, 16-sums at t * nb * 16).
+    if (const std::byte* pk = q4_k_copy(w)) {
+        q4k_rows(w, pk, b.d.data(), b.qs.data(), b.bsums.data(), n,
+                 out_batch.data(), n);
         return;
     }
     if (!takes(w)) {

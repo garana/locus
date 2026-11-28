@@ -1475,7 +1475,11 @@ interleaved per token tile; row slices start on multiples of 4 so each
 finds its quads. Q4_0 takes the same kernel from its copy only
 (`block_q4_0x4`, the nibbles xor 0x88 so a shift or a mask gives 16
 times each signed quant; the exact dot is the sdot sum over 16), else
-the one-row and four-token kernels. On the M4 Max
+the one-row and four-token kernels. Q4_K likewise, from a copy of four
+rows a 608-byte block (scales and mins decoded at load, f32 d and
+dmin, the quants 4 bytes of each row in turn; 6% larger than the rows,
+so the lookup scales the offset), with the row kernel's steps per
+lane, so its bits. On the M4 Max
 this takes Orpheus 3B Q4_K_M prefill from 97 to 182 tok/s and decode
 from 80 to 85 tok/s. F32, F16 and BF16 weights always take the f32
 dot; on neon F16 and BF16 widen to f32 in registers, 8 weights a step
