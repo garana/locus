@@ -140,7 +140,10 @@ cost above.
   results are close to the default's but not bit-identical.
 - FLUX.1 Kontext Q8_0, one DiT step: 512 x 512 Vulkan 4.88 s, Metal
   4.30 s; 1024 x 1024 Vulkan 17.6 s, Metal 16.4 s (#1044). The server
-  serves images on Vulkan today (#1057).
+  runs the FLUX DiT on Metal, CLIP, T5 and the VAE on Vulkan (#1057):
+  a served 4-step image, warm, 256 x 256 10.7 s against 25.2 s with
+  the DiT on Vulkan, 512 x 512 19.8 against 31.2 s, 1024 x 1024 64.8
+  against 80.7 s.
 
 Against llama.cpp (Homebrew, ggml 1.1.1; 2026-11-27), main 5443ecf5,
 so the CPU rows are before #1232's block-32 change (its Q8_0 prefill
