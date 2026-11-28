@@ -14,7 +14,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
+#include <string_view>
 #include <vector>
 
 namespace locus::backend {
@@ -258,6 +260,163 @@ __global__ void gqa_attend_combine(const float* __restrict__ part,
     }
 }
 
+/** Query-heads a flash block takes: up to 32 (the tile's queries times
+ *  the group). */
+constexpr std::uint32_t kFlashHeads = 32;
+
+/**
+ * Flash attention for a prefill chunk of one sequence (i#1254): one
+ * block per (KV head, tile of QT = kFlashHeads / group queries). K and
+ * V are staged in shared memory KT positions at a time, read once for
+ * the tile's QT * group query-heads; a thread takes whole (query-head,
+ * position) dots, so no shuffle tree; each query-head keeps a running
+ * max and sum (online softmax) and its output in registers, so there is
+ * no partial buffer and no second pass. A position past a query is
+ * masked. Its sums run in another order than gqa_attend_partial's, so a
+ * prefill's attention is close to, not bit for bit, a decode's
+ * (DESIGN 16).
+ *
+ * Shared memory: H * HD floats of q, KT * (HD + 1) of the K or V tile
+ * (a row padded by one float, so lanes on different rows hit different
+ * banks), H * KT scores, 3 H for the running max, sum and rescale.
+ */
+template <std::uint32_t HD>
+__global__ void gqa_attend_flash(
+    const float* __restrict__ kv, const std::uint32_t* __restrict__ blocks,
+    std::size_t block_stride, std::size_t layer_off, std::size_t v_off,
+    std::uint32_t bt, std::uint32_t kv_dim, float scale,
+    const std::uint32_t* __restrict__ qpos, std::uint32_t n_q,
+    std::uint32_t group, const float* __restrict__ q, std::size_t q_stride,
+    float* __restrict__ out) {
+    constexpr std::uint32_t KT = HD <= 64 ? 32 : 16;
+    constexpr std::uint32_t KS = HD + 1;  // padded row stride
+    constexpr std::uint32_t kPer = kFlashHeads * HD / kAttendThreads;
+    extern __shared__ float sh[];
+    const std::uint32_t qt = kFlashHeads / group;
+    const std::uint32_t H = qt * group;
+    const std::uint32_t kvh = blockIdx.x, q0 = blockIdx.y * qt;
+    const std::uint32_t nq = min(qt, n_q - q0);
+    const unsigned tid = threadIdx.x, nt = blockDim.x;
+    const unsigned lane = tid % 32, warp = tid / 32, nw = nt / 32;
+    float* qs = sh;                    // [h][HD], h = query * group + g
+    float* kvs = qs + H * HD;          // [KT][KS]
+    float* ps = kvs + KT * KS;         // [h][KT]
+    float* mh = ps + H * KT;           // running max a query-head
+    float* lh = mh + H;                // running sum
+    float* rs = lh + H;                // this tile's rescale
+    const std::size_t head0 = std::size_t{kvh} * group * HD;
+    std::uint32_t last = 0;  // the tile's positions: up to its last query
+    for (std::uint32_t i = 0; i < nq; ++i) {
+        last = max(last, qpos[q0 + i] + 1);
+    }
+    for (std::uint32_t e = tid; e < H * HD; e += nt) {
+        const std::uint32_t h = e / HD, i = h / group;
+        qs[e] = i < nq ? q[(q0 + i) * q_stride + head0 +
+                           std::size_t{h % group} * HD + e % HD]
+                       : 0.0f;
+    }
+    for (std::uint32_t h = tid; h < H; h += nt) {
+        mh[h] = -INFINITY;
+        lh[h] = 0.0f;
+    }
+    float acc[kPer];
+#pragma unroll
+    for (std::uint32_t k = 0; k < kPer; ++k) {
+        acc[k] = 0.0f;
+    }
+    const auto row_of = [&](std::uint32_t t) {
+        return blocks[t / bt] * block_stride + layer_off +
+               std::size_t{t % bt} * kv_dim + std::size_t{kvh} * HD;
+    };
+    for (std::uint32_t t0 = 0; t0 < last; t0 += KT) {
+        const std::uint32_t n = min(KT, last - t0);
+        __syncthreads();  // the last tile's V and scores are used
+        for (std::uint32_t e = tid; e < KT * HD; e += nt) {
+            const std::uint32_t j = e / HD, d = e % HD;
+            kvs[j * KS + d] = j < n ? __ldg(kv + row_of(t0 + j) + d) : 0.0f;
+        }
+        __syncthreads();
+        // Scores: a thread a (query-head, position), a plain dot.
+        for (std::uint32_t e = tid; e < H * KT; e += nt) {
+            const std::uint32_t h = e / KT, j = e % KT;
+            const std::uint32_t i = h / group;
+            float s = -INFINITY;
+            if (i < nq && j < n && t0 + j <= qpos[q0 + i]) {
+                const float* qr = qs + h * HD;
+                const float* kr = kvs + j * KS;
+                float d = 0.0f;
+#pragma unroll 16
+                for (std::uint32_t x = 0; x < HD; ++x) {
+                    d += qr[x] * kr[x];
+                }
+                s = d * scale;
+            }
+            ps[e] = s;
+        }
+        __syncthreads();
+        // Online softmax: warp w takes query-heads w, w + nw, ...
+        for (std::uint32_t h = warp; h < H; h += nw) {
+            float s = lane < KT ? ps[h * KT + lane] : -INFINITY;
+            float mx = s;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            }
+            const float m_old = mh[h];
+            const float m_new = fmaxf(m_old, mx);
+            const float p = s == -INFINITY ? 0.0f : expf(s - m_new);
+            float sum = p;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            }
+            if (lane < KT) {
+                ps[h * KT + lane] = p;
+            }
+            __syncwarp();
+            if (lane == 0) {
+                const float r =
+                    m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
+                rs[h] = r;
+                lh[h] = lh[h] * r + sum;
+                mh[h] = m_new;
+            }
+        }
+        __syncthreads();
+        // V into the same tile buffer.
+        for (std::uint32_t e = tid; e < KT * HD; e += nt) {
+            const std::uint32_t j = e / HD, d = e % HD;
+            kvs[j * KS + d] =
+                j < n ? __ldg(kv + row_of(t0 + j) + v_off + d) : 0.0f;
+        }
+        __syncthreads();
+        // Outputs: thread owns (h, d) = e / HD, e % HD for e = tid + k nt.
+#pragma unroll
+        for (std::uint32_t k = 0; k < kPer; ++k) {
+            const std::uint32_t e = tid + k * nt;
+            const std::uint32_t h = e / HD, d = e % HD;
+            if (h < H) {
+                float v = acc[k] * rs[h];
+                for (std::uint32_t j = 0; j < n; ++j) {
+                    v += ps[h * KT + j] * kvs[j * KS + d];
+                }
+                acc[k] = v;
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (std::uint32_t k = 0; k < kPer; ++k) {
+        const std::uint32_t e = tid + k * nt;
+        const std::uint32_t h = e / HD, d = e % HD;
+        const std::uint32_t i = h / group;
+        if (h < H && i < nq) {
+            out[(q0 + i) * q_stride + head0 + std::size_t{h % group} * HD +
+                d] = acc[k] / lh[h];
+        }
+    }
+}
+
 /** Grow-only device scratch for cuda_kv_attend; callers hold mu. */
 struct AttendScratch {
     std::mutex mu;
@@ -370,6 +529,46 @@ bool cuda_kv_attend(const KvAttend& a) {
     const auto* qpos = static_cast<const std::uint32_t*>(
         dev_tables ? a.dev_meta : s.meta);
     const auto* qtab = qpos + a.n_q;
+    // A prefill chunk of one sequence (several queries, one block table)
+    // takes the flash kernel (i#1254); decode and a batch of sequences
+    // keep the two passes below. LOCUS_CUDA_FLASH=0 keeps them for all.
+    static const bool flash_on = [] {
+        const char* e = std::getenv("LOCUS_CUDA_FLASH");
+        return e == nullptr || std::string_view(e) != "0";
+    }();
+    bool one_seq = a.n_q > 1;
+    for (std::uint32_t i = 1; one_seq && i < a.n_q; ++i) {
+        one_seq = meta[a.n_q + i] == meta[a.n_q];
+    }
+    const auto flash = [&](auto kernel, std::uint32_t hd) {
+        const std::uint32_t kt = hd <= 64 ? 32 : 16;
+        const std::uint32_t h = kFlashHeads / group * group;
+        const std::size_t sh =
+            (std::size_t{h} * hd + std::size_t{kt} * (hd + 1) +
+             std::size_t{h} * kt + 3 * std::size_t{h}) * sizeof(float);
+        if (sh > 48 * 1024) {
+            return false;
+        }
+        const std::uint32_t qt = kFlashHeads / group;
+        // The sequence's table starts at its offset in the blocks array
+        // (the queries share it: one_seq), as qtab does for the two-pass
+        // kernels; the n_blocks check above covers tab + pos / bt.
+        kernel<<<dim3(a.n_kv_heads, (a.n_q + qt - 1) / qt), kAttendThreads,
+                 sh>>>(static_cast<const float*>(a.mirror),
+                       dblocks + meta[a.n_q],
+                       a.block_stride, a.layer_off, a.v_off, a.block_tokens,
+                       a.n_kv_heads * a.head_dim, a.kq_scale, qpos, a.n_q,
+                       group, dq, a.q_stride, dout);
+        return true;
+    };
+    bool flashed = false;
+    if (flash_on && one_seq) {
+        if (a.head_dim == 64) {
+            flashed = flash(gqa_attend_flash<64>, 64);
+        } else if (a.head_dim == 128) {
+            flashed = flash(gqa_attend_flash<128>, 128);
+        }
+    }
     const auto partial = [&](auto kernel) {
         kernel<<<dim3(a.n_kv_heads, a.n_q, chunks), kAttendThreads,
                  shared>>>(
@@ -378,20 +577,22 @@ bool cuda_kv_attend(const KvAttend& a) {
             a.head_dim, a.kq_scale, qpos, qtab, dq, a.q_stride,
             static_cast<float*>(s.part));
     };
-    switch (group) {
-        case 1: partial(gqa_attend_partial<1>); break;
-        case 2: partial(gqa_attend_partial<2>); break;
-        case 3: partial(gqa_attend_partial<3>); break;
-        case 4: partial(gqa_attend_partial<4>); break;
-        case 5: partial(gqa_attend_partial<5>); break;
-        case 6: partial(gqa_attend_partial<6>); break;
-        case 7: partial(gqa_attend_partial<7>); break;
-        case 8: partial(gqa_attend_partial<8>); break;
-        default: return false;  // checked above; other sizes: host
+    if (!flashed) {
+        switch (group) {
+            case 1: partial(gqa_attend_partial<1>); break;
+            case 2: partial(gqa_attend_partial<2>); break;
+            case 3: partial(gqa_attend_partial<3>); break;
+            case 4: partial(gqa_attend_partial<4>); break;
+            case 5: partial(gqa_attend_partial<5>); break;
+            case 6: partial(gqa_attend_partial<6>); break;
+            case 7: partial(gqa_attend_partial<7>); break;
+            case 8: partial(gqa_attend_partial<8>); break;
+            default: return false;  // checked above; other sizes: host
+        }
+        gqa_attend_combine<<<dim3(a.n_kv_heads, a.n_q), kAttendThreads>>>(
+            static_cast<const float*>(s.part), a.head_dim, group, qpos,
+            chunks, dout, a.q_stride);
     }
-    gqa_attend_combine<<<dim3(a.n_kv_heads, a.n_q), kAttendThreads>>>(
-        static_cast<const float*>(s.part), a.head_dim, group, qpos, chunks,
-        dout, a.q_stride);
     if (!cuda_ok(cudaGetLastError())) {
         return false;
     }

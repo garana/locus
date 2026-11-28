@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <limits>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -175,6 +176,152 @@ TEST_CASE("cuda attention over the KV mirror matches the host",
         cuda.ops, plain, ps, layer, hp, 0, 1, q.data(), out.data(), width));
 }
 
+// i#1254: a prefill chunk of one sequence at head width 64 or 128 takes
+// the flash kernel (K / V tiles in shared memory, an online softmax);
+// it tracks the host attention for every group the CUDA path takes, a
+// chunk from position 0 and one deep in the sequence (tiles of 32 or 16
+// positions cut mid-chunk, a last query tile not full).
+TEST_CASE("cuda flash prefill attention tracks the host",
+          "[cuda][attention][mirror]") {
+    if (!locus::backend::cuda_backend_usable()) {
+        SKIP("no usable CUDA device");
+    }
+    const auto& cuda = *locus::backend::find_backend("cuda");
+    std::mt19937 rng(1254);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    for (const std::uint32_t hd : {64u, 128u}) {
+        constexpr std::uint32_t n_kv = 2, layer = 0, n_pos = 150;
+        PagedKvCache::Geometry g;
+        g.n_layers = 1;
+        g.kv_dim = n_kv * hd;
+        g.block_tokens = 16;
+        g.n_blocks = 12;
+        PagedKvCache cache(g);
+        void* dev = locus::backend::cuda_kv_mirror_alloc(
+            PagedKvCache::pool_floats(g));
+        REQUIRE(dev != nullptr);
+        cache.attach_mirror({dev, &locus::backend::cuda_kv_mirror_store,
+                             &locus::backend::cuda_kv_mirror_free});
+        // Another sequence first, so seq's blocks are not the pool's
+        // first ones and its table can sit at an offset (below).
+        Seq other, seq;
+        REQUIRE(cache.ensure_capacity(other, 20));
+        REQUIRE(cache.ensure_capacity(seq, n_pos));
+        for (Seq* s : {&other, &seq}) {
+            const std::uint32_t np = s == &seq ? n_pos : 20;
+            for (std::uint32_t t = 0; t < np; ++t) {
+                for (std::uint32_t i = 0; i < g.kv_dim; ++i) {
+                    cache.k(*s, layer, t)[i] = ud(rng);
+                    cache.v(*s, layer, t)[i] = ud(rng);
+                }
+            }
+            cache.sync_rows(*s, layer, 0, np);
+        }
+        const auto host_ref = [&](const locus::model::Hparams& hp,
+                                  std::uint32_t grp, const float* qr,
+                                  std::uint32_t pos, float* ref) {
+            locus::model::gqa_attend(
+                qr, ref, hp.n_heads, hd, grp, pos, hp.kq_scale,
+                [&](std::uint32_t t) -> const float* {
+                    return cache.k(seq, layer, t);
+                },
+                [&](std::uint32_t t) -> const float* {
+                    return cache.v(seq, layer, t);
+                });
+        };
+        // seq's chunk with its table at an offset in a shared blocks
+        // array (other's table first), as a CUDA forward's device tables
+        // hold several sequences: the flash kernel must start at it.
+        {
+            locus::model::Hparams hp;
+            hp.n_kv_heads = n_kv;
+            hp.n_heads = n_kv * 4;
+            hp.head_dim = hd;
+            hp.kq_scale = 1.0f / std::sqrt(static_cast<float>(hd));
+            const std::size_t w = std::size_t{hp.n_heads} * hd;
+            constexpr std::uint32_t n_q = 24, base = 100;
+            std::vector<std::uint32_t> blocks(other.blocks.begin(),
+                                              other.blocks.end());
+            const auto off = static_cast<std::uint32_t>(blocks.size());
+            blocks.insert(blocks.end(), seq.blocks.begin(), seq.blocks.end());
+            std::vector<std::uint32_t> pos(n_q), tab(n_q, off);
+            for (std::uint32_t i = 0; i < n_q; ++i) {
+                pos[i] = base + i;
+            }
+            std::vector<float> q(n_q * w), out(n_q * w);
+            for (auto& v : q) {
+                v = ud(rng);
+            }
+            locus::backend::KvAttend a;
+            a.mirror = cache.mirror_data();
+            a.blocks = blocks.data();
+            a.n_blocks = static_cast<std::uint32_t>(blocks.size());
+            a.block_stride = cache.block_floats();
+            a.layer_off = cache.layer_offset(layer);
+            a.v_off = cache.layer_floats() / 2;
+            a.block_tokens = g.block_tokens;
+            a.n_heads = hp.n_heads;
+            a.n_kv_heads = n_kv;
+            a.head_dim = hd;
+            a.kq_scale = hp.kq_scale;
+            a.n_q = n_q;
+            a.q_pos = pos.data();
+            a.q_table = tab.data();
+            a.q = q.data();
+            a.out = out.data();
+            a.q_stride = w;
+            INFO("hd " << hd << ", table at offset " << off);
+            REQUIRE(locus::backend::cuda_kv_attend(a));
+            for (std::uint32_t i = 0; i < n_q; ++i) {
+                std::vector<float> ref(w);
+                host_ref(hp, 4, q.data() + i * w, base + i, ref.data());
+                for (std::size_t j = 0; j < w; ++j) {
+                    REQUIRE(out[i * w + j] ==
+                            Catch::Approx(ref[j]).epsilon(1e-4).margin(1e-5));
+                }
+            }
+        }
+        for (const std::uint32_t grp : {1u, 4u, 7u, 8u}) {
+            locus::model::Hparams hp;
+            hp.n_kv_heads = n_kv;
+            hp.n_heads = n_kv * grp;
+            hp.head_dim = hd;
+            hp.kq_scale = 1.0f / std::sqrt(static_cast<float>(hd));
+            const std::size_t w = std::size_t{hp.n_heads} * hd;
+            for (const auto& [base, n_q] :
+                 {std::pair<std::uint32_t, std::uint32_t>{0, 40},
+                  {113, 37}}) {
+                INFO("hd " << hd << " group " << grp << " base " << base
+                           << " n_q " << n_q);
+                std::vector<float> q(n_q * w), out(n_q * w);
+                for (auto& v : q) {
+                    v = ud(rng);
+                }
+                REQUIRE(locus::model::device_gqa_attend(
+                    cuda.ops, cache, seq, layer, hp, base, n_q, q.data(),
+                    out.data(), w));
+                for (std::uint32_t i = 0; i < n_q; ++i) {
+                    std::vector<float> ref(w);
+                    locus::model::gqa_attend(
+                        q.data() + i * w, ref.data(), hp.n_heads, hd, grp,
+                        base + i, hp.kq_scale,
+                        [&](std::uint32_t t) -> const float* {
+                            return cache.k(seq, layer, t);
+                        },
+                        [&](std::uint32_t t) -> const float* {
+                            return cache.v(seq, layer, t);
+                        });
+                    for (std::size_t j = 0; j < w; ++j) {
+                        REQUIRE(out[i * w + j] ==
+                                Catch::Approx(ref[j]).epsilon(1e-4).margin(
+                                    1e-5));
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("cuda attention: prefill and decode give the same logits",
           "[cuda][attention][mirror]") {
     const auto* cuda = locus::backend::find_backend("cuda");
@@ -242,8 +389,9 @@ TEST_CASE("cuda forward runs qwen2 on the GPU path, prefill equal to decode",
           "[cuda][attention][mirror][qwen]") {
     // Qwen2's attention (q / k / v biases, NEOX RoPE) takes the
     // one-submit forward (i#1196): the device stage moves and the per-op
-    // attention stage does not; a prefill gives the bits of decode
-    // steps; both stay close to the CPU's forward.
+    // attention stage does not; a prefill tracks the decode steps (its
+    // attention is the flash kernel, i#1254); both stay close to the
+    // CPU's forward.
     const auto* cuda = locus::backend::find_backend("cuda");
     if (cuda == nullptr || !cuda->available) {
         SKIP("no usable CUDA backend");
@@ -287,9 +435,25 @@ TEST_CASE("cuda forward runs qwen2 on the GPU path, prefill equal to decode",
     }
     CHECK(sm->stage_ns(Stage::kDevice) > dev0);
     CHECK(sm->stage_ns(Stage::kAttention) == att0);
-    for (std::size_t i = 0; i < all.size(); ++i) {
-        INFO("position " << i / nv << " logit " << i % nv);
-        REQUIRE(same_bits(all[i], step[i]));
+    // The prefill's attention is the flash kernel (i#1254), decode's the
+    // two-pass one: close, not bit for bit (DESIGN 16), and the same top
+    // token at every position.
+    {
+        float gap = 0.0f, big = 0.0f;
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            gap = std::max(gap, std::fabs(all[i] - step[i]));
+            big = std::max(big, std::fabs(step[i]));
+        }
+        WARN("prefill against decode, largest logit gap " << gap << " of "
+                                                          << big);
+        CHECK(gap <= 1e-4f * big);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            INFO("position " << t);
+            CHECK(locus::model::argmax(std::span<const float>(
+                      all.data() + std::size_t{t} * nv, nv)) ==
+                  locus::model::argmax(std::span<const float>(
+                      step.data() + std::size_t{t} * nv, nv)));
+        }
     }
 
     // The CPU on f32 activations, as the CUDA forward computes: its

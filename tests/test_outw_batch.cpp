@@ -181,11 +181,16 @@ void check_outw(TransformerModel& model, float tol = 0.0f) {
 // skipped (no batched forward). Convention: test_model_e2e.cpp.
 // tol applies only where one token and a batch take different float
 // orders: the sse4 backend on an AVX CPU (i#1244) and the fallback copy
-// of it; every other backend, metal's batch-invariant mode among them,
-// keeps bit for bit.
+// of it, and cuda, whose prefill chunk attends with the flash kernel and
+// a decode step with the two-pass one (i#1254: within 1e-3 there, the
+// gap is about 1e-5); every other backend, metal's batch-invariant mode
+// among them, keeps bit for bit.
 void sweep_backends(const std::string& path, float tol = 0.0f) {
     const bool avx = locus::sys::detect().avx;
     const auto tol_for = [&](std::string_view name) {
+        if (tol > 0.0f && name == "cuda") {
+            return 1e-3f;
+        }
         return avx && name == "sse4" ? tol : 0.0f;
     };
     const float fb_tol = tol_for(locus::backend::best_backend().name);
