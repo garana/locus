@@ -2255,6 +2255,23 @@ TEST_CASE("neon dotprod fast Q4_0 from a load-time copy gives the scalar "
             }
         }
     }
+    // The split batch (#1261's hooks: quantized once in two halves, then
+    // rows 0 .. 15 and 16 .. 36 dotted apart) reads the copy too, with
+    // the whole call's bits.
+    locus::backend::QuantBatch qb;
+    REQUIRE(neon_dotprod_fast::q8k_batch_size_neon(m, n, qb));
+    neon_dotprod_fast::q8k_batch_quantize_neon(m, x, 0, 33, qb);
+    neon_dotprod_fast::q8k_batch_quantize_neon(m, x, 33, n, qb);
+    std::vector<float> sp(std::size_t{rows} * n);
+    neon_dotprod_fast::matvec_q8k_batch_pre_neon(
+        locus::backend::mat_rows(m, 0, 16), qb,
+        std::span(sp.data(), std::size_t{16} * n), n);
+    neon_dotprod_fast::matvec_q8k_batch_pre_neon(
+        locus::backend::mat_rows(m, 16, rows - 16), qb,
+        std::span(sp.data() + std::size_t{16} * n,
+                  std::size_t{rows - 16} * n),
+        n);
+    REQUIRE(sp == got);
 }
 #endif
 #endif

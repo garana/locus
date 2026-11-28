@@ -443,13 +443,20 @@ void q8k_batch_quantize_neon(const Mat& w, std::span<const float> x_batch,
 
 void matvec_q8k_batch_pre_neon(const Mat& w, const QuantBatch& b,
                                std::span<float> out_batch, std::uint32_t n) {
+    // The load-time copy where the model made one (i#1243), as the whole
+    // batch call: a row slice starts on a multiple of 4 (slice_row), so
+    // find_packed finds its quads. Q4_0's activations are the dotprod
+    // build's block-32 layout (d at t * nb, qs at t * cols), which its
+    // size and quantize hooks fill, so only the dots differ.
+    if (const std::byte* pk = q4_0_copy(w)) {
+        block32_rows<true>(w, pk, b.d.data(), b.qs.data(), n,
+                           out_batch.data(), n);
+        return;
+    }
     if (!takes(w)) {
         base::matvec_q8k_batch_pre_neon(w, b, out_batch, n);
         return;
     }
-    // The load-time copy where the model made one (i#1243), as the whole
-    // batch call: a row slice starts on a multiple of 4 (slice_row), so
-    // find_packed finds its quads.
     block32_rows<false>(w, find_packed(w), b.d.data(), b.qs.data(), n,
                         out_batch.data(), n);
 }
