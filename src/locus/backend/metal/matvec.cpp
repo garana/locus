@@ -61,6 +61,27 @@ Kind kind_of(TensorType t) {
 }
 
 /**
+ * @returns The prefill matmul tile's weight rows for ctx's GPU (i#1074,
+ * the per-family table of #1240): 128 below Apple family 9 (the M2,
+ * family 8: Llama 1B's prefill matmuls about 5% faster than with 64;
+ * family 7, the M1, takes it too, unmeasured), 64 on 9 and up (the M4,
+ * where mm_tile was tuned). LOCUS_METAL_MM_TILE=64 or 128 picks one
+ * (tests, benches).
+ */
+std::uint32_t mm_tile_rows(const Context& ctx) {
+    if (const char* e = std::getenv("LOCUS_METAL_MM_TILE")) {
+        const std::string_view v(e);
+        if (v == "64") {
+            return 64;
+        }
+        if (v == "128") {
+            return 128;
+        }
+    }
+    return ctx.apple_family() >= 9 ? 64 : 128;
+}
+
+/**
  * @returns The Q6_K matvec kernel for ctx's GPU (i#1058): ggml's
  * half-block layout below Apple family 9 (the M2, family 8, reads Q6_K
  * at about twice the bandwidth with it; family 7, the M1, takes it too,
@@ -463,7 +484,10 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
     if (kernel.empty() || cols % block != 0 || n_tok == 0) {
         return false;
     }
-    const std::uint32_t row_tiles = (rows + 63) / 64;
+    // The tile by GPU family (i#1074): 128 rows on 256 threads, or 64 on
+    // 128.
+    const std::uint32_t tm = mm_tile_rows(ctx);
+    const std::uint32_t row_tiles = (rows + tm - 1) / tm;
     const std::uint32_t tok_tiles = (n_tok + 31) / 32;
     const MmParams p{w_off,    x_off,      out_off,
                      rows,     cols,       n_tok,
@@ -471,8 +495,10 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                      scale,    row_tiles,  1,
                      0};
     const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
-    ctx.dispatch(kernel.c_str(), args, std::as_bytes(std::span(&p, 1)),
-                 row_tiles * tok_tiles * 128, 128);
+    const std::uint32_t group = tm == 128 ? 256 : 128;
+    const std::string name = tm == 128 ? kernel + "_r128" : kernel;
+    ctx.dispatch(name.c_str(), args, std::as_bytes(std::span(&p, 1)),
+                 row_tiles * tok_tiles * group, group);
     return true;
 }
 
