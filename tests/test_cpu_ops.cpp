@@ -3174,11 +3174,12 @@ TEST_CASE("quantize_activation_q8_0 gives the scalar form's bits", "[ops]") {
         const float d = amax / 127.0f;
         const float id = d != 0.0f ? 1.0f / d : 0.0f;
         d_out = f16_to_f32(f32_to_f16(d));
+        // A non-finite product is 0 on every path (i#1269).
         for (int j = 0; j < 32; ++j) {
             const float v = xb[j] * id;
-            qs[j] = std::isnan(v)
-                        ? 0
-                        : static_cast<std::int8_t>(std::nearbyint(v));
+            qs[j] = std::isfinite(v)
+                        ? static_cast<std::int8_t>(std::nearbyint(v))
+                        : std::int8_t{0};
         }
     };
     constexpr std::size_t nb = 64;
@@ -3205,7 +3206,7 @@ TEST_CASE("quantize_activation_q8_0 gives the scalar form's bits", "[ops]") {
     for (int j = 0; j < 32; ++j) {
         x[192 + j] = nan;  // block 6: all NaN
         // Block 7: amax about 1e-38, so 1 / d overflows to inf and each
-        // nonzero x * id is +-inf (the cast keeps the low byte).
+        // nonzero x * id is +-inf, a quant of 0 (i#1269).
         x[224 + j] = 1e-38f * dist(rng);
         // Block 8: amax 1e-45, so d rounds to 0 and id is 0.
         x[256 + j] = j % 2 == 0 ? 1e-45f : -1e-45f;
@@ -3227,4 +3228,22 @@ TEST_CASE("quantize_activation_q8_0 gives the scalar form's bits", "[ops]") {
     REQUIRE(qs[64 + 5] == 2);   // 2.5 rounds to even
     REQUIRE(qs[64 + 6] == -4);  // -3.5 rounds to even
     REQUIRE(qs[64 + 7] == 0);
+    for (int j = 0; j < 32; ++j) {
+        REQUIRE(qs[224 + j] == 0);  // block 7: +-inf products are 0
+    }
+#if defined(__aarch64__)
+    // The NEON form on the same blocks (i#1269: it saturated +inf to a
+    // low byte of 0xff, -1, where the others give 0).
+    std::vector<float> dn(nb);
+    std::vector<std::int8_t> qn(nb * 32);
+    quantize_activation_q8_0_neon(x, dn.data(), qn.data());
+    for (std::size_t b = 0; b < nb; ++b) {
+        INFO("neon block " << b);
+        REQUIRE(std::bit_cast<std::uint32_t>(dn[b]) ==
+                std::bit_cast<std::uint32_t>(want_d[b]));
+        for (int j = 0; j < 32; ++j) {
+            REQUIRE(qn[b * 32 + j] == want_qs[b * 32 + j]);
+        }
+    }
+#endif
 }
