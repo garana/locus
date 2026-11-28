@@ -64,14 +64,15 @@ const std::vector<Backend>& list() {
         // the same bits alone or in a batch. Both read the model's
         // load-time copy where it made one (i#1243), so only one copy
         // of the weights is hot; else a batch interleaves the rows per
-        // token tile and one token takes the one-row kernel above. The
-        // i8mm path below, in the same order, replaces it under
-        // LOCUS_CPU_FAST.
+        // token tile and one token takes the one-row kernel above. Q4_0
+        // takes the same shape from its copy only (without one, the
+        // kernels above). The i8mm path below, in the same order,
+        // replaces it under LOCUS_CPU_FAST.
         if (f.dotprod) {
             Ops& o = b.back().ops;
             o.matvec_q8k = &neon_dotprod_fast::matvec_neon_q8k;
             o.matvec_q8k_batch = &neon_dotprod_fast::matvec_batch_neon_q8k;
-            o.packs_q8_0 = true;
+            o.packs_block32 = true;
             o.q8k_batch_size = &neon_dotprod_fast::q8k_batch_size_neon;
             o.q8k_batch_quantize = &neon_dotprod_fast::q8k_batch_quantize_neon;
             o.matvec_q8k_batch_pre =
@@ -85,7 +86,7 @@ const std::vector<Backend>& list() {
             Ops& o = b.back().ops;
             o.matvec_q8k = &neon_i8mm::matvec_neon_q8k;
             o.matvec_q8k_batch = &neon_i8mm::matvec_batch_neon_q8k;
-            o.packs_q8_0 = false;  // it reads the rows as stored
+            o.packs_block32 = false;  // it reads the rows as stored
             // Its batch has no split halves: the model calls it whole.
             o.q8k_batch_size = nullptr;
             o.q8k_batch_quantize = nullptr;
@@ -187,9 +188,9 @@ const std::vector<Backend>& list() {
             b.begin(), b.end(),
             [](const Backend& e) { return e.available && e.ops.cpu; });
         Ops mo = cpu_best->ops;  // scalar is always available
-        // No load-time Q8_0 copy on Metal (i#1243): its forward reads
-        // the mapped weights, so a copy would double their RAM.
-        mo.packs_q8_0 = false;
+        // No load-time block-32 copy on Metal (i#1243): its forward
+        // reads the mapped weights, so a copy would double their RAM.
+        mo.packs_block32 = false;
         mo.alloc_kv = &metal::alloc_kv;
         mo.free_kv = &metal::free_kv;
         b.push_back({"metal",

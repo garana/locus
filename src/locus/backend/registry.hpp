@@ -209,10 +209,10 @@ struct Ops {
     bool prefers_q8k = false;
     /**
      * True when matvec_q8k and matvec_q8k_batch read a load-time
-     * PackedQ8_0 copy of a Q8_0 matrix (repack.hpp, i#1243): neon on a
-     * dotprod CPU. The model makes the copies only then.
+     * PackedBlock32 copy of a Q8_0 or Q4_0 matrix (repack.hpp, i#1243):
+     * neon on a dotprod CPU. The model makes the copies only then.
      */
-    bool packs_q8_0 = false;
+    bool packs_block32 = false;
     /**
      * True when matvec and matvec_batch run on the CPU (the scalar,
      * neon, sse4 and avx2 entries, and metal's, which runs what its

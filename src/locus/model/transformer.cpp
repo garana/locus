@@ -331,19 +331,19 @@ void TransformerModel::use_backend(const backend::Backend& b) {
 }
 
 struct TransformerModel::PackedSet {
-    std::vector<std::unique_ptr<backend::PackedQ8_0>> mats;
+    std::vector<std::unique_ptr<backend::PackedBlock32>> mats;
     std::uint64_t bytes = 0;
 
     /** The copies as raw pointers, for one register or unregister. */
-    std::vector<backend::PackedQ8_0*> ptrs() const {
-        std::vector<backend::PackedQ8_0*> p;
+    std::vector<backend::PackedBlock32*> ptrs() const {
+        std::vector<backend::PackedBlock32*> p;
         for (const auto& m : mats) {
             p.push_back(m.get());
         }
         return p;
     }
     /** Unregisters the whole set in one step, then frees it. */
-    ~PackedSet() { backend::unregister_packed_q8_0(ptrs()); }
+    ~PackedSet() { backend::unregister_packed(ptrs()); }
 };
 
 std::uint64_t TransformerModel::packed_bytes() const {
@@ -352,8 +352,8 @@ std::uint64_t TransformerModel::packed_bytes() const {
 
 void TransformerModel::prepare_cpu_layout() {
     // A backend that does not read the copy (a GPU one, sse4) frees it,
-    // so a GPU run does not hold a second copy of the Q8_0 weights.
-    if (backend_ == nullptr || !backend_->ops.packs_q8_0) {
+    // so a GPU run does not hold a second copy of the weights.
+    if (backend_ == nullptr || !backend_->ops.packs_block32) {
         packed_.reset();
         return;
     }
@@ -364,17 +364,17 @@ void TransformerModel::prepare_cpu_layout() {
         e != nullptr && std::string_view(e) == "0") {
         return;
     }
-    // The copy is anonymous memory about the size of the Q8_0 weights;
-    // the mapped pages it replaces go cold and the kernel may reclaim
-    // them. A streamed model keeps the rows as stored, and so does one
-    // whose weights and copy would pass 3/4 of RAM.
+    // The copy is anonymous memory about the size of the Q8_0 and Q4_0
+    // weights; the mapped pages it replaces go cold and the kernel may
+    // reclaim them. A streamed model keeps the rows as stored, and so
+    // does one whose weights and copy would pass 3/4 of RAM.
     const std::uint64_t ram = sys::total_ram_bytes();
     if (weights_stream(weight_bytes_, ram)) {
         return;
     }
     std::vector<const Mat*> todo;
     const auto add = [&](const Mat& w) {
-        if (backend::packs_q8_0(w) &&
+        if (backend::packs_block32(w) &&
             std::none_of(todo.begin(), todo.end(), [&](const Mat* o) {
                 return o->data == w.data;
             })) {
@@ -397,11 +397,12 @@ void TransformerModel::prepare_cpu_layout() {
     set->mats.resize(todo.size());
     sys::ThreadPool::instance().parallel_for(
         todo.size(), [&](std::size_t i) {
-            set->mats[i] = std::make_unique<backend::PackedQ8_0>(*todo[i]);
+            set->mats[i] =
+                std::make_unique<backend::PackedBlock32>(*todo[i]);
         });
     set->bytes = bytes;
     // One publish for the whole model (not one per matrix).
-    backend::register_packed_q8_0(set->ptrs());
+    backend::register_packed(set->ptrs());
     packed_ = std::move(set);
 }
 
