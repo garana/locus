@@ -1115,6 +1115,25 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
         }
         std::vector<float> got(std::size_t{rows} * n);
         matvec_batch_sse4_q8k(m, xb, got, n);
+        // i#1198's split: the batch quantized in two token ranges, then
+        // two row slices (3 and 4 rows) dotted against it, as the model
+        // runs them; the same bits.
+        locus::backend::QuantBatch qb;
+        if (q8k_batch_size_sse4(m, n, qb)) {
+            q8k_batch_quantize_sse4(m, xb, 0, n / 2, qb);
+            q8k_batch_quantize_sse4(m, xb, n / 2, n, qb);
+            std::vector<float> split(std::size_t{rows} * n);
+            const std::uint32_t r_mid = 3;
+            matvec_q8k_batch_pre_sse4(
+                locus::backend::mat_rows(m, 0, r_mid), qb,
+                std::span(split.data(), std::size_t{r_mid} * n), n);
+            matvec_q8k_batch_pre_sse4(
+                locus::backend::mat_rows(m, r_mid, rows - r_mid), qb,
+                std::span(split.data() + std::size_t{r_mid} * n,
+                          std::size_t{rows - r_mid} * n),
+                n);
+            REQUIRE(split == got);
+        }
         for (std::uint32_t tk = 0; tk < n; ++tk) {
             const std::span<const float> x(xb.data() + std::size_t{tk} * cols,
                                            cols);
@@ -1228,6 +1247,25 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
         }
         std::vector<float> got(std::size_t{rows} * n);
         matvec_batch_sse4_q8k(m, xb, got, n);
+        // i#1198's split: the batch quantized in two token ranges, then
+        // two row slices (3 and 4 rows) dotted against it, as the model
+        // runs them; the same bits.
+        locus::backend::QuantBatch qb;
+        if (q8k_batch_size_sse4(m, n, qb)) {
+            q8k_batch_quantize_sse4(m, xb, 0, n / 2, qb);
+            q8k_batch_quantize_sse4(m, xb, n / 2, n, qb);
+            std::vector<float> split(std::size_t{rows} * n);
+            const std::uint32_t r_mid = 3;
+            matvec_q8k_batch_pre_sse4(
+                locus::backend::mat_rows(m, 0, r_mid), qb,
+                std::span(split.data(), std::size_t{r_mid} * n), n);
+            matvec_q8k_batch_pre_sse4(
+                locus::backend::mat_rows(m, r_mid, rows - r_mid), qb,
+                std::span(split.data() + std::size_t{r_mid} * n,
+                          std::size_t{rows - r_mid} * n),
+                n);
+            REQUIRE(split == got);
+        }
         for (std::uint32_t tk = 0; tk < n; ++tk) {
             const std::span<const float> x(xb.data() + std::size_t{tk} * cols,
                                            cols);
@@ -1798,17 +1836,24 @@ TEST_CASE("neon dotprod variant is bit-identical to the baseline neon",
         mats.push_back(Mat{t, store.back().data(), rows, cols});
     }
     {
+        // Every block-32 type: n 7 runs a four-token step of the batch
+        // kernel and a tail (i#1239).
         std::uniform_int_distribution<int> byte_d(0, 255);
-        std::vector<std::byte> w(std::size_t{rows} * (cols / 32) * 34);
-        for (auto& by : w) {
-            by = static_cast<std::byte>(byte_d(rng));
+        for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
+                                       std::pair{TensorType::kQ4_0, 18u},
+                                       std::pair{TensorType::kQ5_0, 22u},
+                                       std::pair{TensorType::kIQ4_NL, 18u}}) {
+            std::vector<std::byte> w(std::size_t{rows} * (cols / 32) * bytes);
+            for (auto& by : w) {
+                by = static_cast<std::byte>(byte_d(rng));
+            }
+            for (std::size_t bl = 0; bl < w.size() / bytes; ++bl) {
+                const std::uint16_t d = f32_to_f16(0.01f);
+                std::memcpy(w.data() + bl * bytes, &d, 2);
+            }
+            store.push_back(std::move(w));
+            mats.push_back(Mat{t, store.back().data(), rows, cols});
         }
-        for (std::size_t bl = 0; bl < w.size() / 34; ++bl) {
-            const std::uint16_t d = f32_to_f16(0.01f);
-            std::memcpy(w.data() + bl * 34, &d, 2);
-        }
-        store.push_back(std::move(w));
-        mats.push_back(Mat{TensorType::kQ8_0, store.back().data(), rows, cols});
         std::vector<std::byte> f(std::size_t{rows} * cols * 4);
         for (std::size_t i = 0; i < std::size_t{rows} * cols; ++i) {
             const float v = xd(rng);

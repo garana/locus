@@ -468,7 +468,7 @@ const backend::Backend& TransformerModel::use_backend_for(
         const backend::Backend* mt = backend::find_backend("metal");
         if (usable(mt)) {
             std::string not_taken;
-            if (kv_type == kv::KvType::kF32) {
+            if (kv_type == kv::KvType::kF32 || kv_type == kv::KvType::kF16) {
                 use_backend(*mt);  // metal_forward_why_not reads it
                 not_taken = metal_forward_why_not();
                 if (not_taken.empty()) {
@@ -476,11 +476,10 @@ const backend::Backend& TransformerModel::use_backend_for(
                     return *mt;
                 }
             } else {
-                const char* name = kv_type == kv::KvType::kQ8   ? "q8"
-                                   : kv_type == kv::KvType::kQ4 ? "q4"
-                                                                : "f16";
+                const char* name =
+                    kv_type == kv::KvType::kQ8 ? "q8" : "q4";
                 not_taken = std::string("a ") + name +
-                            " KV cache (metal_forward takes f32)";
+                            " KV cache (metal_forward takes f32 and f16)";
             }
             note = "default; metal_forward does not take this model: " +
                    not_taken + "; metal would be used if it did";
@@ -489,6 +488,36 @@ const backend::Backend& TransformerModel::use_backend_for(
                 usable(vk)) {
                 use_backend(*vk);
                 return *vk;
+            }
+        } else if (const backend::Backend* cu = backend::find_backend("cuda");
+                   usable(cu)) {
+            // i#1253: CUDA when its one-submit forward takes the model
+            // (an f32 KV cache, a plain llama or qwen2 with no MoE, and
+            // weights within the pool's budget, about 80% of free
+            // VRAM). Else the CPU: the per-op CUDA path paged a model
+            // over the budget and ran slower than the CPU on a 2 GB card
+            // (Orpheus 3B decode 1.6 against 6.5 tok/s).
+            const auto mb = [](std::uint64_t b) {
+                return std::to_string(b >> 20);
+            };
+            const std::size_t budget = cu->ops.pool_budget != nullptr
+                                           ? cu->ops.pool_budget()
+                                           : 0;
+            const std::string size =
+                mb(weight_bytes_) + " MB of weights, a " + mb(budget) +
+                " MB weight pool";
+            if (kv_type != kv::KvType::kF32) {
+                note = "default; a KV cache that is not f32 (cuda_forward "
+                       "takes f32): the best backend here";
+            } else {
+                use_backend(*cu);  // cuda_forward_supported reads it
+                if (cuda_forward_supported()) {
+                    note = "default; the model fits the CUDA device (" +
+                           size + ")";
+                    return *cu;
+                }
+                note = "default; cuda_forward does not take this model (" +
+                       size + "): the best backend here";
             }
         } else {
             note = "default; the best backend here";
@@ -2281,6 +2310,13 @@ bool batch_dequant_enabled() {
     return on;
 }
 
+/** The calling thread's QuantBatch (i#1198): reused across matmuls, so
+ *  its buffers grow to the largest batch once. */
+backend::QuantBatch& quant_batch() {
+    thread_local backend::QuantBatch qb;
+    return qb;
+}
+
 /**
  * Runs body(r0, r1) over row-slices of a rows-row matvec: threaded
  * across mt_slices() when the backend is re-entrant, else inline.
@@ -2354,6 +2390,45 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     }
     if (op.matvec_q8k != nullptr &&
         backend::uses_quantized_activation(w.type)) {
+        if (op.matvec_q8k_batch != nullptr && !op.self_parallel &&
+            op.q8k_batch_size != nullptr &&
+            op.q8k_batch_size(w, n, quant_batch())) {
+            // i#1198: the batch quantized once, its tokens split over
+            // the pool, then every row slice dots against it (before,
+            // each row slice quantized all n tokens again).
+            backend::QuantBatch& qb = quant_batch();
+            const std::size_t tslices =
+                op.mt_safe ? std::min<std::size_t>(mt_fanout(), n) : 1;
+            if (tslices <= 1) {
+                op.q8k_batch_quantize(w, x_batch, 0, n, qb);
+            } else {
+                sys::ThreadPool::instance().parallel_for(
+                    tslices, [&](std::size_t i) {
+                        op.q8k_batch_quantize(
+                            w, x_batch,
+                            static_cast<std::uint32_t>(n * i / tslices),
+                            static_cast<std::uint32_t>(n * (i + 1) /
+                                                       tslices),
+                            qb);
+                    });
+            }
+            for_row_slices(
+                op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+                    const Mat sub = backend::mat_rows(w, r0, r1 - r0);
+                    thread_local std::vector<float> rt;
+                    rt.resize(static_cast<std::size_t>(r1 - r0) * n);
+                    op.matvec_q8k_batch_pre(sub, qb, rt, n);
+                    for (std::uint32_t t = 0; t < n; ++t) {
+                        float* o =
+                            out_batch.data() +
+                            static_cast<std::size_t>(t) * oc + r0;
+                        for (std::uint32_t r = 0; r < r1 - r0; ++r) {
+                            o[r] = rt[static_cast<std::size_t>(r) * n + t];
+                        }
+                    }
+                });
+            return;
+        }
         if (op.matvec_q8k_batch != nullptr && !op.self_parallel) {
             // Each slice transposes its own rows into the token-major
             // output, so no thread waits on a serial transpose.

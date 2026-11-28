@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <vector>
 
 #include "locus/gguf/gguf.hpp"
 
@@ -151,6 +152,21 @@ struct Mat {
     const std::byte* data = nullptr;
     std::uint32_t rows = 0;
     std::uint32_t cols = 0;
+};
+
+/**
+ * A batch's activations quantized once for a matrix's row slices
+ * (Ops::q8k_batch_size / q8k_batch_quantize / matvec_q8k_batch_pre,
+ * i#1198). The backend that sizes it owns the layout: per token, the
+ * block scales in d, the int8 quants in qs, and for the K-quants the
+ * 16-wide sums in bsums and Q6_K's offset terms in q6off.
+ */
+struct QuantBatch {
+    std::vector<float> d;
+    std::vector<std::int8_t> qs;
+    std::vector<std::int16_t> bsums;
+    std::vector<std::int16_t> q6off;
+    std::uint32_t n = 0;
 };
 
 /**

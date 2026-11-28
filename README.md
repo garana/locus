@@ -75,9 +75,12 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   unified memory, whatever backend the language model uses, the
   PixArt and FLUX DiTs run each whole step on the GPU with their
   activations resident, and the VAE convolutions run on the GPU
-  (T5's attention stays on the CPU). On an M4 Max a
-  256 x 256 FLUX image takes about 35 s; elsewhere FLUX runs on the
-  CPU, minutes per image. Request fields:
+  (T5's attention stays on the CPU). On Apple the FLUX and PixArt
+  DiTs run on Metal instead, their text encoders and VAEs on Vulkan
+  (LOCUS_FLUX_METAL=0 or LOCUS_PIXART_METAL=0 keeps a DiT on Vulkan):
+  on an M4 Max a 256 x 256 FLUX image with 4 steps takes about 11 s,
+  1024 x 1024 about 65 s, and a 20-step PixArt image about 9 s;
+  elsewhere FLUX runs on the CPU, minutes per image. Request fields:
   docs/CLIENTS.md.
 - **Video output:** `/v1/videos` with LTX-Video 2B distilled (T5-XXL,
   the 3D DiT, rectified flow, the causal 3D VAE), text to video or
@@ -126,8 +129,9 @@ Speech (text to audio) is `/v1/audio/speech`. How these run together:
 
 1. Text to text has no lock: requests share continuous batching. Every
    other kind runs alongside it and slows it, since they share the CPU
-   cores and the GPU; a FLUX step on the GPU holds the Vulkan lock, so
-   text on the same GPU waits for each step.
+   cores and the GPU; a FLUX step on Vulkan holds the Vulkan lock, so
+   text on the same GPU waits for each step, and a FLUX step on Metal
+   gives the Metal lock up between transformer blocks.
 2. Image to text runs one request at a time (the next one waits), on
    its own KV cache, outside the batch (#257).
 3. Text to image and image to image share one lock with video
@@ -349,7 +353,10 @@ measurements behind each choice: [docs/HOSTS.md](docs/HOSTS.md).
 
 Without `--backend` or `LOCUS_BACKEND`, a Mac runs a model on metal
 when metal's whole-token forward takes it (and the KV cache is f32),
-else on vulkan where usable, else on neon (#867). locus-server and
+else on vulkan where usable, else on neon (#867). A host with a usable
+CUDA device runs it on cuda when cuda's whole-token forward takes it
+(a dense llama or qwen2, an f32 KV cache, weights within the weight
+pool), else on the CPU (#1253). locus-server and
 locus-run print the pick and why at start, e.g. `backend: vulkan
 (default; metal_forward does not take this model: qwen2vl's M-RoPE;
 metal would be used if it did)`, or `backend: neon (--backend)`.

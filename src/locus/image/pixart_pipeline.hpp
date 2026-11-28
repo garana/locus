@@ -73,6 +73,8 @@ class PixArtPipeline {
      * @param op The backend ops (a CPU backend).
      * @param alive Polled before each DiT call; false cancels.
      * @param timing Filled when not null.
+     * @param enc_op The ops for T5 and the VAE when not null (else op):
+     *     the DiT on Metal and these on Vulkan or the CPU (i#1057).
      * @returns image_size()^2 * 3 bytes, row-major RGB, or empty when
      *     cancelled.
      * @throws std::invalid_argument on a bad request.
@@ -80,7 +82,9 @@ class PixArtPipeline {
     std::vector<std::uint8_t> generate(const Request& req,
                                        const backend::Ops& op,
                                        const std::function<bool()>& alive,
-                                       Timing* timing = nullptr) const;
+                                       Timing* timing = nullptr,
+                                       const backend::Ops* enc_op = nullptr)
+        const;
 
     /**
      * The denoising loop and the decode from a given start latent (for
@@ -88,11 +92,11 @@ class PixArtPipeline {
      *
      * @returns [3][S][S] in about [-1, 1], or empty when cancelled.
      */
-    std::vector<float> generate_from(std::span<const float> latent,
-                                     const Request& req,
-                                     const backend::Ops& op,
-                                     const std::function<bool()>& alive,
-                                     Timing* timing = nullptr) const;
+    std::vector<float> generate_from(
+        std::span<const float> latent, const Request& req,
+        const backend::Ops& op, const std::function<bool()>& alive,
+        Timing* timing = nullptr,
+        const backend::Ops* enc_op = nullptr) const;
 
     /** diffusers' clean_caption=False: ASCII strip and lowercase. */
     static std::string preprocess(std::string_view text);

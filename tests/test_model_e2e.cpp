@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -114,6 +116,60 @@ TEST_CASE("use_backend refuses a backend this machine cannot run",
     CAPTURE(off->name);
     REQUIRE_THROWS_AS(model.use_backend(*off), std::invalid_argument);
     CHECK(&model.active_backend() == &best);
+}
+
+// i#1253: with no --backend, a host with a usable CUDA device runs a
+// model on CUDA when cuda_forward takes it (an f32 KV cache, weights
+// within the pool), else the CPU's best backend; without a device the
+// default is unchanged.
+TEST_CASE("the default backend is CUDA when the model fits the GPU",
+          "[e2e][backend][cuda]") {
+    if (std::getenv("LOCUS_BACKEND") != nullptr) {
+        SKIP("LOCUS_BACKEND is set");
+    }
+    using locus::kv::KvType;
+    const std::string models = std::string(LOCUS_SOURCE_DIR) + "/tests/models/";
+    const std::string small = models + "qwen2.5-0.5b-instruct-q8_0.gguf";
+    if (!std::filesystem::exists(small)) {
+        SKIP(small + " absent");
+    }
+    auto g = locus::gguf::GgufFile::open(small);
+    auto model = locus::model::TransformerModel::load(g);
+    std::string why;
+    const auto& got = model.use_backend_for("", KvType::kF32, &why);
+    CAPTURE(why);
+    const auto* cu = locus::backend::find_backend("cuda");
+    const bool cuda = cu != nullptr && cu->available && cu->selectable;
+    const auto* mt = locus::backend::find_backend("metal");
+    if (mt != nullptr && mt->available && mt->selectable) {
+        SKIP("a Metal host: its own default");
+    }
+    if (!cuda) {
+        // No device: the default is the CPU's best, as before.
+        CHECK(&got == &locus::backend::best_backend());
+        return;
+    }
+    // Fits (0.5 GB of weights): CUDA.
+    CHECK(std::string_view(got.name) == "cuda");
+    CHECK(why.find("fits the CUDA device") != std::string::npos);
+    // A KV cache that is not f32 (q8 here): cuda_forward declines it,
+    // so the CPU.
+    const auto& q8 = model.use_backend_for("", KvType::kQ8, &why);
+    CHECK(&q8 == &locus::backend::best_backend());
+    CHECK(why.find("KV cache that is not f32") != std::string::npos);
+    // Weights over the pool's budget (Orpheus 3B, 1.9 GB, on a 2 GB
+    // card): the CPU.
+    const std::string big = models + "orpheus-3b-0.1-ft-Q4_K_M.gguf";
+    if (std::filesystem::exists(big) && cu->ops.pool_budget != nullptr) {
+        auto gb = locus::gguf::GgufFile::open(big);
+        auto mb = locus::model::TransformerModel::load(gb);
+        if (std::filesystem::file_size(big) > cu->ops.pool_budget()) {
+            const auto& b = mb.use_backend_for("", KvType::kF32, &why);
+            CAPTURE(why);
+            CHECK(&b == &locus::backend::best_backend());
+            CHECK(why.find("does not take this model") != std::string::npos);
+        }
+    }
 }
 
 namespace {

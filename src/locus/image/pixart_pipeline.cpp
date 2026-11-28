@@ -132,7 +132,9 @@ std::vector<float> PixArtPipeline::normal_latent(std::uint64_t seed,
 
 std::vector<float> PixArtPipeline::generate_from(
     std::span<const float> latent, const Request& req, const backend::Ops& op,
-    const std::function<bool()>& alive, Timing* timing) const {
+    const std::function<bool()>& alive, Timing* timing,
+    const backend::Ops* enc_op) const {
+    const backend::Ops& eop = enc_op != nullptr ? *enc_op : op;
     const std::uint32_t s = dit_->latent_size();
     const std::size_t n = std::size_t{dit_->in_channels()} * s * s;
     if (latent.size() != n) {
@@ -147,9 +149,9 @@ std::vector<float> PixArtPipeline::generate_from(
     const auto t0 = Clock::now();
     const auto pos_ids = prompt_ids(*tok_, req.prompt);
     const auto neg_ids = prompt_ids(*tok_, req.negative_prompt);
-    const auto pos = t5_->encode(pos_ids, op);
+    const auto pos = t5_->encode(pos_ids, eop);
     if (alive && !alive()) return {};
-    const auto neg = t5_->encode(neg_ids, op);
+    const auto neg = t5_->encode(neg_ids, eop);
     const auto t1 = Clock::now();
     auto sched = DpmSolverPP::from_gguf(*dit_file_, req.steps);
     std::vector<float> x(latent.begin(), latent.end());
@@ -159,7 +161,7 @@ std::vector<float> PixArtPipeline::generate_from(
         [&](std::uint32_t) { return !alive || alive(); });
     if (!done) return {};
     const auto t2 = Clock::now();
-    auto img = vae_->decode(x, s, s, op);
+    auto img = vae_->decode(x, s, s, eop);
     const auto t3 = Clock::now();
     if (timing != nullptr) {
         *timing = {ms(t0, t1), ms(t1, t2), ms(t2, t3)};
@@ -169,11 +171,12 @@ std::vector<float> PixArtPipeline::generate_from(
 
 std::vector<std::uint8_t> PixArtPipeline::generate(
     const Request& req, const backend::Ops& op,
-    const std::function<bool()>& alive, Timing* timing) const {
+    const std::function<bool()>& alive, Timing* timing,
+    const backend::Ops* enc_op) const {
     const std::uint32_t s = dit_->latent_size();
     const auto latent = normal_latent(
         req.seed, std::size_t{dit_->in_channels()} * s * s);
-    const auto img = generate_from(latent, req, op, alive, timing);
+    const auto img = generate_from(latent, req, op, alive, timing, enc_op);
     if (img.empty()) return {};
     const std::uint32_t side = image_size();
     return SdVaeDecoder::to_rgb8(img, side, side);
