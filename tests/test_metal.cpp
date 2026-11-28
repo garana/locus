@@ -402,7 +402,29 @@ TEST_CASE("metal matmuls match the CPU matvec per token",
     Context& ctx = Context::get();
     std::mt19937 rng(17);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    // Rows and tokens off the 64 x 32 tile, strided token rows.
+    // Both prefill tiles on every Mac (i#1074: the default is the GPU
+    // family's), the caller's LOCUS_METAL_MM_TILE put back after.
+    struct EnvGuard {
+        std::string old;
+        bool had = false;
+        EnvGuard() {
+            if (const char* e = std::getenv("LOCUS_METAL_MM_TILE")) {
+                old = e;
+                had = true;
+            }
+        }
+        ~EnvGuard() {
+            if (had) {
+                ::setenv("LOCUS_METAL_MM_TILE", old.c_str(), 1);
+            } else {
+                ::unsetenv("LOCUS_METAL_MM_TILE");
+            }
+        }
+    } guard;
+    const char* tile = GENERATE("64", "128");
+    ::setenv("LOCUS_METAL_MM_TILE", tile, 1);
+    CAPTURE(tile);
+    // Rows and tokens off both tiles (64 or 128 x 32), strided rows.
     for (const TensorType ty :
          {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0,
           TensorType::kQ4_0, TensorType::kQ5_0, TensorType::kF32,
@@ -1812,12 +1834,15 @@ TEST_CASE("the default backend follows metal_forward's gate",
     if (metal) {
         CHECK(why == "default; metal_forward takes this model");
     }
+    // An f16 cache too (i#1245: the tools' default on Metal).
+    CHECK(model.use_backend_for("", KvType::kF16, &why).name ==
+          (metal ? "metal" : best));
     // metal_forward declines a quantized cache.
     CHECK(model.use_backend_for("", KvType::kQ8, &why).name == best);
     if (metal) {
         CHECK(why == "default; metal_forward does not take this model: "
-                     "a q8 KV cache (metal_forward takes f32); metal would "
-                     "be used if it did");
+                     "a q8 KV cache (metal_forward takes f32 and f16); metal "
+                     "would be used if it did");
     }
     // An explicit choice wins.
     const char* cpu =

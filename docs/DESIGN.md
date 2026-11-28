@@ -81,10 +81,12 @@ Correctness first, then CPU throughput, then GPU.
   unit-tested alone and shared by every backend.
 - The pool can hold f32, f16, q8 or q4 rows (R14). On Vulkan the pool
   is GPU-mapped, so attention reads K and V where they are written. On
-  Metal it is a shared buffer, and the GPU forward takes f32 (the
-  default) or f16 (`--kv-type f16`: K and V rounded to halves as
-  written, read back as float; half the attention's reads); q8 and q4
-  run the per-op path there.
+  Metal it is a shared buffer, and the GPU forward takes f16 or f32;
+  q8 and q4 run the per-op path there. f16 (K and V rounded to halves
+  as written, read back as float; half the attention's reads) is the
+  tools' default from Apple family 9 (i#1245: decode at 2k positions 5
+  to 7% faster on the M4 Max); below it (the M2 Pro: -4% to +2%) and
+  on the other backends f32 is.
 
 ### 4.2 Scheduler (continuous batching)
 

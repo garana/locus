@@ -75,9 +75,11 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   unified memory, whatever backend the language model uses, the
   PixArt and FLUX DiTs run each whole step on the GPU with their
   activations resident, and the VAE convolutions run on the GPU
-  (T5's attention stays on the CPU). On an M4 Max a
-  256 x 256 FLUX image takes about 35 s; elsewhere FLUX runs on the
-  CPU, minutes per image. Request fields:
+  (T5's attention stays on the CPU). On Apple the FLUX DiT runs on
+  Metal instead, CLIP, T5 and the VAE on Vulkan (LOCUS_FLUX_METAL=0
+  keeps the DiT on Vulkan): on an M4 Max a 256 x 256 image with 4
+  steps takes about 11 s, 1024 x 1024 about 65 s; elsewhere FLUX runs
+  on the CPU, minutes per image. Request fields:
   docs/CLIENTS.md.
 - **Video output:** `/v1/videos` with LTX-Video 2B distilled (T5-XXL,
   the 3D DiT, rectified flow, the causal 3D VAE), text to video or
@@ -126,8 +128,9 @@ Speech (text to audio) is `/v1/audio/speech`. How these run together:
 
 1. Text to text has no lock: requests share continuous batching. Every
    other kind runs alongside it and slows it, since they share the CPU
-   cores and the GPU; a FLUX step on the GPU holds the Vulkan lock, so
-   text on the same GPU waits for each step.
+   cores and the GPU; a FLUX step on Vulkan holds the Vulkan lock, so
+   text on the same GPU waits for each step, and a FLUX step on Metal
+   gives the Metal lock up between transformer blocks.
 2. Image to text runs one request at a time (the next one waits), on
    its own KV cache, outside the batch (#257).
 3. Text to image and image to image share one lock with video

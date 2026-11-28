@@ -130,18 +130,32 @@ TEST_CASE("flux pipeline matches diffusers", "[flux][image][e2e]") {
     REQUIRE(p->t5_ids(req.prompt, req.max_sequence_length) == t5_ids);
     const auto latent = read_f32(kDir + "golden/flux/pipeline_in.f32");
     const auto ref = read_f32(kDir + "golden/flux/pipeline_out.f32");
-    std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
-        {"cpu", &locus::backend::best_backend().ops}};
-    if (locus::backend::vulkan_imports_host_memory()) {
-        // As the server runs it: the DiT steps on the GPU, the rest per op.
+    // The DiT's ops, then CLIP, T5 and the VAE's (null: the DiT's).
+    struct Leg {
+        const char* name;
+        const locus::backend::Ops* op;
+        const locus::backend::Ops* enc = nullptr;
+    };
+    std::vector<Leg> legs = {{"cpu", &locus::backend::best_backend().ops}};
+    const bool vk = locus::backend::vulkan_imports_host_memory();
+    if (vk) {
+        // The DiT steps on the GPU, the rest per op.
         legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
     }
     if (locus::backend::metal::Context::usable()) {
         legs.push_back({"metal", &locus::backend::metal::image_ops()});
+        // As the server runs it on Apple (i#1057): the DiT on Metal, the
+        // rest on Vulkan.
+        if (vk) {
+            legs.push_back({"metal dit, vulkan rest",
+                            &locus::backend::metal::image_ops(),
+                            &locus::backend::vulkan_image_ops()});
+        }
     }
-    for (const auto& [name, op] : legs) {
+    for (const auto& [name, op, enc] : legs) {
         DYNAMIC_SECTION(name) {
-            const auto img = p->generate_from(latent, req, *op, nullptr);
+            const auto img =
+                p->generate_from(latent, req, *op, nullptr, nullptr, enc);
             REQUIRE(img.size() == ref.size());
             double worst = 0.0, ss = 0.0;
             for (std::size_t i = 0; i < img.size(); ++i) {
