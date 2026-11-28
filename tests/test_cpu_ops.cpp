@@ -2089,12 +2089,12 @@ TEST_CASE("neon dotprod fast Q8_0 gives the same bits from a load-time "
         matvec_q8k(m, {x.data() + std::size_t{tk} * cols, cols}, scal[tk]);
     }
     {
-        locus::backend::PackedQ8_0 pk(m);
+        locus::backend::PackedBlock32 pk(m);
         REQUIRE(pk.bytes() == std::size_t{10} * 4 * nb * 34);
-        REQUIRE(locus::backend::find_packed_q8_0(m) == nullptr);  // not yet
-        locus::backend::PackedQ8_0* const one[] = {&pk};
-        locus::backend::register_packed_q8_0(one);
-        REQUIRE(locus::backend::find_packed_q8_0(m) != nullptr);
+        REQUIRE(locus::backend::find_packed(m) == nullptr);  // not yet
+        locus::backend::PackedBlock32* const one[] = {&pk};
+        locus::backend::register_packed(one);
+        REQUIRE(locus::backend::find_packed(m) != nullptr);
         std::vector<float> got(plain.size());
         neon_dotprod_fast::matvec_batch_neon_q8k(m, x, got, n);
         REQUIRE(got == plain);
@@ -2113,7 +2113,7 @@ TEST_CASE("neon dotprod fast Q8_0 gives the same bits from a load-time "
         for (const std::uint32_t r0 : {8u, 5u}) {
             INFO("r0=" << r0);
             const Mat s = locus::backend::mat_rows(m, r0, rows - r0);
-            REQUIRE((locus::backend::find_packed_q8_0(s) != nullptr) ==
+            REQUIRE((locus::backend::find_packed(s) != nullptr) ==
                     (r0 % 4 == 0));
             std::vector<float> sg(std::size_t{s.rows} * n);
             neon_dotprod_fast::matvec_batch_neon_q8k(s, x, sg, n);
@@ -2130,7 +2130,76 @@ TEST_CASE("neon dotprod fast Q8_0 gives the same bits from a load-time "
         }
     }
     // The copy is gone with its owner.
-    REQUIRE(locus::backend::find_packed_q8_0(m) == nullptr);
+    REQUIRE(locus::backend::find_packed(m) == nullptr);
+}
+
+TEST_CASE("neon dotprod fast Q4_0 from a load-time copy gives the scalar "
+          "bits",
+          "[ops][neon][fast][repack]") {
+    if (!locus::sys::detect().dotprod) {
+        SKIP("CPU has no dotprod");
+    }
+    // 37 rows (a last quad of one row), 70 tokens (two token tiles,
+    // 4-token passes and a tail). Without a copy Q4_0 takes the dotprod
+    // build's kernels; with one, the four-row kernel on block_q4_0x4.
+    const std::uint32_t rows = 37, cols = 256, n = 70;
+    const std::size_t nb = cols / 32;
+    std::mt19937 rng(12432);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    std::vector<std::byte> w(std::size_t{rows} * nb * 18);
+    for (auto& by : w) {
+        by = static_cast<std::byte>(byte_d(rng));
+    }
+    for (std::size_t bl = 0; bl < w.size() / 18; ++bl) {
+        const std::uint16_t d = f32_to_f16(scale_d(rng));
+        std::memcpy(w.data() + bl * 18, &d, 2);
+    }
+    std::vector<float> x(std::size_t{n} * cols);
+    for (auto& v : x) {
+        v = ud(rng);
+    }
+    const Mat m{TensorType::kQ4_0, w.data(), rows, cols};
+    std::vector<std::vector<float>> scal(n, std::vector<float>(rows));
+    for (std::uint32_t tk = 0; tk < n; ++tk) {
+        matvec_q8k(m, {x.data() + std::size_t{tk} * cols, cols}, scal[tk]);
+    }
+    std::vector<float> plain(std::size_t{rows} * n);
+    neon_dotprod_fast::matvec_batch_neon_q8k(m, x, plain, n);
+    locus::backend::PackedBlock32 pk(m);
+    REQUIRE(pk.bytes() == std::size_t{10} * 4 * nb * 18);
+    locus::backend::PackedBlock32* const one[] = {&pk};
+    locus::backend::register_packed(one);
+    REQUIRE(locus::backend::find_packed(m) != nullptr);
+    std::vector<float> got(plain.size());
+    neon_dotprod_fast::matvec_batch_neon_q8k(m, x, got, n);
+    REQUIRE(got == plain);
+    for (std::uint32_t tk = 0; tk < n; ++tk) {
+        INFO("t=" << tk);
+        std::vector<float> o1(rows);
+        neon_dotprod_fast::matvec_neon_q8k(
+            m, {x.data() + std::size_t{tk} * cols, cols}, o1);
+        REQUIRE(o1 == scal[tk]);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(got[std::size_t{r} * n + tk] == scal[tk][r]);
+        }
+    }
+    // A slice on a quad reads the copy; one off a quad, the rows as
+    // stored: the same bits either way.
+    for (const std::uint32_t r0 : {8u, 5u}) {
+        INFO("r0=" << r0);
+        const Mat s = locus::backend::mat_rows(m, r0, rows - r0);
+        REQUIRE((locus::backend::find_packed(s) != nullptr) ==
+                (r0 % 4 == 0));
+        std::vector<float> sg(std::size_t{s.rows} * n);
+        neon_dotprod_fast::matvec_batch_neon_q8k(s, x, sg, n);
+        for (std::uint32_t r = 0; r < s.rows; ++r) {
+            for (std::uint32_t tk = 0; tk < n; ++tk) {
+                REQUIRE(sg[std::size_t{r} * n + tk] == scal[tk][r0 + r]);
+            }
+        }
+    }
 }
 #endif
 #endif
@@ -2145,7 +2214,7 @@ TEST_CASE("pack_q8_0_quad writes llama.cpp's block_q8_0x4 layout",
         w[i] = static_cast<std::byte>(i * 7 + 3);
     }
     const Mat m{TensorType::kQ8_0, w.data(), rows, cols};
-    REQUIRE(locus::backend::packs_q8_0(m));
+    REQUIRE(locus::backend::packs_block32(m));
     std::vector<std::byte> out(nb * locus::backend::kPackedQ8_0Block);
     for (const std::uint32_t r0 : {0u, 4u}) {
         locus::backend::pack_q8_0_quad(m, r0, out.data());
@@ -2164,24 +2233,67 @@ TEST_CASE("pack_q8_0_quad writes llama.cpp's block_q8_0x4 layout",
         }
     }
     // Only a registered matrix's quads are found, at the same width.
-    locus::backend::PackedQ8_0 pk(m);
-    locus::backend::PackedQ8_0* const one[] = {&pk};
-    locus::backend::register_packed_q8_0(one);
-    locus::backend::register_packed_q8_0(one);  // a second is a no-op
-    REQUIRE(locus::backend::find_packed_q8_0(m) != nullptr);
-    REQUIRE(locus::backend::find_packed_q8_0(
-                locus::backend::mat_rows(m, 4, 2)) ==
-            locus::backend::find_packed_q8_0(m) + nb * 136);
-    REQUIRE(locus::backend::find_packed_q8_0(
-                locus::backend::mat_rows(m, 1, 4)) == nullptr);
+    locus::backend::PackedBlock32 pk(m);
+    locus::backend::PackedBlock32* const one[] = {&pk};
+    locus::backend::register_packed(one);
+    locus::backend::register_packed(one);  // a second is a no-op
+    REQUIRE(locus::backend::find_packed(m) != nullptr);
+    REQUIRE(locus::backend::find_packed(locus::backend::mat_rows(m, 4, 2)) ==
+            locus::backend::find_packed(m) + nb * 136);
+    REQUIRE(locus::backend::find_packed(locus::backend::mat_rows(m, 1, 4)) ==
+            nullptr);
     const Mat wide{TensorType::kQ8_0, w.data(), rows / 2, cols * 2};
-    REQUIRE(locus::backend::find_packed_q8_0(wide) == nullptr);
+    REQUIRE(locus::backend::find_packed(wide) == nullptr);
+    // Another type over the same bytes is not this copy.
     const Mat other{TensorType::kQ4_0, w.data(), rows, cols};
-    REQUIRE(locus::backend::find_packed_q8_0(other) == nullptr);
+    REQUIRE(locus::backend::find_packed(other) == nullptr);
     // A set unregisters in one step; the copy's own destructor then has
     // nothing left to do.
-    locus::backend::unregister_packed_q8_0(one);
-    REQUIRE(locus::backend::find_packed_q8_0(m) == nullptr);
+    locus::backend::unregister_packed(one);
+    REQUIRE(locus::backend::find_packed(m) == nullptr);
+}
+
+TEST_CASE("pack_q4_0_quad writes llama.cpp's block_q4_0x4 layout",
+          "[ops][repack]") {
+    // 6 rows: quad 1 holds rows 4 and 5, then row 5 twice more.
+    const std::uint32_t rows = 6, cols = 64;
+    const std::size_t nb = cols / 32;
+    std::vector<std::byte> w(std::size_t{rows} * nb * 18);
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        w[i] = static_cast<std::byte>(i * 11 + 5);
+    }
+    const Mat m{TensorType::kQ4_0, w.data(), rows, cols};
+    REQUIRE(locus::backend::packs_block32(m));
+    std::vector<std::byte> out(nb * locus::backend::kPackedQ4_0Block);
+    for (const std::uint32_t r0 : {0u, 4u}) {
+        locus::backend::pack_q4_0_quad(m, r0, out.data());
+        for (std::size_t b = 0; b < nb; ++b) {
+            const std::byte* o = out.data() + b * 72;
+            for (std::uint32_t j = 0; j < 4; ++j) {
+                const std::uint32_t r = std::min(r0 + j, rows - 1);
+                const std::byte* src = w.data() + (r * nb + b) * 18;
+                INFO("r0=" << r0 << " b=" << b << " j=" << j);
+                REQUIRE(std::memcmp(o + 2 * j, src, 2) == 0);
+                for (std::size_t k = 0; k < 4; ++k) {
+                    for (std::size_t i = 0; i < 4; ++i) {
+                        const int got =
+                            std::to_integer<int>(o[8 + 16 * k + 4 * j + i]);
+                        const int want =
+                            std::to_integer<int>(src[2 + 4 * k + i]) ^ 0x88;
+                        REQUIRE(got == want);
+                    }
+                }
+            }
+        }
+    }
+    locus::backend::PackedBlock32 pk(m);
+    REQUIRE(pk.bytes() == std::size_t{2} * 4 * nb * 18);
+    locus::backend::PackedBlock32* const one[] = {&pk};
+    locus::backend::register_packed(one);
+    REQUIRE(locus::backend::find_packed(locus::backend::mat_rows(m, 4, 2)) ==
+            locus::backend::find_packed(m) + nb * 72);
+    const Mat other{TensorType::kQ8_0, w.data(), rows / 2, cols};
+    REQUIRE(locus::backend::find_packed(other) == nullptr);
 }
 
 TEST_CASE("conv1d dense matches a hand-computed same-padded case",

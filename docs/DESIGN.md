@@ -1467,7 +1467,10 @@ CPU the Q8_0 one takes four rows interleaved per `sdot` lane, from a
 copy made once at load (`backend/repack.hpp`, llama.cpp's
 `block_q8_0x4`; not for streamed or MoE expert weights), else
 interleaved per token tile; row slices start on multiples of 4 so each
-finds its quads. On the M4 Max
+finds its quads. Q4_0 takes the same kernel from its copy only
+(`block_q4_0x4`, the nibbles xor 0x88 so a shift or a mask gives 16
+times each signed quant; the exact dot is the sdot sum over 16), else
+the one-row and four-token kernels. On the M4 Max
 this takes Orpheus 3B Q4_K_M prefill from 97 to 182 tok/s and decode
 from 80 to 85 tok/s. F32, F16 and BF16 weights always take the f32
 dot; on neon F16 and BF16 widen to f32 in registers, 8 weights a step
