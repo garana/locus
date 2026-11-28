@@ -116,7 +116,13 @@ TEST_CASE("cuda device rmsnorm, rope and add equal the host ops",
             rmsnorm({x.data() + t * n, n}, w, 1e-5f,
                     {ref.data() + t * n, n});
         }
-        REQUIRE(same_bits(dout.get(), ref));
+        // The device sums the squares by a block tree (i#1254), the host
+        // in index order: close, not bit for bit (DESIGN 16).
+        const auto got = dout.get();
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            REQUIRE(got[i] ==
+                    Catch::Approx(ref[i]).epsilon(1e-5).margin(1e-6));
+        }
     }
     {
         // 32 heads of 64 at three positions, llama3-style factors.

@@ -4284,22 +4284,42 @@ std::vector<const void*>& dev_pins() {
     return pins;
 }
 
-/** rmsnorm per token: one block per token, the sum of squares taken by
- *  thread 0 in index order (the host's order), then scaled in parallel. */
+/** rmsnorm per token: one block of 256 per token; each thread sums the
+ *  squares of its stride, the warps reduce by a fixed xor tree, then
+ *  warp 0 the 8 warp sums (i#1254: a sum by thread 0 alone took 18 us
+ *  for 896 floats). A fixed order, the same for a token in a prefill or
+ *  a decode, close to the host's index order (DESIGN 16). */
 __global__ void dev_rmsnorm_kernel(const float* __restrict__ x,
                                    const float* __restrict__ w, float eps,
                                    float* __restrict__ out, std::uint32_t n) {
+    __shared__ float part[32];
     __shared__ float scale;
     const float* xt = x + std::size_t{blockIdx.x} * n;
     float* ot = out + std::size_t{blockIdx.x} * n;
-    if (threadIdx.x == 0) {
-        float ss = 0.0f;
-        for (std::uint32_t i = 0; i < n; ++i) {
-            ss = __fadd_rn(ss, __fmul_rn(xt[i], xt[i]));
+    const unsigned lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    float ss = 0.0f;
+    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        ss = __fadd_rn(ss, __fmul_rn(xt[i], xt[i]));
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, o));
+    }
+    if (lane == 0) {
+        part[warp] = ss;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const unsigned nw = blockDim.x / 32;
+        float s = lane < nw ? part[lane] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1) {
+            s = __fadd_rn(s, __shfl_xor_sync(0xffffffffu, s, o));
         }
-        scale = __fdiv_rn(
-            1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, static_cast<float>(n)),
-                                       eps)));
+        if (lane == 0) {
+            scale = __fdiv_rn(
+                1.0f,
+                __fsqrt_rn(__fadd_rn(__fdiv_rn(s, static_cast<float>(n)),
+                                     eps)));
+        }
     }
     __syncthreads();
     for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
