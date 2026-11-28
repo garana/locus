@@ -1444,6 +1444,17 @@ TEST_CASE("matvec_batch_cuda Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL/IQ4_XS "
                                     t == TensorType::kQ8_0);
                     const float g = got[static_cast<std::size_t>(r) * n + tk];
                     if (gemm) {
+                        // Q8_0's per-token kernel runs Q8_0 activations
+                        // (i#1254), the GEMM f32 ones: the GEMM is held
+                        // to the CPU's f32 matvec there.
+                        if (t == TensorType::kQ8_0 &&
+                            locus::backend::cuda_q8_int8_on()) {
+                            matvec(mat_rows(m, r, 1),
+                                   {xb.data() +
+                                        static_cast<std::size_t>(tk) * cols,
+                                    cols},
+                                   {&ref, 1});
+                        }
                         REQUIRE(g == Catch::Approx(ref).epsilon(1e-3).margin(
                                          1e-3));
                     } else {

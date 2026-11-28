@@ -446,7 +446,10 @@ TEST_CASE("cuda forward runs qwen2 on the GPU path, prefill equal to decode",
         }
         WARN("prefill against decode, largest logit gap " << gap << " of "
                                                           << big);
-        CHECK(gap <= 1e-4f * big);
+        // On Q8_0 activations (i#1254) the attention's float gap can
+        // move a quant by one step: measured 0.40 of 23 (3.2e-5 on f32).
+        CHECK(gap <= (locus::backend::cuda_q8_int8_on() ? 0.05f : 1e-4f) *
+                         big);
         for (std::uint32_t t = 0; t < n; ++t) {
             INFO("position " << t);
             CHECK(locus::model::argmax(std::span<const float>(
@@ -456,10 +459,11 @@ TEST_CASE("cuda forward runs qwen2 on the GPU path, prefill equal to decode",
         }
     }
 
-    // The CPU on f32 activations, as the CUDA forward computes: its
-    // default Q8 activations put the logits about 1.3 apart (of 23).
+    // The CPU on the activations the CUDA forward uses: Q8_0 ones for
+    // its Q8_0 matvecs (i#1254), else f32 (the two put the logits about
+    // 1.3 apart, of 23).
     model.use_backend(locus::backend::best_backend());
-    model.use_q8k_activations(false);
+    model.use_q8k_activations(locus::backend::cuda_q8_int8_on());
     std::vector<float> cpu(std::size_t{n} * nv);
     {
         auto cache = model.make_cache(8);
@@ -472,7 +476,25 @@ TEST_CASE("cuda forward runs qwen2 on the GPU path, prefill equal to decode",
         worst = std::max(worst, std::fabs(cpu[i] - all[i]));
         top = std::max(top, std::fabs(cpu[i]));
     }
-    CHECK(worst <= 1e-4f * top);  // measured 4.7e-5 of 23
+    if (!locus::backend::cuda_q8_int8_on()) {
+        CHECK(worst <= 1e-4f * top);  // measured 4.7e-5 of 23
+    } else {
+        // Both quantize their activations, so a float rounding apart
+        // upstream (sum orders) can move a quant by one step and the
+        // logits by more than the rounding: measured 0.42 of 23. Each
+        // position's top token must agree.
+        WARN("logit gap against the CPU on Q8 activations: " << worst
+                                                             << " of " << top);
+        CHECK(worst <= 0.05f * top);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const auto row = [&](const std::vector<float>& v) {
+                const auto b = v.begin() + std::ptrdiff_t{t} * nv;
+                return std::max_element(b, b + nv) - b;
+            };
+            INFO("position " << t);
+            CHECK(row(cpu) == row(all));
+        }
+    }
     // Its 640 MB of weights would stay in the 2 GB card's pool and
     // leave the next test's KV mirror no room.
     locus::backend::cuda_pool_reset();

@@ -524,7 +524,13 @@ void check_matvec_variant_matches_scalar(
         Mat m{locus::gguf::TensorType::kQ8_0, w.data(), rows,
               cols};
         std::vector<float> a(rows), b(rows);
-        matvec(m, x, a);
+        // CUDA's Q8_0 matvec runs Q8_0 activations (i#1254): the
+        // scalar Q8_0-activation dot is its reference.
+        if (variant == &matvec_cuda && cuda_q8_int8_on()) {
+            matvec_q8k(m, x, a);
+        } else {
+            matvec(m, x, a);
+        }
         variant(m, x, b);
         for (std::uint32_t r = 0; r < rows; ++r) {
             REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-4));
@@ -883,7 +889,12 @@ TEST_CASE("cuda q8_0 matvec matches scalar across row blocks",
             }
             Mat m{locus::gguf::TensorType::kQ8_0, w.data(), rows, cols};
             std::vector<float> a(rows), b(rows);
-            matvec(m, x, a);
+            // Q8_0 activations on CUDA (i#1254): the scalar q8k dot.
+            if (cuda_q8_int8_on()) {
+                matvec_q8k(m, x, a);
+            } else {
+                matvec(m, x, a);
+            }
             cuda_pool_reset();
             matvec_cuda(m, x, b);
             for (std::uint32_t r = 0; r < rows; ++r) {
@@ -1059,7 +1070,12 @@ TEST_CASE("cuda prefetch then matvec is token-exact", "[backend]") {
     }
     Mat m{locus::gguf::TensorType::kQ8_0, w.data(), rows, cols};
     std::vector<float> a(rows), b(rows);
-    matvec(m, x, a);
+    // Q8_0 activations on CUDA (i#1254): the scalar q8k dot.
+    if (cuda_q8_int8_on()) {
+        matvec_q8k(m, x, a);
+    } else {
+        matvec(m, x, a);
+    }
     cuda_prefetch(m);       // async upload into the pool
     matvec_cuda(m, x, b);   // must consume the in-flight page
     for (std::uint32_t r = 0; r < rows; ++r) {

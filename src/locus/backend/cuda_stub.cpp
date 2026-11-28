@@ -29,6 +29,10 @@ void cuda_evict(const Mat&) {}
 
 std::size_t cuda_pool_budget() { return 0; }
 bool cuda_prefill_gemm_on() { return false; }
+bool cuda_q8_int8_on() { return false; }
+bool cuda_quantize_q8_0_act(std::span<const float>, float*, std::int8_t*) {
+    return false;
+}
 
 void* cuda_kv_mirror_alloc(std::size_t) { return nullptr; }
 

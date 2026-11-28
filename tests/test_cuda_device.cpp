@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <thread>
 #include <vector>
@@ -225,9 +226,19 @@ TEST_CASE("cuda device matvecs equal matvec_cuda", "[cuda][device]") {
             REQUIRE(cuda_dev_finish());
             const auto got = dout.get();
             if (gemm_type && nb >= 32) {
+                // The GEMM runs f32 activations; Q8_0's per-token kernel
+                // runs Q8_0 ones (i#1254), about 0.1 apart here, so its
+                // GEMM is held to the CPU's f32 matvec instead.
+                std::vector<float> ref32 = want;
+                if (type == TensorType::kQ8_0 && cuda_q8_int8_on()) {
+                    for (std::uint32_t t = 0; t < nb; ++t) {
+                        matvec(m, {xb.data() + std::size_t{t} * cols, cols},
+                               {ref32.data() + std::size_t{t} * rows, rows});
+                    }
+                }
                 for (std::size_t i = 0; i < got.size(); ++i) {
                     REQUIRE(got[i] ==
-                            Catch::Approx(want[i]).epsilon(1e-3).margin(1e-3));
+                            Catch::Approx(ref32[i]).epsilon(1e-3).margin(1e-3));
                 }
             } else {
                 REQUIRE(same_bits(got, want));
@@ -278,6 +289,53 @@ TEST_CASE("cuda prefill GEMMs on two threads keep their own weights",
     cuda_pool_reset();
 }
 
+TEST_CASE("cuda q8_0 activation quantizer equals the CPU's",
+          "[cuda][device]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no usable CUDA device");
+    }
+    // i#1254: the device quantizer takes quantize_block32_act's rule, so
+    // the scales and quants are the CPU's bit for bit. Random blocks of
+    // three sizes, then the edges: all zero, values exactly halfway
+    // between two quants (round to nearest even), an amax so small that
+    // 1 / d overflows (every quant 0), a NaN and an infinity.
+    std::vector<float> x;
+    for (const float scale : {1.0f, 37.0f, 1e-3f}) {
+        const auto r = random_floats(32 * 16, 11, scale);
+        x.insert(x.end(), r.begin(), r.end());
+    }
+    x.insert(x.end(), 32, 0.0f);
+    for (int j = 0; j < 32; ++j) {
+        // amax 127 gives d = 1, so j + 0.5 sits halfway.
+        x.push_back(j == 0 ? 127.0f : static_cast<float>(j % 20) + 0.5f);
+    }
+    for (int j = 0; j < 32; ++j) {
+        x.push_back(j % 2 == 0 ? 1e-38f : -5e-39f);
+    }
+    for (int j = 0; j < 32; ++j) {
+        x.push_back(j == 3 ? std::numeric_limits<float>::quiet_NaN()
+                           : 0.25f * static_cast<float>(j));
+    }
+    for (int j = 0; j < 32; ++j) {
+        x.push_back(j == 7 ? std::numeric_limits<float>::infinity()
+                           : 0.5f * static_cast<float>(j));
+    }
+    const std::size_t nb = x.size() / 32;
+    std::vector<float> d(nb), cd(nb);
+    std::vector<std::int8_t> q(x.size()), cq(x.size());
+    REQUIRE(cuda_quantize_q8_0_act(x, d.data(), q.data()));
+    quantize_activation_q8_0(x, cd.data(), cq.data());
+    for (std::size_t b = 0; b < nb; ++b) {
+        INFO("block " << b);
+        REQUIRE(std::bit_cast<std::uint32_t>(d[b]) ==
+                std::bit_cast<std::uint32_t>(cd[b]));
+        for (std::size_t j = 0; j < 32; ++j) {
+            INFO("element " << j);
+            REQUIRE(q[b * 32 + j] == cq[b * 32 + j]);
+        }
+    }
+}
+
 // i#1197: the Q8_0 decode kernel takes two rows a warp and copies a
 // pass with 16-byte loads when a row is 16-byte aligned, 16-bit ones
 // when not, and a short loop for a last pass under 32 blocks. 7 rows
@@ -300,6 +358,32 @@ TEST_CASE("cuda q8_0 matvec rows are the bits of each row alone",
             std::vector<float> got(rows), cpu(rows);
             matvec_cuda(m, x, got);
             matvec(m, x, cpu);
+            if (cuda_q8_int8_on()) {
+                // On Q8_0 activations (i#1254): the CPU's block terms,
+                // float(p) * (d_w * d_x) with p the exact integer dot,
+                // summed in block order. The device sums the same terms
+                // in another order, so a float rounding apart.
+                std::vector<float> xd(nblk);
+                std::vector<std::int8_t> xq(cols);
+                quantize_activation_q8_0(x, xd.data(), xq.data());
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    const std::byte* row =
+                        w.data() + std::size_t{r} * nblk * 34;
+                    float s = 0.0f;
+                    for (std::uint32_t b = 0; b < nblk; ++b) {
+                        std::uint16_t h;
+                        std::memcpy(&h, row + b * 34, 2);
+                        int p = 0;
+                        for (int j = 0; j < 32; ++j) {
+                            p += static_cast<int>(static_cast<std::int8_t>(
+                                     row[b * 34 + 2 + j])) *
+                                 xq[b * 32 + j];
+                        }
+                        s += static_cast<float>(p) * (f16_to_f32(h) * xd[b]);
+                    }
+                    cpu[r] = s;
+                }
+            }
             for (std::uint32_t r = 0; r < rows; ++r) {
                 std::vector<float> one(1);
                 matvec_cuda(mat_rows(m, r, 1), x, one);
