@@ -90,6 +90,34 @@ TEST_CASE("loads a real Llama-family GGUF model", "[e2e]") {
     REQUIRE(text.find("Once upon a time") != std::string::npos);
 }
 
+// i#1243: the load-time Q8_0 copy exists only while the backend reads
+// it: made by use_backend for one with packs_q8_0, freed when the model
+// moves to one without (a GPU, the scalar reference), never at load.
+TEST_CASE("the Q8_0 copy follows the backend", "[e2e][backend][repack]") {
+    const std::string path = llama32_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("llama-3.2-1b-q8_0.gguf not present");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    REQUIRE(model.packed_bytes() == 0);
+    const auto& best = locus::backend::best_backend();
+    model.use_backend(best);
+    if (!best.ops.packs_q8_0) {
+        REQUIRE(model.packed_bytes() == 0);
+        SKIP(std::string(best.name) + " reads no copy");
+    }
+    if (model.packed_bytes() == 0) {
+        SKIP("weights and copy pass 3/4 of this host's RAM");
+    }
+    model.use_backend(*locus::backend::find_backend("scalar"));
+    REQUIRE(model.packed_bytes() == 0);
+    if (const auto* mt = locus::backend::find_backend("metal");
+        mt != nullptr) {
+        REQUIRE_FALSE(mt->ops.packs_q8_0);
+    }
+}
+
 // i#1226: a backend built in but not runnable here (an x86 build's
 // avx2 on a CPU without AVX2) is refused by name, not run into SIGILL,
 // and the model keeps the backend it had.
