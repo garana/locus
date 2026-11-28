@@ -1452,10 +1452,10 @@ The mode is on when the architecture requires it
 8-bit dot is its fast path (`Ops::prefers_q8k`: neon, sse4, scalar).
 avx2, cuda and the Vulkan per-op fallback keep the f32 dot, but for
 CUDA's Q8_0 matvec and prefill tile: they quantize x on the device by
-the CPU's Q8_0 rule and sum each block's exact integer dot as
+the CPU's Q8_0 rule and sum each quarter block's exact integer dot as
 `float(p) * (d_w * d_x)` in one order, so the tile and the matvec give
 a row the same bits (on the GTX 750 Ti, Qwen2.5 0.5B Q8_0 decodes at
-74 tok/s against 62; `LOCUS_CUDA_Q8_INT8=0` keeps the f32 dot; #1254).
+79 tok/s against 62; `LOCUS_CUDA_Q8_INT8=0` keeps the f32 dot; #1254).
 A prefill of 32 tokens or more keeps cuBLAS's f32 GEMM.
 `LOCUS_F32_ACTIVATIONS` (any value but "0" or empty) or
 `use_q8k_activations(false)` selects the f32 path, the reference for
