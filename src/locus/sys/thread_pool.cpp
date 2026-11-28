@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #include "locus/sys/features.hpp"
 #include "locus/sys/perf_counters.hpp"
@@ -74,6 +75,13 @@ ThreadPool::ThreadPool(std::size_t n_workers)
     const unsigned pcores = performance_cores();
     spin_workers_ =
         pcores > 1 ? std::min<std::size_t>(n_workers_, pcores - 1) : 0;
+    // LOCUS_POOL_SPIN=N sets the spinner count instead (i#1198: to
+    // measure the sleepers' wake-up cost, and to try spinners on a host
+    // whose tiers are not reported).
+    if (const char* e = std::getenv("LOCUS_POOL_SPIN")) {
+        spin_workers_ = std::min<std::size_t>(
+            n_workers_, static_cast<std::size_t>(std::strtoul(e, nullptr, 10)));
+    }
     workers_.reserve(n_workers_);
     for (std::size_t i = 0; i < n_workers_; ++i) {
         workers_.emplace_back([this, i] { worker(i); });
