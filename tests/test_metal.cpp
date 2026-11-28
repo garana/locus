@@ -2560,3 +2560,61 @@ TEST_CASE("bench: metal decode over several sequences", "[.bench][metal]") {
         }
     }
 }
+
+// A hidden bench (i#1074): the prefill matmul on Llama 3.2 1B's shapes
+// (512 tokens), 10 copies in one batch after a warm one; prints TFLOPS
+// per type and shape. Run: locus_tests "[.metal-mm-bench]".
+TEST_CASE("metal prefill matmul throughput", "[.metal-mm-bench]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    Context& ctx = Context::get();
+    constexpr std::uint32_t kTok = 512;
+    constexpr int kReps = 10;
+    std::mt19937 rng(3);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const TensorType ty :
+         {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0}) {
+        double flop = 0, sec = 0;
+        for (const auto& [rows, cols] :
+             {std::pair<std::uint32_t, std::uint32_t>{2048, 2048},
+              {512, 2048}, {8192, 2048}, {2048, 8192}}) {
+            const auto w = random_weights(ty, rows, cols, 1);
+            std::vector<float> x(std::size_t{kTok} * cols);
+            for (auto& v : x) {
+                v = dist(rng);
+            }
+            Context::Buffer wb = ctx.upload(w);
+            Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
+            Context::Buffer ob =
+                ctx.alloc(std::size_t{kTok} * rows * sizeof(float));
+            std::lock_guard lk(mb::device_mutex());
+            const auto run = [&](int reps) {
+                ctx.begin_batch();
+                for (int i = 0; i < reps; ++i) {
+                    REQUIRE(mb::record_matmul(ctx, ty, rows, cols, kTok, wb,
+                                              0, xb, 0, cols, ob, 0, rows,
+                                              false));
+                }
+                ctx.end_batch();
+            };
+            run(1);
+            const auto t0 = std::chrono::steady_clock::now();
+            run(kReps);
+            const double s = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+            const double f = 2.0 * rows * cols * kTok * kReps;
+            std::printf("type %d %5u x %5u: %.2f TFLOPS\n",
+                        static_cast<int>(ty), rows, cols, f / s * 1e-12);
+            flop += f;
+            sec += s;
+            ctx.free(wb);
+            ctx.free(xb);
+            ctx.free(ob);
+        }
+        std::printf("type %d all shapes: %.2f TFLOPS\n",
+                    static_cast<int>(ty), flop / sec * 1e-12);
+    }
+}
