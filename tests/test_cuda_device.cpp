@@ -320,6 +320,8 @@ TEST_CASE("cuda q8_0 activation quantizer equals the CPU's",
         x.push_back(j == 7 ? std::numeric_limits<float>::infinity()
                            : 0.5f * static_cast<float>(j));
     }
+    // All NaN: the CPU's max starts at 0 and drops NaN, so d is 0.
+    x.insert(x.end(), 32, std::numeric_limits<float>::quiet_NaN());
     const std::size_t nb = x.size() / 32;
     std::vector<float> d(nb), cd(nb);
     std::vector<std::int8_t> q(x.size()), cq(x.size());

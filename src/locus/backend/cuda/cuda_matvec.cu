@@ -1520,7 +1520,9 @@ __global__ void quantize_q8_0_act_kernel(const float* __restrict__ x,
     }
     const std::uint32_t lane = threadIdx.x % 32;
     const float v = x[static_cast<std::size_t>(b) * 32 + lane];
-    float amax = fabsf(v);
+    // Seeded at 0 as the CPU's max: fmaxf drops a NaN, so an all-NaN
+    // block gives amax 0 (d 0), not NaN.
+    float amax = fmaxf(0.0f, fabsf(v));
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
@@ -1536,7 +1538,9 @@ __global__ void quantize_q8_0_act_kernel(const float* __restrict__ x,
     }
 }
 
-/** The integer dot of 4 int8 pairs packed in a and b, added to c. */
+/** The integer dot of 4 int8 pairs packed in a and b, added to c. The
+ *  build targets sm_50 (CMakeLists.txt), so the byte multiplies run;
+ *  __dp4a needs an sm_61 target (a newer card JITs compute_50). */
 __device__ inline int dot4_i8(int a, int b, int c) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
     return __dp4a(a, b, c);
