@@ -1553,10 +1553,10 @@ __device__ inline int dot4_i8(int a, int b, int c) {
 }
 
 /**
- * One Q8_0 block's term against Q8_0 activations, the CPU's
- * vec_dot_block32_q8_0 step: float(p) * (d_w * d_x), p the exact
- * integer dot. Rounded multiplies (no fma), so the matvec and the
- * prefill tile give a block the same bits.
+ * One term against Q8_0 activations, the CPU's vec_dot_block32_q8_0
+ * step on a quarter block: float(p) * (d_w * d_x), p the exact integer
+ * dot of 8 quants. Rounded multiplies (no fma), so the matvec and the
+ * prefill tile give a quarter the same bits.
  */
 __device__ inline float q8_0_q8x_term(int p, float dw, float dx) {
     return __fmul_rn(__int2float_rn(p), __fmul_rn(dw, dx));
@@ -1567,12 +1567,12 @@ __device__ inline float q8_0_q8x_term(int p, float dw, float dx) {
  * one warp a row, llama.cpp's mul_mat_vec_q layout: a pass takes 8
  * consecutive blocks, lane l bytes 8 (l % 4) .. + 7 of block l / 4,
  * read straight from global memory (weights by 16-bit words, x by 8
- * bytes), the 4 lanes of a block add their integer dots exactly, then
- * one float term a block (q8_0_q8x_term). Each term goes to lane kb %
- * 32 and adds there in block order, then the warp's xor tree sums the
- * lanes: the prefill tile's steps (matvec_tile_q8_0_q8x_kernel), so a
- * token's bits are the same in a prefill or a decode. Launch with 32 *
- * kWarpRows threads a block and ceil(rows / kWarpRows) blocks.
+ * bytes); each lane's exact integer dot of its 8 quants makes one
+ * float term (q8_0_q8x_term), added to the lane's sum pass by pass,
+ * then the warp's xor tree sums the lanes: the prefill tile's steps
+ * (matvec_tile_q8_0_q8x_kernel), so the two give a row the same bits.
+ * Launch with 32 * kWarpRows threads a block and ceil(rows /
+ * kWarpRows) blocks.
  */
 __global__ void matvec_q8_0_q8x_kernel(const std::uint8_t* __restrict__ w,
                                        const float* __restrict__ xd,
@@ -1612,14 +1612,11 @@ __global__ void matvec_q8_0_q8x_kernel(const std::uint8_t* __restrict__ w,
             dw = __half2float(__ushort_as_half(__ldg(blk)));
             dx = __ldg(xd + kb);
         }
-        p += __shfl_xor_sync(0xffffffffu, p, 1);
-        p += __shfl_xor_sync(0xffffffffu, p, 2);
-        const float term = q8_0_q8x_term(p, dw, dx);
-        // Lane L owns block 8 it + L % 8 when L / 8 == it % 4: blocks
-        // L, L + 32, ... in order, as the tile's lane L.
-        const float t = __shfl_sync(0xffffffffu, term, 4 * (lane % 8));
-        if (lane / 8 == it % 4 && it * 8 + lane % 8 < nblk) {
-            acc = __fadd_rn(acc, t);
+        // Each lane adds its own quarter-block term, in iteration order:
+        // no shuffles in the loop (i#1254: three a pass cost 6% of a
+        // Qwen2.5 decode), and the tile's lanes take the same quarters.
+        if (kb < nblk) {
+            acc = __fadd_rn(acc, q8_0_q8x_term(p, dw, dx));
         }
     }
     acc = warp_sum(acc);
@@ -1631,11 +1628,12 @@ __global__ void matvec_q8_0_q8x_kernel(const std::uint8_t* __restrict__ w,
 /**
  * The prefill tile for Q8_0 on Q8_0 activations (i#1254): R rows by T
  * tokens a warp, the weights staged as matvec_tile_q8_0_kernel stages
- * them; lane l takes block b0 + l of every row, and for each token the
- * block's exact integer dot and its term (q8_0_q8x_term), added in
- * block order, then the warp's xor tree: matvec_q8_0_q8x_kernel's bits.
- * xd / xq hold n tokens' activations (token t at t * nblk and t *
- * cols). Token-major output.
+ * them. Lane l takes the decode kernel's quarters: in step s of a pass,
+ * bytes 8 (l % 4) .. + 7 of block b0 + 8 s + l / 4, and for each token
+ * their exact integer dot and its term (q8_0_q8x_term), added to the
+ * lane's sum step by step, then the warp's xor tree:
+ * matvec_q8_0_q8x_kernel's bits. xd / xq hold n tokens' activations
+ * (token t at t * nblk and t * cols). Token-major output.
  */
 template <std::uint32_t R, std::uint32_t T>
 __global__ void matvec_tile_q8_0_q8x_kernel(
@@ -1676,64 +1674,68 @@ __global__ void matvec_tile_q8_0_q8x_kernel(
             }
         }
         __syncwarp();
-        if (lane < nb) {
-            const std::uint32_t b = b0 + lane;
+        const std::uint32_t sub = lane % 4;
+        for (std::uint32_t s = 0; s * 8 < nb; ++s) {
+            const std::uint32_t lb = 8 * s + lane / 4;  // block in the pass
+            if (lb >= nb) {
+                continue;  // as the decode kernel: no term past the row
+            }
+            const std::uint32_t b = b0 + lb;
             // The integer dots in float: every product and partial sum
-            // is an integer under 2^24 (|p| <= 32 * 127 * 128), so each
+            // is an integer under 2^24 (|p| <= 8 * 127 * 128), so each
             // step is exact and pf is p in any order; sm_5x runs float
             // multiply-adds far faster than byte ones. Each weight word
-            // is converted once a block, for all T tokens.
-            float pf[R][T];
+            // is converted once, for all T tokens.
+            float wf[R][8];
+            float dw[R];
 #pragma unroll
             for (std::uint32_t i = 0; i < R; ++i) {
+                const std::uint16_t* blk16 = mine[i] + lb * 17;
+                dw[i] = __half2float(__ushort_as_half(blk16[0]));
 #pragma unroll
-                for (std::uint32_t t = 0; t < T; ++t) {
-                    pf[i][t] = 0.0f;
-                }
-            }
-#pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                float wf[R][4];
-#pragma unroll
-                for (std::uint32_t i = 0; i < R; ++i) {
-                    const std::uint16_t* blk16 = mine[i] + lane * 17;
+                for (int k = 0; k < 2; ++k) {
                     const int wq = static_cast<int>(
-                        blk16[1 + 2 * k] |
-                        static_cast<std::uint32_t>(blk16[2 + 2 * k]) << 16);
+                        blk16[1 + 4 * sub + 2 * k] |
+                        static_cast<std::uint32_t>(
+                            blk16[2 + 4 * sub + 2 * k])
+                            << 16);
 #pragma unroll
                     for (int g = 0; g < 4; ++g) {
-                        wf[i][g] = static_cast<float>(
+                        wf[i][4 * k + g] = static_cast<float>(
                             static_cast<std::int8_t>(wq >> (8 * g)));
                     }
                 }
+            }
 #pragma unroll
-                for (std::uint32_t t = 0; t < T; ++t) {
-                    // A token past n reads token n - 1 (not stored).
-                    const std::size_t tok = min(t0 + t, n - 1);
-                    const int xv = __ldg(reinterpret_cast<const int*>(
-                        xq + tok * cols + static_cast<std::size_t>(b) * 32 +
-                        4 * k));
+            for (std::uint32_t t = 0; t < T; ++t) {
+                // A token past n reads token n - 1 (not stored).
+                const std::size_t tok = min(t0 + t, n - 1);
+                const int2 xv = __ldg(reinterpret_cast<const int2*>(
+                    xq + tok * cols + static_cast<std::size_t>(b) * 32 +
+                    8 * sub));
+                const float dx = __ldg(xd + tok * nblk + b);
+                float pf[R];
+#pragma unroll
+                for (std::uint32_t i = 0; i < R; ++i) {
+                    pf[i] = 0.0f;
+                }
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    const int xw = k == 0 ? xv.x : xv.y;
 #pragma unroll
                     for (int g = 0; g < 4; ++g) {
                         const float xf = static_cast<float>(
-                            static_cast<std::int8_t>(xv >> (8 * g)));
+                            static_cast<std::int8_t>(xw >> (8 * g)));
 #pragma unroll
                         for (std::uint32_t i = 0; i < R; ++i) {
-                            pf[i][t] = fmaf(wf[i][g], xf, pf[i][t]);
+                            pf[i] = fmaf(wf[i][4 * k + g], xf, pf[i]);
                         }
                     }
                 }
-            }
 #pragma unroll
-            for (std::uint32_t i = 0; i < R; ++i) {
-                const float dw = __half2float(
-                    __ushort_as_half(mine[i][lane * 17]));
-#pragma unroll
-                for (std::uint32_t t = 0; t < T; ++t) {
-                    const std::size_t tok = min(t0 + t, n - 1);
-                    const float dx = __ldg(xd + tok * nblk + b);
+                for (std::uint32_t i = 0; i < R; ++i) {
                     acc[i][t] = __fadd_rn(
-                        acc[i][t], __fmul_rn(pf[i][t], __fmul_rn(dw, dx)));
+                        acc[i][t], __fmul_rn(pf[i], __fmul_rn(dw[i], dx)));
                 }
             }
         }
