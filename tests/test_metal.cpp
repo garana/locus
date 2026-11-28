@@ -1807,12 +1807,15 @@ TEST_CASE("the default backend follows metal_forward's gate",
     if (metal) {
         CHECK(why == "default; metal_forward takes this model");
     }
+    // An f16 cache too (i#1245: the tools' default on Metal).
+    CHECK(model.use_backend_for("", KvType::kF16, &why).name ==
+          (metal ? "metal" : best));
     // metal_forward declines a quantized cache.
     CHECK(model.use_backend_for("", KvType::kQ8, &why).name == best);
     if (metal) {
         CHECK(why == "default; metal_forward does not take this model: "
-                     "a q8 KV cache (metal_forward takes f32); metal would "
-                     "be used if it did");
+                     "a q8 KV cache (metal_forward takes f32 and f16); metal "
+                     "would be used if it did");
     }
     // An explicit choice wins.
     const char* cpu =
