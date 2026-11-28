@@ -402,8 +402,9 @@ TEST_CASE("metal matmuls match the CPU matvec per token",
     Context& ctx = Context::get();
     std::mt19937 rng(17);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    // Both prefill tiles on every Mac (i#1074: the default is the GPU
-    // family's), the caller's LOCUS_METAL_MM_TILE put back after.
+    // Every prefill tile on every Mac (i#1074: the default is the GPU
+    // family's; t64, the 64 x 64 tile, i#1267), the caller's
+    // LOCUS_METAL_MM_TILE put back after.
     struct EnvGuard {
         std::string old;
         bool had = false;
@@ -421,7 +422,7 @@ TEST_CASE("metal matmuls match the CPU matvec per token",
             }
         }
     } guard;
-    const char* tile = GENERATE("64", "128");
+    const char* tile = GENERATE("64", "128", "t64");
     ::setenv("LOCUS_METAL_MM_TILE", tile, 1);
     CAPTURE(tile);
     // Rows and tokens off both tiles (64 or 128 x 32), strided rows.

@@ -81,6 +81,13 @@ std::uint32_t mm_tile_rows(const Context& ctx) {
     return ctx.apple_family() >= 9 ? 64 : 128;
 }
 
+/** @returns Whether the prefill matmul takes the 64 x 64 tile
+ *  (mm_*_t64, i#1267): LOCUS_METAL_MM_TILE=t64 (being measured). */
+bool mm_tile_t64() {
+    const char* e = std::getenv("LOCUS_METAL_MM_TILE");
+    return e != nullptr && std::string_view(e) == "t64";
+}
+
 /**
  * @returns The Q6_K matvec kernel for ctx's GPU (i#1058): ggml's
  * half-block layout below Apple family 9 (the M2, family 8, reads Q6_K
@@ -486,17 +493,21 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
     }
     // The tile by GPU family (i#1074): 128 rows on 256 threads, or 64 on
     // 128.
-    const std::uint32_t tm = mm_tile_rows(ctx);
+    const bool t64 = mm_tile_t64();
+    const std::uint32_t tm = t64 ? 64 : mm_tile_rows(ctx);
+    const std::uint32_t tn = t64 ? 64 : 32;
     const std::uint32_t row_tiles = (rows + tm - 1) / tm;
-    const std::uint32_t tok_tiles = (n_tok + 31) / 32;
+    const std::uint32_t tok_tiles = (n_tok + tn - 1) / tn;
     const MmParams p{w_off,    x_off,      out_off,
                      rows,     cols,       n_tok,
                      x_stride, out_stride, accumulate ? 1u : 0u,
                      scale,    row_tiles,  1,
                      0};
     const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
-    const std::uint32_t group = tm == 128 ? 256 : 128;
-    const std::string name = tm == 128 ? kernel + "_r128" : kernel;
+    const std::uint32_t group = tm == 128 || t64 ? 256 : 128;
+    const std::string name = t64          ? kernel + "_t64"
+                             : tm == 128 ? kernel + "_r128"
+                                         : kernel;
     ctx.dispatch(name.c_str(), args, std::as_bytes(std::span(&p, 1)),
                  row_tiles * tok_tiles * group, group);
     return true;
