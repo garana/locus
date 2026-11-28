@@ -2310,6 +2310,13 @@ bool batch_dequant_enabled() {
     return on;
 }
 
+/** The calling thread's QuantBatch (i#1198): reused across matmuls, so
+ *  its buffers grow to the largest batch once. */
+backend::QuantBatch& quant_batch() {
+    thread_local backend::QuantBatch qb;
+    return qb;
+}
+
 /**
  * Runs body(r0, r1) over row-slices of a rows-row matvec: threaded
  * across mt_slices() when the backend is re-entrant, else inline.
@@ -2383,6 +2390,45 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     }
     if (op.matvec_q8k != nullptr &&
         backend::uses_quantized_activation(w.type)) {
+        if (op.matvec_q8k_batch != nullptr && !op.self_parallel &&
+            op.q8k_batch_size != nullptr &&
+            op.q8k_batch_size(w, n, quant_batch())) {
+            // i#1198: the batch quantized once, its tokens split over
+            // the pool, then every row slice dots against it (before,
+            // each row slice quantized all n tokens again).
+            backend::QuantBatch& qb = quant_batch();
+            const std::size_t tslices =
+                op.mt_safe ? std::min<std::size_t>(mt_fanout(), n) : 1;
+            if (tslices <= 1) {
+                op.q8k_batch_quantize(w, x_batch, 0, n, qb);
+            } else {
+                sys::ThreadPool::instance().parallel_for(
+                    tslices, [&](std::size_t i) {
+                        op.q8k_batch_quantize(
+                            w, x_batch,
+                            static_cast<std::uint32_t>(n * i / tslices),
+                            static_cast<std::uint32_t>(n * (i + 1) /
+                                                       tslices),
+                            qb);
+                    });
+            }
+            for_row_slices(
+                op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+                    const Mat sub = backend::mat_rows(w, r0, r1 - r0);
+                    thread_local std::vector<float> rt;
+                    rt.resize(static_cast<std::size_t>(r1 - r0) * n);
+                    op.matvec_q8k_batch_pre(sub, qb, rt, n);
+                    for (std::uint32_t t = 0; t < n; ++t) {
+                        float* o =
+                            out_batch.data() +
+                            static_cast<std::size_t>(t) * oc + r0;
+                        for (std::uint32_t r = 0; r < r1 - r0; ++r) {
+                            o[r] = rt[static_cast<std::size_t>(r) * n + t];
+                        }
+                    }
+                });
+            return;
+        }
         if (op.matvec_q8k_batch != nullptr && !op.self_parallel) {
             // Each slice transposes its own rows into the token-major
             // output, so no thread waits on a serial transpose.

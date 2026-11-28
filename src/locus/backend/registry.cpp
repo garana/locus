@@ -92,6 +92,9 @@ const std::vector<Backend>& list() {
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_sse4,
                       .matvec_q8k_batch = &matvec_batch_sse4_q8k,
+                      .q8k_batch_size = &q8k_batch_size_sse4,
+                      .q8k_batch_quantize = &q8k_batch_quantize_sse4,
+                      .matvec_q8k_batch_pre = &matvec_q8k_batch_pre_sse4,
                       .prefers_q8k = true,
                       .cpu = true}});
 #if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
@@ -103,6 +106,9 @@ const std::vector<Backend>& list() {
             o.matvec_q8k = &sse4_avx::matvec_sse4_q8k;
             o.matvec_batch = &sse4_avx::matvec_batch_sse4;
             o.matvec_q8k_batch = &sse4_avx::matvec_batch_sse4_q8k;
+            o.q8k_batch_size = &sse4_avx::q8k_batch_size_sse4;
+            o.q8k_batch_quantize = &sse4_avx::q8k_batch_quantize_sse4;
+            o.matvec_q8k_batch_pre = &sse4_avx::matvec_q8k_batch_pre_sse4;
         }
 #endif
 #endif
