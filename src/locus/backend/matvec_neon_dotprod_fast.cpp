@@ -414,6 +414,46 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
     block32_batch<false>(w, find_packed(w), x_batch, out_batch, n);
 }
 
+bool q8k_batch_size_neon(const Mat& w, std::uint32_t n, QuantBatch& b) {
+    if (!takes(w)) {
+        return base::q8k_batch_size_neon(w, n, b);
+    }
+    b.n = n;
+    b.d.resize(std::size_t{w.cols} / 32 * n);
+    b.qs.resize(std::size_t{w.cols} * n);
+    b.bsums.clear();
+    b.q6off.clear();
+    return true;
+}
+
+void q8k_batch_quantize_neon(const Mat& w, std::span<const float> x_batch,
+                             std::uint32_t t0, std::uint32_t t1,
+                             QuantBatch& b) {
+    if (!takes(w)) {
+        base::q8k_batch_quantize_neon(w, x_batch, t0, t1, b);
+        return;
+    }
+    const std::size_t nb = w.cols / 32;
+    for (std::uint32_t t = t0; t < t1; ++t) {
+        quantize_activation_q8_0_neon(
+            x_batch.subspan(std::size_t{t} * w.cols, w.cols),
+            b.d.data() + t * nb, b.qs.data() + std::size_t{t} * w.cols);
+    }
+}
+
+void matvec_q8k_batch_pre_neon(const Mat& w, const QuantBatch& b,
+                               std::span<float> out_batch, std::uint32_t n) {
+    if (!takes(w)) {
+        base::matvec_q8k_batch_pre_neon(w, b, out_batch, n);
+        return;
+    }
+    // The load-time copy where the model made one (i#1243), as the whole
+    // batch call: a row slice starts on a multiple of 4 (slice_row), so
+    // find_packed finds its quads.
+    block32_rows<false>(w, find_packed(w), b.d.data(), b.qs.data(), n,
+                        out_batch.data(), n);
+}
+
 }  // namespace locus::backend::neon_dotprod_fast
 
 #if defined(__clang__)

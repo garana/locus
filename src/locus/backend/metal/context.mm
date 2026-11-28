@@ -5,11 +5,17 @@
 #import <Metal/Metal.h>
 #include <mach/mach.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 // kKernelParts: kernels.metal, embedded by CMake in pieces.
 #include "locus/backend/metal/kernels_src.hpp"
@@ -50,6 +56,62 @@ void finish(id<MTLCommandBuffer> cb, std::string_view what) {
                                  ns_error([cb error]));
     }
 }
+
+/**
+ * LOCUS_METAL_PROFILE=1: every dispatch runs in a command buffer of its
+ * own, its GPU time added to its kernel's total, and the totals go to
+ * stderr at exit (most first). Dispatches that overlap in a batch run
+ * one after another here, so it shows each kernel's share, not the
+ * batch's wall time. A batch's dispatches have already run when it is
+ * abandoned in this mode (a profiling switch only).
+ */
+struct Profile {
+    struct Row {
+        double sec = 0;
+        std::uint64_t n = 0;
+    };
+    std::mutex mu;
+    std::unordered_map<std::string, Row> rows;
+
+    static Profile* get() {
+        static Profile* p = [] () -> Profile* {
+            const char* e = std::getenv("LOCUS_METAL_PROFILE");
+            if (e == nullptr || std::string_view(e) != "1") {
+                return nullptr;
+            }
+            auto* q = new Profile;
+            std::atexit([] { Profile::get()->print(); });
+            return q;
+        }();
+        return p;
+    }
+
+    void add(std::string_view name, double sec) {
+        std::lock_guard lk(mu);
+        Row& r = rows[std::string(name)];
+        r.sec += sec;
+        ++r.n;
+    }
+
+    void print() {
+        std::lock_guard lk(mu);
+        std::vector<std::pair<std::string, Row>> v(rows.begin(), rows.end());
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+            return a.second.sec > b.second.sec;
+        });
+        double total = 0;
+        for (const auto& [k, r] : v) {
+            total += r.sec;
+        }
+        std::fprintf(stderr, "metal profile: %.1f ms GPU in all\n",
+                     total * 1e3);
+        for (const auto& [k, r] : v) {
+            std::fprintf(stderr, "  %-28s %9.2f ms %5.1f%% %7llu\n",
+                         k.c_str(), r.sec * 1e3, 100.0 * r.sec / total,
+                         static_cast<unsigned long long>(r.n));
+        }
+    }
+};
 
 }  // namespace
 
@@ -292,6 +354,18 @@ void Context::dispatch(std::string_view name, std::span<const Arg> args,
         if (alone) {
             [enc endEncoding];
             finish(cb, name);
+            if (Profile* pr = Profile::get()) {
+                pr->add(name, [cb GPUEndTime] - [cb GPUStartTime]);
+            }
+        } else if (Profile* pr = Profile::get()) {
+            // Run this dispatch alone, then reopen the batch.
+            [enc endEncoding];
+            finish(cb, name);
+            pr->add(name, [cb GPUEndTime] - [cb GPUStartTime]);
+            impl_->batch = [impl_->queue commandBuffer];
+            impl_->enc = [impl_->batch
+                computeCommandEncoderWithDispatchType:
+                    MTLDispatchTypeConcurrent];
         }
     }
 }

@@ -1695,6 +1695,28 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
     constexpr std::uint32_t rows = 5, n = 11;
     std::mt19937 rng(101);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    // i#1198's split, as the model runs it: the batch quantized in two
+    // token ranges, then two row slices (2 and 3 rows) dotted against
+    // it; the same bits as the whole call, for the types it takes.
+    const auto split = [&](const Mat& m, std::span<const float> xb,
+                           const std::vector<float>& got) {
+        locus::backend::QuantBatch qb;
+        if (!q8k_batch_size_neon(m, n, qb)) {
+            return;
+        }
+        q8k_batch_quantize_neon(m, xb, 0, n / 2, qb);
+        q8k_batch_quantize_neon(m, xb, n / 2, n, qb);
+        std::vector<float> s(std::size_t{rows} * n);
+        matvec_q8k_batch_pre_neon(mat_rows(m, 0, 2), qb,
+                                  std::span(s.data(), std::size_t{2} * n), n);
+        matvec_q8k_batch_pre_neon(
+            mat_rows(m, 2, rows - 2), qb,
+            std::span(s.data() + std::size_t{2} * n,
+                      std::size_t{rows - 2} * n),
+            n);
+        INFO("split, type " << static_cast<int>(m.type));
+        REQUIRE(s == got);
+    };
     const auto tokens = [&](std::uint32_t cols) {
         std::vector<float> xb(std::size_t{n} * cols);
         for (auto& v : xb) {
@@ -1715,6 +1737,7 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
         const Mat m{t, w.data(), rows, kcols};
         std::vector<float> got(std::size_t{rows} * n);
         matvec_batch_neon_q8k(m, xk, got, n);
+        split(m, xk, got);
         for (std::uint32_t tk = 0; tk < n; ++tk) {
             const std::span<const float> x(xk.data() + std::size_t{tk} * kcols,
                                            kcols);
@@ -1758,6 +1781,7 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
         const Mat m{t, w.data(), rows, bcols};
         std::vector<float> got(std::size_t{rows} * n);
         matvec_batch_neon_q8k(m, xq, got, n);
+        split(m, xq, got);
         for (std::uint32_t tk = 0; tk < n; ++tk) {
             const std::span<const float> x(xq.data() + std::size_t{tk} * bcols,
                                            bcols);
@@ -1992,6 +2016,37 @@ TEST_CASE("neon dotprod fast Q8_0 follows llama.cpp's order alone and "
     const Mat m{TensorType::kQ8_0, w.data(), rows, cols};
     std::vector<float> got(std::size_t{rows} * n);
     neon_dotprod_fast::matvec_batch_neon_q8k(m, x, got, n);
+    // i#1198's split: quantized in two token ranges, two row slices (16
+    // and 21 rows: the first ends on a quad, the second has a short
+    // last quad) dotted apart; the same bits as the whole call, from
+    // the rows as stored and from a registered load-time copy (i#1243).
+    const auto split_check = [&](const std::vector<float>& whole) {
+        locus::backend::QuantBatch qb;
+        REQUIRE(neon_dotprod_fast::q8k_batch_size_neon(m, n, qb));
+        neon_dotprod_fast::q8k_batch_quantize_neon(m, x, 0, 33, qb);
+        neon_dotprod_fast::q8k_batch_quantize_neon(m, x, 33, n, qb);
+        std::vector<float> s(std::size_t{rows} * n);
+        neon_dotprod_fast::matvec_q8k_batch_pre_neon(
+            mat_rows(m, 0, 16), qb, std::span(s.data(), std::size_t{16} * n),
+            n);
+        neon_dotprod_fast::matvec_q8k_batch_pre_neon(
+            mat_rows(m, 16, rows - 16), qb,
+            std::span(s.data() + std::size_t{16} * n,
+                      std::size_t{rows - 16} * n),
+            n);
+        REQUIRE(s == whole);
+    };
+    split_check(got);
+    {
+        locus::backend::PackedBlock32 pk(m);
+        locus::backend::PackedBlock32* set[] = {&pk};
+        locus::backend::register_packed(set);
+        REQUIRE(locus::backend::find_packed(m) != nullptr);
+        std::vector<float> whole(std::size_t{rows} * n);
+        neon_dotprod_fast::matvec_batch_neon_q8k(m, x, whole, n);
+        split_check(whole);
+        locus::backend::unregister_packed(set);
+    }
     for (std::uint32_t tk = 0; tk < n; ++tk) {
         const std::span<const float> xt(x.data() + std::size_t{tk} * cols,
                                         cols);

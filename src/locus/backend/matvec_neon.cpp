@@ -2059,18 +2059,70 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
         }
         return;
     }
+    // Block-32 and Q4_K / Q6_K: quantize, then the rows (i#1198's two
+    // halves in a row, the same kernels).
+    thread_local QuantBatch b;
+    if (self::q8k_batch_size_neon(w, n, b)) {
+        self::q8k_batch_quantize_neon(w, x_batch, 0, n, b);
+        self::matvec_q8k_batch_pre_neon(w, b, out_batch, n);
+        return;
+    }
+}
+
+bool q8k_batch_size_neon(const Mat& w, std::uint32_t n, QuantBatch& b) {
+    const std::size_t cols = w.cols;
+    const bool block32 = uses_quantized_activation(w.type) &&
+                         !is_q8k_type(w.type) && cols % 32 == 0;
+    const bool kq = (w.type == gguf::TensorType::kQ4_K ||
+                     w.type == gguf::TensorType::kQ6_K) &&
+                    cols % 256 == 0;
+    if (!block32 && !kq) {
+        return false;  // the IQ, i733 and per-token paths stay whole
+    }
+    b.n = n;
+    b.qs.resize(cols * n);
+    b.q6off.clear();
     if (block32) {
+        b.d.resize(cols / 32 * n);
+        b.bsums.clear();
+    } else {
+        b.d.resize(cols / 256 * n);
+        b.bsums.resize(cols / 256 * 16 * n);
+    }
+    return true;
+}
+
+void q8k_batch_quantize_neon(const Mat& w, std::span<const float> x_batch,
+                             std::uint32_t t0, std::uint32_t t1,
+                             QuantBatch& b) {
+    const std::size_t cols = w.cols;
+    if (b.bsums.empty()) {  // block-32: Q8_0 activations
+        const std::size_t nb = cols / 32;
+        for (std::uint32_t t = t0; t < t1; ++t) {
+            quantize_activation_q8_0_neon(x_batch.subspan(t * cols, cols),
+                                          b.d.data() + t * nb,
+                                          b.qs.data() + t * cols);
+        }
+        return;
+    }
+    const std::size_t nb = cols / 256;
+    for (std::uint32_t t = t0; t < t1; ++t) {
+        quantize_activation_q8k_neon(x_batch.subspan(t * cols, cols),
+                                     b.d.data() + t * nb,
+                                     b.qs.data() + t * cols,
+                                     b.bsums.data() + t * nb * 16);
+    }
+}
+
+void matvec_q8k_batch_pre_neon(const Mat& w, const QuantBatch& b,
+                               std::span<float> out_batch, std::uint32_t n) {
+    const std::size_t cols = w.cols;
+    const bool q4k = w.type == gguf::TensorType::kQ4_K;
+    if (b.bsums.empty()) {
         // Block-32 weights x Q8_0 activations, as matvec_neon_q8k.
         const std::size_t nb = cols / 32;
-        thread_local std::vector<float> d8;
-        thread_local std::vector<std::int8_t> q8;
-        d8.resize(nb * n);
-        q8.resize(cols * n);
-        for (std::uint32_t t = 0; t < n; ++t) {
-            quantize_activation_q8_0_neon(x_batch.subspan(t * cols, cols),
-                                     d8.data() + t * nb,
-                                     q8.data() + t * cols);
-        }
+        const std::vector<float>& d8 = b.d;
+        const std::vector<std::int8_t>& q8 = b.qs;
         const std::size_t bb = w.type == gguf::TensorType::kQ8_0   ? 34
                                : w.type == gguf::TensorType::kQ5_0 ? 22
                                                                    : 18;
@@ -2097,7 +2149,9 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
         return;
     }
     const std::size_t nb = cols / 256;
-    const auto [yd, yq, ys] = quantize_batch_q8k(x_batch, cols, n);
+    const std::vector<float>& yd = b.d;
+    const std::vector<std::int8_t>& yq = b.qs;
+    const std::vector<std::int16_t>& ys = b.bsums;
     const std::size_t bb = q4k ? 144 : 210;
     const std::uint32_t tile = q8_token_tile(cols);
     // Four tokens per row pass (the kernels' T), then the tail one by

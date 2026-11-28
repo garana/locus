@@ -1390,7 +1390,7 @@ struct MmLoadQ4K {
 struct MmLoadQ6K {
     static ulong row_bytes(uint cols) { return ulong(cols / 256) * 210; }
     // Stage k0 is quarter qq of half hn of its block: l = ah + i (the
-    // layout as mv_q6_k; 210-byte blocks, read bytewise).
+    // layout as mv_q6_k; 210-byte blocks).
     static void load(device const uchar* row, uint k0, uint ah,
                      thread float* da) {
         device const uchar* blk = row + (k0 / 256) * 210;
@@ -1402,11 +1402,21 @@ struct MmLoadQ6K {
             float(((device const char*)(blk + 192))[8 * hn + ah / 16 +
                                                    2 * qq]);
         const uint lsh = (qq >> 1) * 4, hsh = 2 * qq;
-        for (uint i = 0; i < 16; ++i) {
-            const int q = int(((ql[i] >> lsh) & 0xF) |
-                              (((qh[i] >> hsh) & 3) << 4)) -
-                          32;
-            da[i] = d * float(q);
+        // Four quants a step from 16-bit loads (as llama.cpp's
+        // dequantize_q6_K; the block is only 2-byte aligned): the low
+        // nibbles and the 2 high bits of four bytes at once, then the
+        // same integer q - 32 times d per lane, so the same values.
+        device const ushort* l16 = (device const ushort*)ql;
+        device const ushort* h16 = (device const ushort*)qh;
+        for (uint j = 0; j < 4; ++j) {
+            const uint lw = uint(l16[2 * j]) | (uint(l16[2 * j + 1]) << 16);
+            const uint hw = uint(h16[2 * j]) | (uint(h16[2 * j + 1]) << 16);
+            const uint q = ((lw >> lsh) & 0x0F0F0F0Fu) |
+                           (((hw >> hsh) & 0x03030303u) << 4);
+            const float4 v = (float4(as_type<uchar4>(q)) - 32.0f) * d;
+            for (uint i = 0; i < 4; ++i) {
+                da[4 * j + i] = v[i];
+            }
         }
     }
 };
