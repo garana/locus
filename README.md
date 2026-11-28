@@ -360,6 +360,9 @@ pool), else on the CPU (#1253). locus-server and
 locus-run print the pick and why at start, e.g. `backend: vulkan
 (default; metal_forward does not take this model: qwen2vl's M-RoPE;
 metal would be used if it did)`, or `backend: neon (--backend)`.
+`LOCUS_METAL_PROFILE=1` runs each Metal dispatch alone and prints, at
+exit, each kernel's GPU time and share (overlap is lost, so the total
+passes the wall time).
 
 Every selectable backend must reproduce the golden outputs. A GPU does
 not always beat the CPU: on a tile GPU streaming a model larger than
