@@ -605,6 +605,22 @@ std::size_t cuda_pool_budget();
 bool cuda_prefill_gemm_on();
 
 /**
+ * @returns Whether CUDA Q8_0 matvecs and prefill tiles run on Q8_0
+ *     activations (i#1254): LOCUS_CUDA_Q8_INT8 not 0; false on
+ *     non-CUDA builds.
+ */
+bool cuda_q8_int8_on();
+
+/**
+ * The device Q8_0 activation quantizer on host x (a multiple of 32
+ * floats), for tests: the scales into d (x.size() / 32), the quants
+ * into q (x.size()); quantize_activation_q8_0's rule.
+ * @returns false without a usable device.
+ */
+bool cuda_quantize_q8_0_act(std::span<const float> x, float* d,
+                            std::int8_t* q);
+
+/**
  * Device mirror of a host F32 KV pool (Ops.kv_mirror_*, i#466).
  * cuda_kv_mirror_alloc returns `n_floats` zeroed device floats, outside
  * the weight pool's budget, or nullptr when they do not fit (and always

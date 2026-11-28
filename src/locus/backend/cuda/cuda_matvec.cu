@@ -28,6 +28,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -1500,6 +1501,256 @@ __global__ void matvec_q8_0_warp_kernel(const std::uint8_t* w,
     }
 }
 
+/**
+ * Quantizes x to Q8_0 activations, 32 floats a block (i#1254), by the
+ * CPU's rule (quantize_block32_act): d = amax / 127, stored rounded to
+ * f16; each quant is x * (1 / d) of the unrounded d, rounded to
+ * nearest even, its low byte kept (a NaN or an infinite product, as
+ * when 1 / d overflows, gives 0). One warp a block, lane j element j;
+ * the max is exact in any order. Launch with 256 threads a block and
+ * ceil(nblk / 8) blocks.
+ */
+__global__ void quantize_q8_0_act_kernel(const float* __restrict__ x,
+                                         float* __restrict__ d,
+                                         std::int8_t* __restrict__ q,
+                                         std::uint32_t nblk) {
+    const std::uint32_t b = blockIdx.x * 8 + threadIdx.x / 32;
+    if (b >= nblk) {
+        return;  // a whole warp leaves together
+    }
+    const std::uint32_t lane = threadIdx.x % 32;
+    const float v = x[static_cast<std::size_t>(b) * 32 + lane];
+    // Seeded at 0 as the CPU's max: fmaxf drops a NaN, so an all-NaN
+    // block gives amax 0 (d 0), not NaN.
+    float amax = fmaxf(0.0f, fabsf(v));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    }
+    const float db = __fdiv_rn(amax, 127.0f);
+    const float id = db != 0.0f ? __fdiv_rn(1.0f, db) : 0.0f;
+    const float p = __fmul_rn(v, id);
+    q[static_cast<std::size_t>(b) * 32 + lane] =
+        isfinite(p) ? static_cast<std::int8_t>(__float2int_rn(p) & 0xff)
+                    : std::int8_t{0};
+    if (lane == 0) {
+        d[b] = __half2float(__float2half_rn(db));
+    }
+}
+
+/** The integer dot of 4 int8 pairs packed in a and b, added to c. The
+ *  build targets sm_50 (CMakeLists.txt), so the byte multiplies run;
+ *  __dp4a needs an sm_61 target (a newer card JITs compute_50). */
+__device__ inline int dot4_i8(int a, int b, int c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, c);
+#else
+    // sm_5x has no dp4a: the bytes, sign-extended, multiplied.
+    return c + (a << 24 >> 24) * (b << 24 >> 24) +
+           (a << 16 >> 24) * (b << 16 >> 24) +
+           (a << 8 >> 24) * (b << 8 >> 24) + (a >> 24) * (b >> 24);
+#endif
+}
+
+/**
+ * One Q8_0 block's term against Q8_0 activations, the CPU's
+ * vec_dot_block32_q8_0 step: float(p) * (d_w * d_x), p the exact
+ * integer dot. Rounded multiplies (no fma), so the matvec and the
+ * prefill tile give a block the same bits.
+ */
+__device__ inline float q8_0_q8x_term(int p, float dw, float dx) {
+    return __fmul_rn(__int2float_rn(p), __fmul_rn(dw, dx));
+}
+
+/**
+ * Q8_0 matvec on Q8_0 activations (quantize_q8_0_act_kernel; i#1254):
+ * one warp a row, llama.cpp's mul_mat_vec_q layout: a pass takes 8
+ * consecutive blocks, lane l bytes 8 (l % 4) .. + 7 of block l / 4,
+ * read straight from global memory (weights by 16-bit words, x by 8
+ * bytes), the 4 lanes of a block add their integer dots exactly, then
+ * one float term a block (q8_0_q8x_term). Each term goes to lane kb %
+ * 32 and adds there in block order, then the warp's xor tree sums the
+ * lanes: the prefill tile's steps (matvec_tile_q8_0_q8x_kernel), so a
+ * token's bits are the same in a prefill or a decode. Launch with 32 *
+ * kWarpRows threads a block and ceil(rows / kWarpRows) blocks.
+ */
+__global__ void matvec_q8_0_q8x_kernel(const std::uint8_t* __restrict__ w,
+                                       const float* __restrict__ xd,
+                                       const std::int8_t* __restrict__ xq,
+                                       float* __restrict__ out,
+                                       std::uint32_t rows,
+                                       std::uint32_t cols) {
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
+    if (r >= rows) {
+        return;  // a whole warp leaves together: no partial shuffles
+    }
+    const std::uint32_t nblk = cols / 32;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) * nblk * 34;
+    const std::uint32_t g = lane / 4, sub = lane % 4;
+    float acc = 0.0f;
+    for (std::uint32_t it = 0; it * 8 < nblk; ++it) {
+        const std::uint32_t kb = it * 8 + g;
+        int p = 0;
+        float dw = 0.0f, dx = 0.0f;
+        if (kb < nblk) {
+            const auto* blk = reinterpret_cast<const std::uint16_t*>(
+                row + static_cast<std::size_t>(kb) * 34);
+            const std::uint32_t w0 =
+                __ldg(blk + 1 + 4 * sub) |
+                static_cast<std::uint32_t>(__ldg(blk + 2 + 4 * sub)) << 16;
+            const std::uint32_t w1 =
+                __ldg(blk + 3 + 4 * sub) |
+                static_cast<std::uint32_t>(__ldg(blk + 4 + 4 * sub)) << 16;
+            const int2 xv = __ldg(reinterpret_cast<const int2*>(
+                xq + static_cast<std::size_t>(kb) * 32 + 8 * sub));
+            // Integer multiplies: an exact dot in float multiply-adds
+            // (as the prefill tile) ran Qwen2.5 decode at 60.5 tok/s
+            // against 70.3 here.
+            p = dot4_i8(static_cast<int>(w0), xv.x, 0);
+            p = dot4_i8(static_cast<int>(w1), xv.y, p);
+            dw = __half2float(__ushort_as_half(__ldg(blk)));
+            dx = __ldg(xd + kb);
+        }
+        p += __shfl_xor_sync(0xffffffffu, p, 1);
+        p += __shfl_xor_sync(0xffffffffu, p, 2);
+        const float term = q8_0_q8x_term(p, dw, dx);
+        // Lane L owns block 8 it + L % 8 when L / 8 == it % 4: blocks
+        // L, L + 32, ... in order, as the tile's lane L.
+        const float t = __shfl_sync(0xffffffffu, term, 4 * (lane % 8));
+        if (lane / 8 == it % 4 && it * 8 + lane % 8 < nblk) {
+            acc = __fadd_rn(acc, t);
+        }
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        out[r] = acc;
+    }
+}
+
+/**
+ * The prefill tile for Q8_0 on Q8_0 activations (i#1254): R rows by T
+ * tokens a warp, the weights staged as matvec_tile_q8_0_kernel stages
+ * them; lane l takes block b0 + l of every row, and for each token the
+ * block's exact integer dot and its term (q8_0_q8x_term), added in
+ * block order, then the warp's xor tree: matvec_q8_0_q8x_kernel's bits.
+ * xd / xq hold n tokens' activations (token t at t * nblk and t *
+ * cols). Token-major output.
+ */
+template <std::uint32_t R, std::uint32_t T>
+__global__ void matvec_tile_q8_0_q8x_kernel(
+    const std::uint8_t* __restrict__ w, const float* __restrict__ xd,
+    const std::int8_t* __restrict__ xq, float* __restrict__ out,
+    std::uint32_t rows, std::uint32_t cols, std::uint32_t n) {
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r0 = (blockIdx.x * kWarpRows + threadIdx.x / 32) * R;
+    if (r0 >= rows) {
+        return;  // a whole warp leaves together: no partial shuffles
+    }
+    __shared__ __align__(16) std::uint16_t sw[kWarpRows][R][32 * 17];
+    auto& mine = sw[threadIdx.x / 32];
+    const std::uint32_t t0 = blockIdx.y * T;
+    const std::uint32_t nblk = cols / 32;
+    const std::uint16_t* row16[R];
+#pragma unroll
+    for (std::uint32_t i = 0; i < R; ++i) {
+        // A row past the end reads the last one and is not written.
+        row16[i] = reinterpret_cast<const std::uint16_t*>(
+            w + static_cast<std::size_t>(min(r0 + i, rows - 1)) * nblk * 34);
+    }
+    float acc[R][T];
+#pragma unroll
+    for (std::uint32_t i = 0; i < R; ++i) {
+#pragma unroll
+        for (std::uint32_t t = 0; t < T; ++t) {
+            acc[i][t] = 0.0f;
+        }
+    }
+    for (std::uint32_t b0 = 0; b0 < nblk; b0 += 32) {
+        const std::uint32_t nb = min(32u, nblk - b0);
+#pragma unroll
+        for (std::uint32_t i = 0; i < R; ++i) {
+            for (std::uint32_t k = lane; k < nb * 17; k += 32) {
+                mine[i][k] =
+                    __ldg(row16[i] + static_cast<std::size_t>(b0) * 17 + k);
+            }
+        }
+        __syncwarp();
+        if (lane < nb) {
+            const std::uint32_t b = b0 + lane;
+            // The integer dots in float: every product and partial sum
+            // is an integer under 2^24 (|p| <= 32 * 127 * 128), so each
+            // step is exact and pf is p in any order; sm_5x runs float
+            // multiply-adds far faster than byte ones. Each weight word
+            // is converted once a block, for all T tokens.
+            float pf[R][T];
+#pragma unroll
+            for (std::uint32_t i = 0; i < R; ++i) {
+#pragma unroll
+                for (std::uint32_t t = 0; t < T; ++t) {
+                    pf[i][t] = 0.0f;
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                float wf[R][4];
+#pragma unroll
+                for (std::uint32_t i = 0; i < R; ++i) {
+                    const std::uint16_t* blk16 = mine[i] + lane * 17;
+                    const int wq = static_cast<int>(
+                        blk16[1 + 2 * k] |
+                        static_cast<std::uint32_t>(blk16[2 + 2 * k]) << 16);
+#pragma unroll
+                    for (int g = 0; g < 4; ++g) {
+                        wf[i][g] = static_cast<float>(
+                            static_cast<std::int8_t>(wq >> (8 * g)));
+                    }
+                }
+#pragma unroll
+                for (std::uint32_t t = 0; t < T; ++t) {
+                    // A token past n reads token n - 1 (not stored).
+                    const std::size_t tok = min(t0 + t, n - 1);
+                    const int xv = __ldg(reinterpret_cast<const int*>(
+                        xq + tok * cols + static_cast<std::size_t>(b) * 32 +
+                        4 * k));
+#pragma unroll
+                    for (int g = 0; g < 4; ++g) {
+                        const float xf = static_cast<float>(
+                            static_cast<std::int8_t>(xv >> (8 * g)));
+#pragma unroll
+                        for (std::uint32_t i = 0; i < R; ++i) {
+                            pf[i][t] = fmaf(wf[i][g], xf, pf[i][t]);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (std::uint32_t i = 0; i < R; ++i) {
+                const float dw = __half2float(
+                    __ushort_as_half(mine[i][lane * 17]));
+#pragma unroll
+                for (std::uint32_t t = 0; t < T; ++t) {
+                    const std::size_t tok = min(t0 + t, n - 1);
+                    const float dx = __ldg(xd + tok * nblk + b);
+                    acc[i][t] = __fadd_rn(
+                        acc[i][t], __fmul_rn(pf[i][t], __fmul_rn(dw, dx)));
+                }
+            }
+        }
+        __syncwarp();  // the next pass overwrites this warp's slices
+    }
+#pragma unroll
+    for (std::uint32_t i = 0; i < R; ++i) {
+#pragma unroll
+        for (std::uint32_t t = 0; t < T; ++t) {
+            const float s = warp_sum(acc[i][t]);
+            if (lane == 0 && r0 + i < rows && t0 + t < n) {
+                out[static_cast<std::size_t>(t0 + t) * rows + r0 + i] = s;
+            }
+        }
+    }
+}
+
 /** Copies the 16-entry IQ4 codebook (device `kvalues`) into shared
  *  memory for the block and syncs; every thread must call it. */
 __device__ void load_iq4_codebook(const std::int8_t* kvalues,
@@ -2697,7 +2948,7 @@ namespace {
  * the budget leaves free.
  */
 struct ScratchSet {
-    static constexpr int kSlots = 4;
+    static constexpr int kSlots = 6;  // 4 and 5: Q8_0 activations
     int device = 0;
     void* p[kSlots] = {};
     std::size_t cap[kSlots] = {};
@@ -3296,6 +3547,37 @@ struct CudaTables {
     const std::int8_t* kvalues = nullptr;  // iq4_xs codebook
 };
 
+/** @returns Whether Q8_0 matvecs and prefill tiles run on Q8_0
+ *  activations (i#1254): LOCUS_CUDA_Q8_INT8 not "0". A numeric mode:
+ *  the disk prefix key holds it. */
+bool q8_int8_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("LOCUS_CUDA_Q8_INT8");
+        return e == nullptr || std::string_view(e) != "0";
+    }();
+    return on;
+}
+
+/**
+ * Queues the Q8_0 activation quantizer on count floats at dx (count a
+ * multiple of 32) into slots 4 (scales) and 5 (quants) of s.
+ * @returns false, queuing nothing, when a buffer cannot be allocated.
+ */
+bool quantize_act(ScratchLease& s, const float* dx, std::size_t count,
+                  const float*& xd, const std::int8_t*& xq) {
+    const std::size_t nblk = count / 32;
+    auto* d = static_cast<float*>(s.get(4, nblk * sizeof(float)));
+    auto* q = static_cast<std::int8_t*>(s.get(5, count));
+    if (d == nullptr || q == nullptr) {
+        return false;
+    }
+    quantize_q8_0_act_kernel<<<(nblk + 7) / 8, 256>>>(
+        dx, d, q, static_cast<std::uint32_t>(nblk));
+    xd = d;
+    xq = q;
+    return true;
+}
+
 void launch_kernel(Kind kind, const void* dw,
                    const CudaTables& t, const float* dxf,
                    float* doutf, std::uint32_t rows,
@@ -3309,12 +3591,23 @@ void launch_kernel(Kind kind, const void* dw,
                 static_cast<const float*>(dw), dxf, doutf, rows,
                 cols);
             break;
-        case Kind::kQ8_0:
+        case Kind::kQ8_0: {
+            const float* xd = nullptr;
+            const std::int8_t* xq = nullptr;
+            ScratchLease s;  // the default stream orders its reuse
+            if (q8_int8_on() && quantize_act(s, dxf, cols, xd, xq)) {
+                matvec_q8_0_q8x_kernel<<<(rows + kWarpRows - 1) /
+                                             kWarpRows,
+                                         32 * kWarpRows>>>(
+                    dwb, xd, xq, doutf, rows, cols);
+                break;
+            }
             matvec_q8_0_warp_kernel<<<
                 (rows + 2 * kWarpRows - 1) / (2 * kWarpRows),
                 32 * kWarpRows>>>(
                 dwb, dxf, doutf, rows, cols);
             break;
+        }
         case Kind::kQ4_K:
             matvec_q4_k_warp_kernel<<<
                 (rows + kWarpRows - 1) / kWarpRows, 32 * kWarpRows>>>(
@@ -3654,6 +3947,30 @@ bool cuda_prefill_gemm_on() {
 #endif
 }
 
+bool cuda_q8_int8_on() { return q8_int8_on(); }
+
+bool cuda_quantize_q8_0_act(std::span<const float> x, float* d,
+                            std::int8_t* q) {
+    if (!cuda_backend_usable()) {
+        return false;
+    }
+    ensure_device();
+    ScratchLease s;
+    const std::size_t bytes = x.size() * sizeof(float);
+    void* dx = s.get(0, bytes);
+    const float* xd = nullptr;
+    const std::int8_t* xq = nullptr;
+    return dx != nullptr &&
+           cuda_ok(cudaMemcpy(dx, x.data(), bytes,
+                              cudaMemcpyHostToDevice)) &&
+           quantize_act(s, static_cast<const float*>(dx), x.size(), xd,
+                        xq) &&
+           cuda_ok(cudaGetLastError()) &&
+           cuda_ok(cudaMemcpy(d, xd, x.size() / 32 * sizeof(float),
+                              cudaMemcpyDeviceToHost)) &&
+           cuda_ok(cudaMemcpy(q, xq, x.size(), cudaMemcpyDeviceToHost));
+}
+
 namespace {
 
 /** The fewest tokens a prefill matmul runs as a GEMM (i#1200), as
@@ -3780,10 +4097,27 @@ bool launch_tile(gguf::TensorType type, const std::uint8_t* w,
             matvec_tile_smem_kernel<R, T, kWarpRows, TileQ6K>
                 <<<grid, 32 * kWarpRows>>>(w, x, out, rows, cols, n);
             return true;
-        case gguf::TensorType::kQ8_0:
+        case gguf::TensorType::kQ8_0: {
+            const float* xd = nullptr;
+            const std::int8_t* xq = nullptr;
+            ScratchLease s;  // the default stream orders its reuse
+            if (q8_int8_on() &&
+                quantize_act(s, x, std::size_t{n} * cols, xd, xq)) {
+                // 2 rows by 8 tokens a warp: of 1 to 8 rows by 4 to 16
+                // tokens on the GTX 750 Ti, the fastest (Llama 3.2 1B
+                // Q8_0, 15 tokens: 113.1 tok/s; 4 x 8 81.2, 4 x 4 85.3,
+                // 2 x 4 86.2).
+                constexpr std::uint32_t Rq = 2, Tq = 8;
+                const dim3 gq((rows + kWarpRows * Rq - 1) / (kWarpRows * Rq),
+                              (n + Tq - 1) / Tq);
+                matvec_tile_q8_0_q8x_kernel<Rq, Tq>
+                    <<<gq, 32 * kWarpRows>>>(w, xd, xq, out, rows, cols, n);
+                return true;
+            }
             matvec_tile_q8_0_kernel<R, T><<<grid, 32 * kWarpRows>>>(
                 w, x, out, rows, cols, n);
             return true;
+        }
         default:
             return false;
     }

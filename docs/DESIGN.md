@@ -1432,7 +1432,7 @@ locus ports those dots (`backend::matvec_q8k`):
 | scalar  | all 15 QK_K types and the block-32 types                      |
 | neon    | all 15 QK_K types and the block-32 types                      |
 | sse4    | all 15 QK_K types and the block-32 types                      |
-| cuda    | all 15 QK_K types                                             |
+| cuda    | all 15 QK_K types; Q8_0 (its matvec and prefill tile)         |
 
 Today the sse4 and CUDA dots, and the neon ones but Q4_K and Q6_K,
 replay the scalar accumulation order, so they are bit-identical to it
@@ -1450,7 +1450,13 @@ close enough that this order noise tips tokens on some goldens.
 The mode is on when the architecture requires it
 (`Hparams::q8k_default`: muse-spark, deepseek41) or when the backend's
 8-bit dot is its fast path (`Ops::prefers_q8k`: neon, sse4, scalar).
-avx2, cuda and the Vulkan per-op fallback keep the f32 dot.
+avx2, cuda and the Vulkan per-op fallback keep the f32 dot, but for
+CUDA's Q8_0 matvec and prefill tile: they quantize x on the device by
+the CPU's Q8_0 rule and sum each block's exact integer dot as
+`float(p) * (d_w * d_x)` in one order, so the tile and the matvec give
+a row the same bits (on the GTX 750 Ti, Qwen2.5 0.5B Q8_0 decodes at
+74 tok/s against 62; `LOCUS_CUDA_Q8_INT8=0` keeps the f32 dot; #1254).
+A prefill of 32 tokens or more keeps cuBLAS's f32 GEMM.
 `LOCUS_F32_ACTIVATIONS` (any value but "0" or empty) or
 `use_q8k_activations(false)` selects the f32 path, the reference for
 exactness checks. On the M4 Max CPU, Orpheus 3B Q4_K_M decodes at 63
