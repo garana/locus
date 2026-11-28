@@ -276,9 +276,12 @@ constexpr std::uint32_t kFlashHeads = 32;
  * prefill's attention is close to, not bit for bit, a decode's
  * (DESIGN 16).
  *
- * Shared memory: H * HD floats of q, KT * (HD + 1) of the K or V tile
- * (a row padded by one float, so lanes on different rows hit different
- * banks), H * KT scores, 3 H for the running max, sum and rescale.
+ * Shared memory: H * (HD + 1) floats of q and KT * (HD + 1) of the K or
+ * V tile (rows padded by one float, so lanes on different rows hit
+ * different banks), H * KT scores, 3 H for the running max, sum and
+ * rescale; KT row offsets, computed once a tile. A thread scores one
+ * query-head against 4 positions, and sums its kPer heads' outputs
+ * from one V float a position (i#1254).
  */
 template <std::uint32_t HD>
 __global__ void gqa_attend_flash(
@@ -291,15 +294,17 @@ __global__ void gqa_attend_flash(
     constexpr std::uint32_t KT = HD <= 64 ? 32 : 16;
     constexpr std::uint32_t KS = HD + 1;  // padded row stride
     constexpr std::uint32_t kPer = kFlashHeads * HD / kAttendThreads;
+    constexpr std::uint32_t JG = 4;  // positions a thread scores at once
     extern __shared__ float sh[];
+    __shared__ std::size_t rowoff[KT];  // the tile's K row offsets
     const std::uint32_t qt = kFlashHeads / group;
     const std::uint32_t H = qt * group;
     const std::uint32_t kvh = blockIdx.x, q0 = blockIdx.y * qt;
     const std::uint32_t nq = min(qt, n_q - q0);
     const unsigned tid = threadIdx.x, nt = blockDim.x;
     const unsigned lane = tid % 32, warp = tid / 32, nw = nt / 32;
-    float* qs = sh;                    // [h][HD], h = query * group + g
-    float* kvs = qs + H * HD;          // [KT][KS]
+    float* qs = sh;                    // [h][KS], h = query * group + g
+    float* kvs = qs + H * KS;          // [KT][KS]
     float* ps = kvs + KT * KS;         // [h][KT]
     float* mh = ps + H * KT;           // running max a query-head
     float* lh = mh + H;                // running sum
@@ -311,9 +316,12 @@ __global__ void gqa_attend_flash(
     }
     for (std::uint32_t e = tid; e < H * HD; e += nt) {
         const std::uint32_t h = e / HD, i = h / group;
-        qs[e] = i < nq ? q[(q0 + i) * q_stride + head0 +
-                           std::size_t{h % group} * HD + e % HD]
-                       : 0.0f;
+        // Rows padded to KS: the score loop's 4 query-heads a warp read
+        // different banks.
+        qs[h * KS + e % HD] =
+            i < nq ? q[(q0 + i) * q_stride + head0 +
+                       std::size_t{h % group} * HD + e % HD]
+                   : 0.0f;
     }
     for (std::uint32_t h = tid; h < H; h += nt) {
         mh[h] = -INFINITY;
@@ -330,28 +338,46 @@ __global__ void gqa_attend_flash(
     };
     for (std::uint32_t t0 = 0; t0 < last; t0 += KT) {
         const std::uint32_t n = min(KT, last - t0);
-        __syncthreads();  // the last tile's V and scores are used
-        for (std::uint32_t e = tid; e < KT * HD; e += nt) {
-            const std::uint32_t j = e / HD, d = e % HD;
-            kvs[j * KS + d] = j < n ? __ldg(kv + row_of(t0 + j) + d) : 0.0f;
+        __syncthreads();  // the last tile's V, scores and rows are used
+        // Each position's row offset once a tile (a division by bt each),
+        // not once a staged float.
+        if (tid < KT) {
+            rowoff[tid] = tid < n ? row_of(t0 + tid) : 0;
         }
         __syncthreads();
-        // Scores: a thread a (query-head, position), a plain dot.
-        for (std::uint32_t e = tid; e < H * KT; e += nt) {
-            const std::uint32_t h = e / KT, j = e % KT;
+        for (std::uint32_t e = tid; e < KT * HD; e += nt) {
+            const std::uint32_t j = e / HD, d = e % HD;
+            kvs[j * KS + d] = j < n ? __ldg(kv + rowoff[j] + d) : 0.0f;
+        }
+        __syncthreads();
+        // Scores: a thread a query-head and JG positions, so each q
+        // float read serves JG dots.
+        for (std::uint32_t e = tid; e < H * (KT / JG); e += nt) {
+            const std::uint32_t h = e / (KT / JG);
+            const std::uint32_t j0 = (e % (KT / JG)) * JG;
             const std::uint32_t i = h / group;
-            float s = -INFINITY;
-            if (i < nq && j < n && t0 + j <= qpos[q0 + i]) {
-                const float* qr = qs + h * HD;
-                const float* kr = kvs + j * KS;
-                float d = 0.0f;
-#pragma unroll 16
-                for (std::uint32_t x = 0; x < HD; ++x) {
-                    d += qr[x] * kr[x];
-                }
-                s = d * scale;
+            const float* qr = qs + h * KS;
+            float d[JG];
+#pragma unroll
+            for (std::uint32_t g = 0; g < JG; ++g) {
+                d[g] = 0.0f;
             }
-            ps[e] = s;
+#pragma unroll 16
+            for (std::uint32_t x = 0; x < HD; ++x) {
+                const float qv = qr[x];
+#pragma unroll
+                for (std::uint32_t g = 0; g < JG; ++g) {
+                    d[g] += qv * kvs[(j0 + g) * KS + x];
+                }
+            }
+#pragma unroll
+            for (std::uint32_t g = 0; g < JG; ++g) {
+                const std::uint32_t j = j0 + g;
+                ps[h * KT + j] =
+                    i < nq && j < n && t0 + j <= qpos[q0 + i]
+                        ? d[g] * scale
+                        : -INFINITY;
+            }
         }
         __syncthreads();
         // Online softmax: warp w takes query-heads w, w + nw, ...
@@ -387,20 +413,28 @@ __global__ void gqa_attend_flash(
         for (std::uint32_t e = tid; e < KT * HD; e += nt) {
             const std::uint32_t j = e / HD, d = e % HD;
             kvs[j * KS + d] =
-                j < n ? __ldg(kv + row_of(t0 + j) + v_off + d) : 0.0f;
+                j < n ? __ldg(kv + rowoff[j] + v_off + d) : 0.0f;
         }
         __syncthreads();
-        // Outputs: thread owns (h, d) = e / HD, e % HD for e = tid + k nt.
+        // Outputs: thread owns (h, d) = e / HD, e % HD for e = tid + k nt
+        // (one d, kPer query-heads), so each V float read serves kPer
+        // heads; per head the sum runs over j in order, as before.
 #pragma unroll
         for (std::uint32_t k = 0; k < kPer; ++k) {
-            const std::uint32_t e = tid + k * nt;
-            const std::uint32_t h = e / HD, d = e % HD;
+            const std::uint32_t h = (tid + k * nt) / HD;
             if (h < H) {
-                float v = acc[k] * rs[h];
-                for (std::uint32_t j = 0; j < n; ++j) {
-                    v += ps[h * KT + j] * kvs[j * KS + d];
+                acc[k] *= rs[h];
+            }
+        }
+        const std::uint32_t dcol = tid % HD;
+        for (std::uint32_t j = 0; j < n; ++j) {
+            const float vv = kvs[j * KS + dcol];
+#pragma unroll
+            for (std::uint32_t k = 0; k < kPer; ++k) {
+                const std::uint32_t h = (tid + k * nt) / HD;
+                if (h < H) {
+                    acc[k] += ps[h * KT + j] * vv;
                 }
-                acc[k] = v;
             }
         }
     }
@@ -544,7 +578,7 @@ bool cuda_kv_attend(const KvAttend& a) {
         const std::uint32_t kt = hd <= 64 ? 32 : 16;
         const std::uint32_t h = kFlashHeads / group * group;
         const std::size_t sh =
-            (std::size_t{h} * hd + std::size_t{kt} * (hd + 1) +
+            (std::size_t{h} * (hd + 1) + std::size_t{kt} * (hd + 1) +
              std::size_t{h} * kt + 3 * std::size_t{h}) * sizeof(float);
         if (sh > 48 * 1024) {
             return false;
