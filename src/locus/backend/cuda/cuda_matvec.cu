@@ -1338,14 +1338,39 @@ __global__ void matvec_q6_k_warp_kernel(const std::uint8_t* w,
  * Copies one pass of a Q8_0 row (nb blocks of 34 bytes from src, 16-bit
  * words) into the warp's shared slice dst (16-byte aligned). A full
  * pass is 1088 bytes, a multiple of 16, so when the row starts 16-byte
- * aligned every pass does and the copy takes 68 16-byte loads. Each
- * lane issues all of its loads before any store (i#1197): a loop of
+ * aligned every pass does and the copy takes 68 16-byte loads; when it
+ * starts 8-byte aligned (an 896-wide row is 952 bytes, so every other
+ * one is), 136 8-byte loads (i#1254), not 544 16-bit ones. Each lane
+ * issues all of its loads before any store (i#1197): a loop of
  * load-then-store kept one load in flight per warp.
+ *
+ * @param align The row start's alignment in bytes: 16, 8, or less.
  */
 __device__ inline void q8_0_copy_pass(const std::uint16_t* src,
                                       std::uint16_t* dst, std::uint32_t nb,
-                                      bool aligned16, std::uint32_t lane) {
-    if (nb == 32 && aligned16) {
+                                      std::uint32_t align, std::uint32_t lane) {
+    if (nb == 32 && align == 8) {
+        const auto* s2 = reinterpret_cast<const uint2*>(src);
+        auto* d2 = reinterpret_cast<uint2*>(dst);
+        uint2 v[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            v[k] = __ldg(s2 + 32 * k + lane);
+        }
+        uint2 e{};
+        if (lane < 8) {
+            e = __ldg(s2 + 128 + lane);
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            d2[32 * k + lane] = v[k];
+        }
+        if (lane < 8) {
+            d2[128 + lane] = e;
+        }
+        return;
+    }
+    if (nb == 32 && align == 16) {
         const auto* s4 = reinterpret_cast<const uint4*>(src);
         auto* d4 = reinterpret_cast<uint4*>(dst);
         const uint4 a = __ldg(s4 + lane);
@@ -1441,8 +1466,13 @@ __global__ void matvec_q8_0_warp_kernel(const std::uint8_t* w,
         w + static_cast<std::size_t>(r0) * nblk * 34);
     const auto* row1 = reinterpret_cast<const std::uint16_t*>(
         w + static_cast<std::size_t>(r1) * nblk * 34);
-    const bool al0 = (reinterpret_cast<std::uintptr_t>(row0) & 15) == 0;
-    const bool al1 = (reinterpret_cast<std::uintptr_t>(row1) & 15) == 0;
+    // Each row's start alignment: 16, 8, or less (16-bit loads).
+    const auto align_of = [](const void* p) -> std::uint32_t {
+        const auto a = reinterpret_cast<std::uintptr_t>(p);
+        return (a & 15) == 0 ? 16 : (a & 7) == 0 ? 8 : 2;
+    };
+    const std::uint32_t al0 = align_of(row0);
+    const std::uint32_t al1 = align_of(row1);
     float acc0 = 0.0f, acc1 = 0.0f;
     for (std::uint32_t b0 = 0; b0 < nblk; b0 += 32) {
         const std::uint32_t nb = min(32u, nblk - b0);
