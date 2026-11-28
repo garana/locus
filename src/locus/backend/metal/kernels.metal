@@ -1706,11 +1706,12 @@ inline void mm_tile128(device const uchar* wbase, device const float* xbase,
     }
     const uint ar = tid >> 1, ah = (tid & 1) * 16;
     const uint bt = tid >> 3, bk = (tid & 7) * 4;
-    const bool a_in = m0 + ar < p.rows;
-    const bool b_in = n0 + bt < p.n_tok;
+    // As mm_tile: a thread past the last row or token loads the last one,
+    // whose sums are never stored, so the loop has no bounds branches.
     device const uchar* wrow =
-        w + (a_in ? ulong(m0 + ar) * L::row_bytes(p.cols) : 0);
-    device const float* xrow = x + ulong(b_in ? n0 + bt : 0) * p.x_stride;
+        w + ulong(min(m0 + ar, p.rows - 1)) * L::row_bytes(p.cols);
+    device const float* xrow =
+        x + ulong(min(n0 + bt, p.n_tok - 1)) * p.x_stride;
     threadgroup float* da = sa + 64 * (16 * (ah / 8) + ar / 8) + ar % 8;
     threadgroup float* db =
         sb + 64 * (4 * (bk / 8) + bt / 8) + 8 * (bt % 8) + bk % 8;
@@ -1718,15 +1719,9 @@ inline void mm_tile128(device const uchar* wbase, device const float* xbase,
     threadgroup const float* lsb0 = sb + 2 * 64 * (sg >> 2);
     for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
         float va[16];
-        if (a_in) {
-            L::load(wrow, k0, ah, va);
-        } else {
-            for (uint i = 0; i < 16; ++i) va[i] = 0.0f;
-        }
-        float4 vb = float4(0.0f);
-        if (b_in) {
-            vb = float4(*(device const packed_float4*)(xrow + k0 + bk));
-        }
+        L::load(wrow, k0, ah, va);
+        const float4 vb =
+            float4(*(device const packed_float4*)(xrow + k0 + bk));
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = 0; i < 8; ++i) da[8 * i] = va[i];
         for (uint i = 0; i < 8; ++i) da[64 * 16 + 8 * i] = va[8 + i];
@@ -1737,6 +1732,7 @@ inline void mm_tile128(device const uchar* wbase, device const float* xbase,
         for (uint kk = 0; kk < kMmTK / 8; ++kk) {
             simdgroup_float8x8 ma[4], mb[2];
             for (uint i = 0; i < 4; ++i) simdgroup_load(ma[i], lsa + 64 * i, 8);
+            simdgroup_barrier(mem_flags::mem_none);
             for (uint i = 0; i < 2; ++i) simdgroup_load(mb[i], lsb + 64 * i, 8);
             for (uint i = 0; i < 8; ++i) {
                 simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4],
