@@ -2284,6 +2284,98 @@ TEST_CASE("neon dotprod fast Q4_0 from a load-time copy gives the scalar "
         n);
     REQUIRE(sp == got);
 }
+
+TEST_CASE("neon dotprod fast Q4_K from a load-time copy gives the row "
+          "kernel's bits",
+          "[ops][neon][fast][repack]") {
+    if (!locus::sys::detect().dotprod) {
+        SKIP("CPU has no dotprod");
+    }
+    // 37 rows (a last quad of one row), 512 columns (two 256-blocks), 70
+    // tokens (two token tiles, 4-token passes and a tail). Without a
+    // copy Q4_K takes the dotprod build's rows_q4_k_q8k_xt; with one,
+    // the four-row kernel on the decoded 608-byte quad blocks.
+    const std::uint32_t rows = 37, cols = 512, n = 70;
+    const std::size_t nb = cols / 256;
+    std::mt19937 rng(12434);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    std::vector<std::byte> w(std::size_t{rows} * nb * 144);
+    for (auto& by : w) {
+        by = static_cast<std::byte>(byte_d(rng));
+    }
+    for (std::size_t bl = 0; bl < w.size() / 144; ++bl) {
+        const std::uint16_t d = f32_to_f16(scale_d(rng));
+        const std::uint16_t dmin = f32_to_f16(scale_d(rng));
+        std::memcpy(w.data() + bl * 144, &d, 2);
+        std::memcpy(w.data() + bl * 144 + 2, &dmin, 2);
+    }
+    std::vector<float> x(std::size_t{n} * cols);
+    for (auto& v : x) {
+        v = ud(rng);
+    }
+    const Mat m{TensorType::kQ4_K, w.data(), rows, cols};
+    std::vector<float> plain(std::size_t{rows} * n);
+    neon_dotprod_fast::matvec_batch_neon_q8k(m, x, plain, n);
+    std::vector<std::vector<float>> one0(n, std::vector<float>(rows));
+    for (std::uint32_t tk = 0; tk < n; ++tk) {
+        neon_dotprod_fast::matvec_neon_q8k(
+            m, {x.data() + std::size_t{tk} * cols, cols}, one0[tk]);
+    }
+    locus::backend::PackedBlock32 pk(m);
+    REQUIRE(pk.bytes() == std::size_t{10} * nb * 608);
+    locus::backend::PackedBlock32* const one[] = {&pk};
+    locus::backend::register_packed(one);
+    REQUIRE(locus::backend::find_packed(m) != nullptr);
+    std::vector<float> got(plain.size());
+    neon_dotprod_fast::matvec_batch_neon_q8k(m, x, got, n);
+    REQUIRE(got == plain);
+    for (std::uint32_t tk = 0; tk < n; ++tk) {
+        INFO("t=" << tk);
+        std::vector<float> o1(rows);
+        neon_dotprod_fast::matvec_neon_q8k(
+            m, {x.data() + std::size_t{tk} * cols, cols}, o1);
+        REQUIRE(o1 == one0[tk]);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(got[std::size_t{r} * n + tk] == one0[tk][r]);
+        }
+    }
+    // A slice on a quad reads the copy at its scaled offset; one off a
+    // quad, the rows as stored.
+    for (const std::uint32_t r0 : {8u, 5u}) {
+        INFO("r0=" << r0);
+        const Mat s = locus::backend::mat_rows(m, r0, rows - r0);
+        REQUIRE((locus::backend::find_packed(s) != nullptr) ==
+                (r0 % 4 == 0));
+        std::vector<float> sg(std::size_t{s.rows} * n);
+        neon_dotprod_fast::matvec_batch_neon_q8k(s, x, sg, n);
+        for (std::uint32_t r = 0; r < s.rows; ++r) {
+            for (std::uint32_t tk = 0; tk < n; ++tk) {
+                REQUIRE(sg[std::size_t{r} * n + tk] == one0[tk][r0 + r]);
+            }
+        }
+    }
+    if (const std::byte* p8 = locus::backend::find_packed(
+            locus::backend::mat_rows(m, 8, 4))) {
+        REQUIRE(p8 == locus::backend::find_packed(m) + 2 * nb * 608);
+    }
+    // The split batch (#1261's hooks) reads the copy too.
+    locus::backend::QuantBatch qb;
+    REQUIRE(neon_dotprod_fast::q8k_batch_size_neon(m, n, qb));
+    neon_dotprod_fast::q8k_batch_quantize_neon(m, x, 0, 33, qb);
+    neon_dotprod_fast::q8k_batch_quantize_neon(m, x, 33, n, qb);
+    std::vector<float> sp(std::size_t{rows} * n);
+    neon_dotprod_fast::matvec_q8k_batch_pre_neon(
+        locus::backend::mat_rows(m, 0, 16), qb,
+        std::span(sp.data(), std::size_t{16} * n), n);
+    neon_dotprod_fast::matvec_q8k_batch_pre_neon(
+        locus::backend::mat_rows(m, 16, rows - 16), qb,
+        std::span(sp.data() + std::size_t{16} * n,
+                  std::size_t{rows - 16} * n),
+        n);
+    REQUIRE(sp == got);
+}
 #endif
 #endif
 

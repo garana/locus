@@ -364,8 +364,8 @@ void TransformerModel::prepare_cpu_layout() {
         e != nullptr && std::string_view(e) == "0") {
         return;
     }
-    // The copy is anonymous memory about the size of the Q8_0 and Q4_0
-    // weights; the mapped pages it replaces go cold and the kernel may
+    // The copy is anonymous memory about the size of the Q8_0, Q4_0 and
+    // Q4_K weights; the mapped pages it replaces go cold and the kernel may
     // reclaim them. A streamed model keeps the rows as stored, and so
     // does one whose weights and copy would pass 3/4 of RAM.
     const std::uint64_t ram = sys::total_ram_bytes();
@@ -387,8 +387,7 @@ void TransformerModel::prepare_cpu_layout() {
     add(out_w_);
     std::uint64_t bytes = 0;
     for (const Mat* w : todo) {
-        bytes += std::uint64_t{(w->rows + 3u) / 4u} * 4u *
-                 backend::mat_row_bytes(*w);
+        bytes += backend::packed_size(*w);
     }
     if (todo.empty() || weight_bytes_ + bytes > ram / 4 * 3) {
         return;

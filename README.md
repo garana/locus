@@ -157,11 +157,12 @@ Block-32 weights (Q8_0, Q4_0, Q5_0, IQ4_NL) take llama.cpp's repacked
 float order on every CPU kernel (per block an exact integer dot, then
 one multiply and one add), so on ARM CPUs with dotprod a Q8_0 or Q4_0
 prefill dots four interleaved weight rows per `sdot` lane, with the
-bits of the one-token kernel. There the model interleaves its Q8_0 and
-Q4_0 weights once at load (llama.cpp's `block_q8_0x4` and
-`block_q4_0x4` layouts, about the size of those weights in anonymous
-memory) unless they are streamed or with the copy would pass 3/4 of
-RAM; `LOCUS_CPU_REPACK=0` keeps the rows as stored.
+bits of the one-token kernel. There the model interleaves its Q8_0,
+Q4_0 and Q4_K weights once at load (llama.cpp's `block_q8_0x4` and
+`block_q4_0x4` layouts, and four Q4_K rows with their 6-bit scales
+decoded), about the size of those weights in anonymous memory, unless
+they are streamed or with the copy would pass 3/4 of RAM;
+`LOCUS_CPU_REPACK=0` keeps the rows as stored.
 Every CPU softmax (attention, including the image and video models',
 MoE routing and the image encoders) and the SiLU activations take a
 polynomial exp four lanes at a time, within a few ulp of `std::exp`.

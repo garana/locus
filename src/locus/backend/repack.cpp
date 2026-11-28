@@ -13,12 +13,14 @@ namespace {
 
 constexpr std::size_t kBlkQ8 = 34;  // f16 scale + 32 int8
 constexpr std::size_t kBlkQ4 = 18;  // f16 scale + 16 bytes of nibbles
+constexpr std::size_t kBlkQ4K = 144;  // d, dmin, 12 B of scales, 128 B
 
 /** One registered matrix: its mapped rows and their packed copy. */
 struct Entry {
     const std::byte* src;
     std::size_t src_bytes;
     std::size_t row_bytes;
+    std::size_t quad_bytes;  // packed bytes per quad of rows
     gguf::TensorType type;
     const std::byte* packed;
 };
@@ -33,7 +35,7 @@ using Snapshot = std::vector<Entry>;
  * or unregister of a set (a model's load, its use_backend or its
  * teardown) builds one new snapshot under `writer` and swaps it in;
  * the old ones stay alive to the end, so a search never reads freed
- * memory: 40 bytes an entry, about 4.5 KB a snapshot for Llama 3.2 1B's
+ * memory: 48 bytes an entry, about 5.4 KB a snapshot for Llama 3.2 1B's
  * 113 matrices, one snapshot each load and teardown. Never destroyed,
  * so no exit-order race.
  */
@@ -71,10 +73,31 @@ void quad_rows(const Mat& w, std::uint32_t r0, std::size_t row_bytes,
 }  // namespace
 
 bool packs_block32(const Mat& w) {
+    if (w.data == nullptr || w.rows == 0 || w.cols == 0) {
+        return false;
+    }
+    if (w.type == gguf::TensorType::kQ4_K) {
+        return w.cols % 256 == 0;
+    }
     return (w.type == gguf::TensorType::kQ8_0 ||
             w.type == gguf::TensorType::kQ4_0) &&
-           w.data != nullptr && w.rows > 0 && w.cols > 0 &&
            w.cols % 32 == 0;
+}
+
+namespace {
+
+/** Packed bytes per quad of w's rows. */
+std::size_t quad_bytes_of(const Mat& w) {
+    if (w.type == gguf::TensorType::kQ4_K) {
+        return std::size_t{w.cols} / 256 * kPackedQ4KBlock;
+    }
+    return 4 * mat_row_bytes(w);  // Q8_0, Q4_0: the source's size
+}
+
+}  // namespace
+
+std::size_t packed_size(const Mat& w) {
+    return std::size_t{(w.rows + 3) / 4} * quad_bytes_of(w);
 }
 
 void pack_q8_0_quad(const Mat& w, std::uint32_t r0, std::byte* out) {
@@ -116,20 +139,61 @@ void pack_q4_0_quad(const Mat& w, std::uint32_t r0, std::byte* out) {
     }
 }
 
+void pack_q4_k_quad(const Mat& w, std::uint32_t r0, std::byte* out) {
+    const std::size_t nb = w.cols / 256;
+    const std::byte* rows[4];
+    quad_rows(w, r0, nb * kBlkQ4K, rows);
+    for (std::size_t b = 0; b < nb; ++b) {
+        std::byte* o = out + b * kPackedQ4KBlock;
+        for (std::size_t j = 0; j < 4; ++j) {
+            const std::byte* blk = rows[j] + b * kBlkQ4K;
+            std::uint16_t h[2];
+            std::memcpy(h, blk, 4);
+            const float d = f16_to_f32(h[0]), dmin = f16_to_f32(h[1]);
+            std::memcpy(o + 4 * j, &d, 4);
+            std::memcpy(o + 16 + 4 * j, &dmin, 4);
+            // The 12 bytes of 6-bit scales and mins, as the kernels
+            // decode them (ggml's get_scale_min_k4).
+            constexpr std::uint32_t kmask1 = 0x3f3f3f3f,
+                                    kmask2 = 0x0f0f0f0f,
+                                    kmask3 = 0x03030303;
+            std::uint32_t utmp[4];
+            std::memcpy(utmp, blk + 4, 12);
+            utmp[3] = ((utmp[2] >> 4) & kmask2) |
+                      (((utmp[1] >> 6) & kmask3) << 4);
+            const std::uint32_t uaux = utmp[1] & kmask1;
+            utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+            utmp[2] = uaux;
+            utmp[0] &= kmask1;
+            std::uint8_t sm[16];  // 8 scales, then 8 mins
+            std::memcpy(sm, utmp, 16);
+            for (std::size_t s = 0; s < 8; ++s) {
+                o[32 + 4 * s + j] = std::byte{sm[s]};
+                o[64 + 4 * s + j] = std::byte{sm[8 + s]};
+            }
+            for (std::size_t v = 0; v < 32; ++v) {
+                std::memcpy(o + 96 + 16 * v + 4 * j, blk + 16 + 4 * v, 4);
+            }
+        }
+    }
+}
+
 PackedBlock32::PackedBlock32(const Mat& w)
     : type_(w.type),
       src_(w.data),
       src_bytes_(std::size_t{w.rows} * mat_row_bytes(w)),
-      row_bytes_(mat_row_bytes(w)) {
+      row_bytes_(mat_row_bytes(w)),
+      quad_bytes_(quad_bytes_of(w)) {
     const std::uint32_t quads = (w.rows + 3) / 4;
-    bytes_.resize(std::size_t{quads} * 4 * row_bytes_);
-    const bool q8 = w.type == gguf::TensorType::kQ8_0;
+    bytes_.resize(packed_size(w));
     for (std::uint32_t q = 0; q < quads; ++q) {
-        std::byte* out = bytes_.data() + std::size_t{q} * 4 * row_bytes_;
-        if (q8) {
+        std::byte* out = bytes_.data() + std::size_t{q} * quad_bytes_;
+        if (w.type == gguf::TensorType::kQ8_0) {
             pack_q8_0_quad(w, 4 * q, out);
-        } else {
+        } else if (w.type == gguf::TensorType::kQ4_0) {
             pack_q4_0_quad(w, 4 * q, out);
+        } else {
+            pack_q4_k_quad(w, 4 * q, out);
         }
     }
 }
@@ -150,8 +214,8 @@ void register_packed(std::span<PackedBlock32* const> set) {
                 continue;
             }
             p->registered_ = true;
-            s.push_back({p->src_, p->src_bytes_, p->row_bytes_, p->type_,
-                         p->bytes_.data()});
+            s.push_back({p->src_, p->src_bytes_, p->row_bytes_,
+                         p->quad_bytes_, p->type_, p->bytes_.data()});
         }
         std::sort(s.begin(), s.end(), [](const Entry& a, const Entry& b) {
             return a.src < b.src;
@@ -199,7 +263,9 @@ const std::byte* find_packed(const Mat& w) {
         off + std::size_t{w.rows} * row_bytes > e.src_bytes) {
         return nullptr;
     }
-    return e.packed + off;
+    // Quad q of the source starts at q * 4 * row_bytes, of the copy at
+    // q * quad_bytes (the same for the block-32 types).
+    return e.packed + off / (4 * row_bytes) * e.quad_bytes;
 }
 
 }  // namespace locus::backend
