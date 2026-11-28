@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <vector>
 
 namespace locus::backend {
 
