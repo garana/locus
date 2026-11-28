@@ -141,6 +141,21 @@ EngineChoice flux_engine() {
     return diffusion_engine();
 }
 
+/** PixArt's DiT engine: as flux_engine (i#1057), the Metal image ops
+ *  where a Metal device is usable; T5 and the VAE stay on
+ *  diffusion_engine(). LOCUS_PIXART_METAL=0 keeps diffusion_engine()
+ *  for the DiT too. */
+EngineChoice pixart_engine() {
+    static const bool on = [] {
+        const char* e = std::getenv("LOCUS_PIXART_METAL");
+        return e == nullptr || std::string_view(e) != "0";
+    }();
+    if (on && backend::metal::Context::usable()) {
+        return {"metal", &backend::metal::image_ops()};
+    }
+    return diffusion_engine();
+}
+
 /** Janus's vision tower: the GPU as for the diffusion models; else the
  *  active backend when it splits rows (a CPU one), else the best CPU
  *  backend, as one device call per linear would be slow. */
@@ -1658,7 +1673,12 @@ std::vector<std::pair<std::string, std::string>> OpenAiServer::engines()
     if (flux_) {
         out.emplace_back("images (FLUX.1)", flux);
     } else if (pixart_) {
-        out.emplace_back("images (PixArt)", diffusion);
+        out.emplace_back(
+            "images (PixArt)",
+            pixart_engine().name == diffusion_engine().name
+                ? diffusion
+                : engine_label(pixart_engine().name) +
+                      "; T5 and the VAE on " + diffusion);
     }
     if (qwen_image_) {
         out.emplace_back("images (Qwen-Image)",
@@ -4040,14 +4060,16 @@ void OpenAiServer::install_routes() {
                 // A discrete GPU would copy 12 GB of weights into the
                 // pool, evicting the LLM's. With these ops the DiT's
                 // attention and the VAE's convolutions run on the GPU
-                // too; T5's attention stays on the CPU.
-                const auto& op = *diffusion_engine().ops;
+                // too; T5's attention stays on the CPU. On Apple the
+                // DiT takes Metal (pixart_engine), the rest these.
+                const auto& op = *pixart_engine().ops;
                 image::PixArtPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {
                     const auto lk = try_image_lock(image_mu_, res, 60);
                     if (!lk.owns_lock()) return;
-                    rgb = pixart_->generate(p, op, ctx.client_alive, &took);
+                    rgb = pixart_->generate(p, op, ctx.client_alive, &took,
+                                            diffusion_engine().ops);
                 }
                 if (rgb.empty()) {
                     res.status = 499;  // the client went away

@@ -160,7 +160,9 @@ cost above.
   runs the FLUX DiT on Metal, CLIP, T5 and the VAE on Vulkan (#1057):
   a served 4-step image, warm, 256 x 256 10.7 s against 25.2 s with
   the DiT on Vulkan, 512 x 512 19.8 against 31.2 s, 1024 x 1024 64.8
-  against 80.7 s.
+  against 80.7 s. PixArt the same way: a served 512 x 512, 20-step
+  image, warm, denoise 7.7 s against 11.3 s, whole image 9.4 s against
+  12.8 s.
 
 Against llama.cpp (Homebrew, ggml 1.1.1; 2026-11-27), main 5443ecf5,
 so the CPU rows are before #1232's block-32 change (its Q8_0 prefill
