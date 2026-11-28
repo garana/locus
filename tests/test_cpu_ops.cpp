@@ -2016,10 +2016,11 @@ TEST_CASE("neon dotprod fast Q8_0 follows llama.cpp's order alone and "
     const Mat m{TensorType::kQ8_0, w.data(), rows, cols};
     std::vector<float> got(std::size_t{rows} * n);
     neon_dotprod_fast::matvec_batch_neon_q8k(m, x, got, n);
-    {
-        // i#1198's split: quantized in two token ranges, two row slices
-        // (16 and 21 rows, off the four-row step) dotted apart; the
-        // same bits.
+    // i#1198's split: quantized in two token ranges, two row slices (16
+    // and 21 rows: the first ends on a quad, the second has a short
+    // last quad) dotted apart; the same bits as the whole call, from
+    // the rows as stored and from a registered load-time copy (i#1243).
+    const auto split_check = [&](const std::vector<float>& whole) {
         locus::backend::QuantBatch qb;
         REQUIRE(neon_dotprod_fast::q8k_batch_size_neon(m, n, qb));
         neon_dotprod_fast::q8k_batch_quantize_neon(m, x, 0, 33, qb);
@@ -2033,7 +2034,18 @@ TEST_CASE("neon dotprod fast Q8_0 follows llama.cpp's order alone and "
             std::span(s.data() + std::size_t{16} * n,
                       std::size_t{rows - 16} * n),
             n);
-        REQUIRE(s == got);
+        REQUIRE(s == whole);
+    };
+    split_check(got);
+    {
+        locus::backend::PackedQ8_0 pk(m);
+        locus::backend::PackedQ8_0* set[] = {&pk};
+        locus::backend::register_packed_q8_0(set);
+        REQUIRE(locus::backend::find_packed_q8_0(m) != nullptr);
+        std::vector<float> whole(std::size_t{rows} * n);
+        neon_dotprod_fast::matvec_batch_neon_q8k(m, x, whole, n);
+        split_check(whole);
+        locus::backend::unregister_packed_q8_0(set);
     }
     for (std::uint32_t tk = 0; tk < n; ++tk) {
         const std::span<const float> xt(x.data() + std::size_t{tk} * cols,
