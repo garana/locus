@@ -39,6 +39,9 @@ const std::vector<Backend>& list() {
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_neon,
                       .matvec_q8k_batch = &matvec_batch_neon_q8k,
+                      .q8k_batch_size = &q8k_batch_size_neon,
+                      .q8k_batch_quantize = &q8k_batch_quantize_neon,
+                      .matvec_q8k_batch_pre = &matvec_q8k_batch_pre_neon,
                       .prefers_q8k = true,
                       .cpu = true}});
 #if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
@@ -50,6 +53,9 @@ const std::vector<Backend>& list() {
             o.matvec_q8k = &neon_dotprod::matvec_neon_q8k;
             o.matvec_batch = &neon_dotprod::matvec_batch_neon;
             o.matvec_q8k_batch = &neon_dotprod::matvec_batch_neon_q8k;
+            o.q8k_batch_size = &neon_dotprod::q8k_batch_size_neon;
+            o.q8k_batch_quantize = &neon_dotprod::q8k_batch_quantize_neon;
+            o.matvec_q8k_batch_pre = &neon_dotprod::matvec_q8k_batch_pre_neon;
         }
 #endif
 #if defined(LOCUS_HAS_NEON_DOTPROD_FAST_VARIANT)
@@ -66,6 +72,10 @@ const std::vector<Backend>& list() {
             o.matvec_q8k = &neon_dotprod_fast::matvec_neon_q8k;
             o.matvec_q8k_batch = &neon_dotprod_fast::matvec_batch_neon_q8k;
             o.packs_q8_0 = true;
+            o.q8k_batch_size = &neon_dotprod_fast::q8k_batch_size_neon;
+            o.q8k_batch_quantize = &neon_dotprod_fast::q8k_batch_quantize_neon;
+            o.matvec_q8k_batch_pre =
+                &neon_dotprod_fast::matvec_q8k_batch_pre_neon;
         }
 #endif
 #if defined(LOCUS_HAS_NEON_I8MM_VARIANT)
@@ -76,6 +86,10 @@ const std::vector<Backend>& list() {
             o.matvec_q8k = &neon_i8mm::matvec_neon_q8k;
             o.matvec_q8k_batch = &neon_i8mm::matvec_batch_neon_q8k;
             o.packs_q8_0 = false;  // it reads the rows as stored
+            // Its batch has no split halves: the model calls it whole.
+            o.q8k_batch_size = nullptr;
+            o.q8k_batch_quantize = nullptr;
+            o.matvec_q8k_batch_pre = nullptr;
         }
 #endif
 #endif

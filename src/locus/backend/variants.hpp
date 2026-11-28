@@ -55,6 +55,20 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
 void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
 
+/**
+ * matvec_batch_neon_q8k's block-32 and Q4_K / Q6_K paths in their two
+ * halves (Ops::q8k_batch_size, q8k_batch_quantize and
+ * matvec_q8k_batch_pre, i#1198): the same quantization and row
+ * kernels, so the same bits, the batch quantized once for every row
+ * slice. q8k_batch_size_neon returns false for the other types.
+ */
+bool q8k_batch_size_neon(const Mat& w, std::uint32_t n, QuantBatch& b);
+void q8k_batch_quantize_neon(const Mat& w, std::span<const float> x_batch,
+                             std::uint32_t t0, std::uint32_t t1,
+                             QuantBatch& b);
+void matvec_q8k_batch_pre_neon(const Mat& w, const QuantBatch& b,
+                               std::span<float> out_batch, std::uint32_t n);
+
 /** quantize_activation_q8k with NEON: bit-identical to it (the same
  *  operations, the same rounding, no contraction). */
 void quantize_activation_q8k_neon(std::span<const float> x, float* d,
@@ -79,6 +93,12 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n);
 void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
+bool q8k_batch_size_neon(const Mat& w, std::uint32_t n, QuantBatch& b);
+void q8k_batch_quantize_neon(const Mat& w, std::span<const float> x_batch,
+                             std::uint32_t t0, std::uint32_t t1,
+                             QuantBatch& b);
+void matvec_q8k_batch_pre_neon(const Mat& w, const QuantBatch& b,
+                               std::span<float> out_batch, std::uint32_t n);
 }  // namespace neon_dotprod
 #endif
 
@@ -111,6 +131,14 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out);
 void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
+/** The i#1198 halves of matvec_batch_neon_q8k: Q8_0 here, the other
+ *  types through the baseline (dotprod) build's. */
+bool q8k_batch_size_neon(const Mat& w, std::uint32_t n, QuantBatch& b);
+void q8k_batch_quantize_neon(const Mat& w, std::span<const float> x_batch,
+                             std::uint32_t t0, std::uint32_t t1,
+                             QuantBatch& b);
+void matvec_q8k_batch_pre_neon(const Mat& w, const QuantBatch& b,
+                               std::span<float> out_batch, std::uint32_t n);
 }  // namespace neon_dotprod_fast
 #endif
 #endif
