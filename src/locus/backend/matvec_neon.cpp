@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -1429,14 +1430,21 @@ void quantize_activation_q8_0_neon(std::span<const float> x, float* d,
         const float dd = amax / 127.0f;
         const float id = dd != 0.0f ? 1.0f / dd : 0.0f;
         d[b] = f16_to_f32(f32_to_f16(dd));
-        // nearbyint under the default rounding mode: half to even; a NaN
-        // converts to 0 (FCVTNS), as the scalar maps it (i#473).
+        // nearbyint under the default rounding mode: half to even. A
+        // non-finite product is 0, as the scalar maps it (i#1269): FCVTNS
+        // gives 0 for a NaN but saturates +-inf (1 / d overflowing), so a
+        // lane whose |p| is not at most FLT_MAX (inf, NaN) is masked off.
+        const float32x4_t fmax =
+            vdupq_n_f32(std::numeric_limits<float>::max());
+        const auto quant = [&](float32x4_t xv) {
+            const float32x4_t p = vmulq_n_f32(xv, id);
+            const uint32x4_t ok = vcaleq_f32(p, fmax);
+            return vandq_s32(vcvtnq_s32_f32(p), vreinterpretq_s32_u32(ok));
+        };
         int16x8_t h[4];
         for (int k = 0; k < 4; ++k) {
-            const int32x4_t a = vcvtnq_s32_f32(vmulq_n_f32(v[2 * k], id));
-            const int32x4_t c =
-                vcvtnq_s32_f32(vmulq_n_f32(v[2 * k + 1], id));
-            h[k] = vcombine_s16(vmovn_s32(a), vmovn_s32(c));
+            h[k] = vcombine_s16(vmovn_s32(quant(v[2 * k])),
+                                vmovn_s32(quant(v[2 * k + 1])));
         }
         vst1q_s8(qs + b * 32, vcombine_s8(vmovn_s16(h[0]), vmovn_s16(h[1])));
         vst1q_s8(qs + b * 32 + 16,
