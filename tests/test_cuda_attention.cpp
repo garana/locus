@@ -202,15 +202,85 @@ TEST_CASE("cuda flash prefill attention tracks the host",
         REQUIRE(dev != nullptr);
         cache.attach_mirror({dev, &locus::backend::cuda_kv_mirror_store,
                              &locus::backend::cuda_kv_mirror_free});
-        Seq seq;
+        // Another sequence first, so seq's blocks are not the pool's
+        // first ones and its table can sit at an offset (below).
+        Seq other, seq;
+        REQUIRE(cache.ensure_capacity(other, 20));
         REQUIRE(cache.ensure_capacity(seq, n_pos));
-        for (std::uint32_t t = 0; t < n_pos; ++t) {
-            for (std::uint32_t i = 0; i < g.kv_dim; ++i) {
-                cache.k(seq, layer, t)[i] = ud(rng);
-                cache.v(seq, layer, t)[i] = ud(rng);
+        for (Seq* s : {&other, &seq}) {
+            const std::uint32_t np = s == &seq ? n_pos : 20;
+            for (std::uint32_t t = 0; t < np; ++t) {
+                for (std::uint32_t i = 0; i < g.kv_dim; ++i) {
+                    cache.k(*s, layer, t)[i] = ud(rng);
+                    cache.v(*s, layer, t)[i] = ud(rng);
+                }
+            }
+            cache.sync_rows(*s, layer, 0, np);
+        }
+        const auto host_ref = [&](const locus::model::Hparams& hp,
+                                  std::uint32_t grp, const float* qr,
+                                  std::uint32_t pos, float* ref) {
+            locus::model::gqa_attend(
+                qr, ref, hp.n_heads, hd, grp, pos, hp.kq_scale,
+                [&](std::uint32_t t) -> const float* {
+                    return cache.k(seq, layer, t);
+                },
+                [&](std::uint32_t t) -> const float* {
+                    return cache.v(seq, layer, t);
+                });
+        };
+        // seq's chunk with its table at an offset in a shared blocks
+        // array (other's table first), as a CUDA forward's device tables
+        // hold several sequences: the flash kernel must start at it.
+        {
+            locus::model::Hparams hp;
+            hp.n_kv_heads = n_kv;
+            hp.n_heads = n_kv * 4;
+            hp.head_dim = hd;
+            hp.kq_scale = 1.0f / std::sqrt(static_cast<float>(hd));
+            const std::size_t w = std::size_t{hp.n_heads} * hd;
+            constexpr std::uint32_t n_q = 24, base = 100;
+            std::vector<std::uint32_t> blocks(other.blocks.begin(),
+                                              other.blocks.end());
+            const auto off = static_cast<std::uint32_t>(blocks.size());
+            blocks.insert(blocks.end(), seq.blocks.begin(), seq.blocks.end());
+            std::vector<std::uint32_t> pos(n_q), tab(n_q, off);
+            for (std::uint32_t i = 0; i < n_q; ++i) {
+                pos[i] = base + i;
+            }
+            std::vector<float> q(n_q * w), out(n_q * w);
+            for (auto& v : q) {
+                v = ud(rng);
+            }
+            locus::backend::KvAttend a;
+            a.mirror = cache.mirror_data();
+            a.blocks = blocks.data();
+            a.n_blocks = static_cast<std::uint32_t>(blocks.size());
+            a.block_stride = cache.block_floats();
+            a.layer_off = cache.layer_offset(layer);
+            a.v_off = cache.layer_floats() / 2;
+            a.block_tokens = g.block_tokens;
+            a.n_heads = hp.n_heads;
+            a.n_kv_heads = n_kv;
+            a.head_dim = hd;
+            a.kq_scale = hp.kq_scale;
+            a.n_q = n_q;
+            a.q_pos = pos.data();
+            a.q_table = tab.data();
+            a.q = q.data();
+            a.out = out.data();
+            a.q_stride = w;
+            INFO("hd " << hd << ", table at offset " << off);
+            REQUIRE(locus::backend::cuda_kv_attend(a));
+            for (std::uint32_t i = 0; i < n_q; ++i) {
+                std::vector<float> ref(w);
+                host_ref(hp, 4, q.data() + i * w, base + i, ref.data());
+                for (std::size_t j = 0; j < w; ++j) {
+                    REQUIRE(out[i * w + j] ==
+                            Catch::Approx(ref[j]).epsilon(1e-4).margin(1e-5));
+                }
             }
         }
-        cache.sync_rows(seq, layer, 0, n_pos);
         for (const std::uint32_t grp : {1u, 4u, 7u, 8u}) {
             locus::model::Hparams hp;
             hp.n_kv_heads = n_kv;

@@ -550,8 +550,12 @@ bool cuda_kv_attend(const KvAttend& a) {
             return false;
         }
         const std::uint32_t qt = kFlashHeads / group;
+        // The sequence's table starts at its offset in the blocks array
+        // (the queries share it: one_seq), as qtab does for the two-pass
+        // kernels; the n_blocks check above covers tab + pos / bt.
         kernel<<<dim3(a.n_kv_heads, (a.n_q + qt - 1) / qt), kAttendThreads,
-                 sh>>>(static_cast<const float*>(a.mirror), dblocks,
+                 sh>>>(static_cast<const float*>(a.mirror),
+                       dblocks + meta[a.n_q],
                        a.block_stride, a.layer_off, a.v_off, a.block_tokens,
                        a.n_kv_heads * a.head_dim, a.kq_scale, qpos, a.n_q,
                        group, dq, a.q_stride, dout);
