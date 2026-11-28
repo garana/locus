@@ -62,7 +62,8 @@ void finish(id<MTLCommandBuffer> cb, std::string_view what) {
  * own, its GPU time added to its kernel's total, and the totals go to
  * stderr at exit (most first). Dispatches that overlap in a batch run
  * one after another here, so it shows each kernel's share, not the
- * batch's wall time.
+ * batch's wall time. A batch's dispatches have already run when it is
+ * abandoned in this mode (a profiling switch only).
  */
 struct Profile {
     struct Row {
