@@ -448,7 +448,7 @@ TEST_CASE("cuda forward runs qwen2 on the GPU path, prefill equal to decode",
                                                           << big);
         // On Q8_0 activations (i#1254) the attention's float gap can
         // move a quant by one step: measured 0.40 of 23 (3.2e-5 on f32).
-        CHECK(gap <= (locus::backend::cuda_q8_int8_on() ? 0.05f : 1e-4f) *
+        CHECK(gap <= (locus::backend::cuda_q8_int8_on() ? 0.03f : 1e-4f) *
                          big);
         for (std::uint32_t t = 0; t < n; ++t) {
             INFO("position " << t);
@@ -481,11 +481,11 @@ TEST_CASE("cuda forward runs qwen2 on the GPU path, prefill equal to decode",
     } else {
         // Both quantize their activations, so a float rounding apart
         // upstream (sum orders) can move a quant by one step and the
-        // logits by more than the rounding: measured 0.42 of 23. Each
-        // position's top token must agree.
+        // logits by more than the rounding: measured 0.40 to 0.42 of 23.
+        // Each position's top token must agree.
         WARN("logit gap against the CPU on Q8 activations: " << worst
                                                              << " of " << top);
-        CHECK(worst <= 0.05f * top);
+        CHECK(worst <= 0.03f * top);
         for (std::uint32_t t = 0; t < n; ++t) {
             const auto row = [&](const std::vector<float>& v) {
                 const auto b = v.begin() + std::ptrdiff_t{t} * nv;
