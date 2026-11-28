@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <vector>
 
 #include "locus/gguf/gguf.hpp"
 
@@ -80,10 +81,8 @@ void layernorm(std::span<const float> x, std::span<const float> w,
                float eps, std::span<float> out);
 
 /**
- * In-place numerically-stable softmax over x. Bit-identical to the
- * std::exp form by default; under LOCUS_CPU_FAST it runs
- * softmax_fast_inplace instead (cpu_fast), for every caller: attention,
- * MoE routing, the image encoders.
+ * In-place numerically-stable softmax over x: softmax_fast_inplace,
+ * for every caller (attention, MoE routing, the image encoders).
  */
 void softmax_inplace(std::span<float> x);
 
@@ -111,7 +110,9 @@ float exp_fast(float x);
 void softmax_fast_inplace(std::span<float> x);
 
 /**
- * out = silu(gate) * up, elementwise (SwiGLU FFN activation).
+ * out = silu(gate) * up, elementwise (SwiGLU FFN activation), with
+ * exp_fast's polynomial four lanes at a time: within a few ulp of the
+ * std::exp form, the same bits on every arch.
  * All three spans have the same length; out may alias gate.
  */
 void silu_mul(std::span<const float> gate, std::span<const float> up,
@@ -151,6 +152,21 @@ struct Mat {
     const std::byte* data = nullptr;
     std::uint32_t rows = 0;
     std::uint32_t cols = 0;
+};
+
+/**
+ * A batch's activations quantized once for a matrix's row slices
+ * (Ops::q8k_batch_size / q8k_batch_quantize / matvec_q8k_batch_pre,
+ * i#1198). The backend that sizes it owns the layout: per token, the
+ * block scales in d, the int8 quants in qs, and for the K-quants the
+ * 16-wide sums in bsums and Q6_K's offset terms in q6off.
+ */
+struct QuantBatch {
+    std::vector<float> d;
+    std::vector<std::int8_t> qs;
+    std::vector<std::int16_t> bsums;
+    std::vector<std::int16_t> q6off;
+    std::uint32_t n = 0;
 };
 
 /**
@@ -508,7 +524,8 @@ void group_norm(std::span<float> x, std::uint32_t ch, std::uint32_t plane,
                 std::uint32_t groups, std::span<const float> gamma,
                 std::span<const float> beta, float eps);
 
-/** SiLU / Swish in place: x = x * sigmoid(x) = x / (1 + exp(-x)). */
+/** SiLU / Swish in place: x = x * sigmoid(x) = x / (1 + exp(-x)),
+ *  exp from exp_fast's polynomial, four lanes at a time. */
 void silu(std::span<float> x);
 
 /**

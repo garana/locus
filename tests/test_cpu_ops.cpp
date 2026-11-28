@@ -228,19 +228,41 @@ TEST_CASE("softmax_fast_inplace is scalar exp_fast in 8 fixed lanes",
     }
 }
 
-TEST_CASE("softmax_inplace without LOCUS_CPU_FAST keeps the std::exp bits",
-          "[ops][fast]") {
-    if (cpu_fast()) {
-        SKIP("LOCUS_CPU_FAST is set");
-    }
+// i#1244: softmax_inplace is softmax_fast_inplace for every caller.
+TEST_CASE("softmax_inplace is softmax_fast_inplace", "[ops][fast]") {
     for (const auto& row : softmax_rows()) {
-        std::vector<float> ref = row;
+        std::vector<float> fast = row;
         std::vector<float> got = row;
-        softmax_ref(ref);
+        softmax_fast_inplace(fast);
         softmax_inplace(got);
-        REQUIRE(std::memcmp(got.data(), ref.data(),
-                            ref.size() * sizeof(float)) == 0);
+        REQUIRE(std::memcmp(got.data(), fast.data(),
+                            fast.size() * sizeof(float)) == 0);
     }
+}
+
+// i#1244: silu_mul and silu take exp_fast's polynomial, four lanes at a
+// time: within 1e-6 of the std::exp form, and the 4-lane body equals
+// the scalar tail (n = 11: two vectors and 3 alone).
+TEST_CASE("silu_mul and silu track the std::exp form", "[ops][fast]") {
+    std::mt19937 rng(1244);
+    std::uniform_real_distribution<float> d(-30.0f, 30.0f);
+    std::vector<float> g(4099), u(4099);
+    for (auto& v : g) v = d(rng);
+    for (auto& v : u) v = d(rng);
+    std::vector<float> out(g.size()), s = g;
+    silu_mul(g, u, out);
+    silu(s);
+    for (std::size_t i = 0; i < g.size(); ++i) {
+        const float sig = g[i] / (1.0f + std::exp(-g[i]));
+        REQUIRE(s[i] == Approx(sig).epsilon(1e-6).margin(1e-30));
+        REQUIRE(out[i] == Approx(sig * u[i]).epsilon(1e-6).margin(1e-30));
+    }
+    // A lane's value does not depend on where it sits: the same input in
+    // the vector body (index 4) and in the tail (index 9).
+    std::vector<float> a(11, 0.37f), b(11, 2.0f), o(11);
+    a[4] = a[9] = -3.25f;
+    silu_mul(a, b, o);
+    REQUIRE(o[4] == o[9]);
 }
 
 TEST_CASE("silu_mul limits", "[ops]") {
@@ -934,8 +956,8 @@ TEST_CASE("matvec_batch_sse4 F32 and BF16 tiles give the per-token bits",
 // every token of a batch, so batched prefill equals the per-token path.
 #if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
 // i#706: the SSE4 kernels built with AVX give the SSE4 build's bits on
-// every entry point, per token and batched (the scalar comparisons
-// above then hold for them too).
+// every entry point, per token and batched, but one-token Q4_K and Q6_K,
+// which take llama.cpp's rows there (i#1244) and stay within 1e-5.
 TEST_CASE("sse4_avx kernels give the sse4 bits", "[ops][batch][sse4]") {
     if (!locus::sys::detect().avx) {
         SKIP("CPU lacks AVX");
@@ -964,7 +986,15 @@ TEST_CASE("sse4_avx kernels give the sse4 bits", "[ops][batch][sse4]") {
         same();
         matvec_sse4_q8k(m, x0, a);
         sse4_avx::matvec_sse4_q8k(m, x0, b);
-        same();
+        if (m.type == TensorType::kQ4_K || m.type == TensorType::kQ6_K) {
+            // One token: the AVX build takes llama.cpp's rows (i#1244),
+            // another float order, so close, not equal.
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                REQUIRE(b[r] == Approx(a[r]).epsilon(1e-5).margin(1e-5));
+            }
+        } else {
+            same();
+        }
         a.resize(std::size_t{rows} * n);
         b.resize(a.size());
         matvec_batch_sse4(m, xb, a, n);
@@ -1086,6 +1116,25 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
         }
         std::vector<float> got(std::size_t{rows} * n);
         matvec_batch_sse4_q8k(m, xb, got, n);
+        // i#1198's split: the batch quantized in two token ranges, then
+        // two row slices (3 and 4 rows) dotted against it, as the model
+        // runs them; the same bits.
+        locus::backend::QuantBatch qb;
+        if (q8k_batch_size_sse4(m, n, qb)) {
+            q8k_batch_quantize_sse4(m, xb, 0, n / 2, qb);
+            q8k_batch_quantize_sse4(m, xb, n / 2, n, qb);
+            std::vector<float> split(std::size_t{rows} * n);
+            const std::uint32_t r_mid = 3;
+            matvec_q8k_batch_pre_sse4(
+                locus::backend::mat_rows(m, 0, r_mid), qb,
+                std::span(split.data(), std::size_t{r_mid} * n), n);
+            matvec_q8k_batch_pre_sse4(
+                locus::backend::mat_rows(m, r_mid, rows - r_mid), qb,
+                std::span(split.data() + std::size_t{r_mid} * n,
+                          std::size_t{rows - r_mid} * n),
+                n);
+            REQUIRE(split == got);
+        }
         for (std::uint32_t tk = 0; tk < n; ++tk) {
             const std::span<const float> x(xb.data() + std::size_t{tk} * cols,
                                            cols);
@@ -1199,6 +1248,25 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
         }
         std::vector<float> got(std::size_t{rows} * n);
         matvec_batch_sse4_q8k(m, xb, got, n);
+        // i#1198's split: the batch quantized in two token ranges, then
+        // two row slices (3 and 4 rows) dotted against it, as the model
+        // runs them; the same bits.
+        locus::backend::QuantBatch qb;
+        if (q8k_batch_size_sse4(m, n, qb)) {
+            q8k_batch_quantize_sse4(m, xb, 0, n / 2, qb);
+            q8k_batch_quantize_sse4(m, xb, n / 2, n, qb);
+            std::vector<float> split(std::size_t{rows} * n);
+            const std::uint32_t r_mid = 3;
+            matvec_q8k_batch_pre_sse4(
+                locus::backend::mat_rows(m, 0, r_mid), qb,
+                std::span(split.data(), std::size_t{r_mid} * n), n);
+            matvec_q8k_batch_pre_sse4(
+                locus::backend::mat_rows(m, r_mid, rows - r_mid), qb,
+                std::span(split.data() + std::size_t{r_mid} * n,
+                          std::size_t{rows - r_mid} * n),
+                n);
+            REQUIRE(split == got);
+        }
         for (std::uint32_t tk = 0; tk < n; ++tk) {
             const std::span<const float> x(xb.data() + std::size_t{tk} * cols,
                                            cols);
@@ -1769,17 +1837,24 @@ TEST_CASE("neon dotprod variant is bit-identical to the baseline neon",
         mats.push_back(Mat{t, store.back().data(), rows, cols});
     }
     {
+        // Every block-32 type: n 7 runs a four-token step of the batch
+        // kernel and a tail (i#1239).
         std::uniform_int_distribution<int> byte_d(0, 255);
-        std::vector<std::byte> w(std::size_t{rows} * (cols / 32) * 34);
-        for (auto& by : w) {
-            by = static_cast<std::byte>(byte_d(rng));
+        for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
+                                       std::pair{TensorType::kQ4_0, 18u},
+                                       std::pair{TensorType::kQ5_0, 22u},
+                                       std::pair{TensorType::kIQ4_NL, 18u}}) {
+            std::vector<std::byte> w(std::size_t{rows} * (cols / 32) * bytes);
+            for (auto& by : w) {
+                by = static_cast<std::byte>(byte_d(rng));
+            }
+            for (std::size_t bl = 0; bl < w.size() / bytes; ++bl) {
+                const std::uint16_t d = f32_to_f16(0.01f);
+                std::memcpy(w.data() + bl * bytes, &d, 2);
+            }
+            store.push_back(std::move(w));
+            mats.push_back(Mat{t, store.back().data(), rows, cols});
         }
-        for (std::size_t bl = 0; bl < w.size() / 34; ++bl) {
-            const std::uint16_t d = f32_to_f16(0.01f);
-            std::memcpy(w.data() + bl * 34, &d, 2);
-        }
-        store.push_back(std::move(w));
-        mats.push_back(Mat{TensorType::kQ8_0, store.back().data(), rows, cols});
         std::vector<std::byte> f(std::size_t{rows} * cols * 4);
         for (std::size_t i = 0; i < std::size_t{rows} * cols; ++i) {
             const float v = xd(rng);

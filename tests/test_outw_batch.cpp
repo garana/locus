@@ -1,7 +1,11 @@
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -10,6 +14,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
+#include "locus/sys/features.hpp"
 
 using locus::model::TransformerModel;
 using Seq = locus::kv::PagedKvCache::Seq;
@@ -26,11 +31,30 @@ std::string q4k_path() {
 
 // i#52: the last stage amortizes the LM head (out_w_) into ONE
 // matvec_batch over the whole batch instead of n per-token matvec
-// passes. This asserts the amortized path is bit-for-bit the per-
-// sequence forward() path (which still projects out_w_ per token), for
-// all three batched sites: forward_batch_decode, forward_batch_layers,
-// and forward_batch's all_logits branch.
-void check_outw(TransformerModel& model) {
+// passes. This asserts the amortized path is the per-sequence forward()
+// path (which still projects out_w_ per token), for all three batched
+// sites: forward_batch_decode, forward_batch_layers, and forward_batch's
+// all_logits branch: bit for bit at tol 0, else within tol (one token and
+// a batch may take kernels of different float orders, DESIGN 16: on AVX
+// one-token Q4_K / Q6_K rows are llama.cpp's, i#1244). A permuted layout
+// is off by far more than any tol used here.
+void check_outw(TransformerModel& model, float tol = 0.0f) {
+    float worst = 0.0f;  // the largest |got - want| seen (tol > 0)
+    const auto same = [tol, &worst](float got, float want) {
+        if (tol == 0.0f) {
+            REQUIRE(got == want);
+        } else {
+            worst = std::max(worst, std::abs(got - want));
+            REQUIRE(got == Catch::Approx(want).margin(tol));
+        }
+    };
+    // Per row, at tol > 0: the batched argmax is the per-token one.
+    const auto same_top = [tol](std::span<const float> got,
+                                std::span<const float> want) {
+        if (tol > 0.0f) {
+            REQUIRE(locus::model::argmax(got) == locus::model::argmax(want));
+        }
+    };
     const auto& hp = model.hparams();
     const std::uint32_t V = hp.n_vocab;
     const std::uint32_t L = hp.n_layers;
@@ -77,9 +101,9 @@ void check_outw(TransformerModel& model) {
         model.forward_batch_decode(next, cache, ptrs, ws, got);
         for (std::uint32_t i = 0; i < N; ++i) {
             for (std::uint32_t r = 0; r < V; ++r) {
-                REQUIRE(got[static_cast<std::size_t>(i) * V + r] ==
-                        ref[i][r]);
+                same(got[static_cast<std::size_t>(i) * V + r], ref[i][r]);
             }
+            same_top({got.data() + std::size_t{i} * V, V}, ref[i]);
         }
         for (auto& s : seqs) {
             cache.release(s);
@@ -102,9 +126,9 @@ void check_outw(TransformerModel& model) {
         model.forward_batch_layers(next, {}, 0, L, cache, ptrs, ws, got);
         for (std::uint32_t i = 0; i < N; ++i) {
             for (std::uint32_t r = 0; r < V; ++r) {
-                REQUIRE(got[static_cast<std::size_t>(i) * V + r] ==
-                        ref[i][r]);
+                same(got[static_cast<std::size_t>(i) * V + r], ref[i][r]);
             }
+            same_top({got.data() + std::size_t{i} * V, V}, ref[i]);
         }
         for (auto& s : seqs) {
             cache.release(s);
@@ -133,15 +157,18 @@ void check_outw(TransformerModel& model) {
         model.forward_batch(chunk, cB, sB, wB, got, /*all_logits=*/true);
         for (std::uint32_t i = 0; i < m; ++i) {
             for (std::uint32_t r = 0; r < V; ++r) {
-                REQUIRE(got[static_cast<std::size_t>(i) * V + r] ==
-                        refc[i][r]);
+                same(got[static_cast<std::size_t>(i) * V + r], refc[i][r]);
             }
+            same_top({got.data() + std::size_t{i} * V, V}, refc[i]);
         }
         cR.release(sR);
         cB.release(sB);
     }
     for (auto& s : seqsR) {
         cacheR.release(s);
+    }
+    if (tol > 0.0f) {
+        WARN("largest |batched - per-token| logit gap: " << worst);
     }
 }
 
@@ -152,7 +179,16 @@ void check_outw(TransformerModel& model) {
 // one). The reference forward() and the batched paths share the one
 // model object, so they always use the section's backend. Vulkan is
 // skipped (no batched forward). Convention: test_model_e2e.cpp.
-void sweep_backends(const std::string& path) {
+// tol applies only where one token and a batch take different float
+// orders: the sse4 backend on an AVX CPU (i#1244) and the fallback copy
+// of it; every other backend, metal's batch-invariant mode among them,
+// keeps bit for bit.
+void sweep_backends(const std::string& path, float tol = 0.0f) {
+    const bool avx = locus::sys::detect().avx;
+    const auto tol_for = [&](std::string_view name) {
+        return avx && name == "sse4" ? tol : 0.0f;
+    };
+    const float fb_tol = tol_for(locus::backend::best_backend().name);
     // The wrapper's op.matvec fallback branch is reached only on a
     // backend that leaves Ops::matvec_batch null, which today is avx2
     // alone. The sweep below therefore cannot reach it on any host
@@ -174,7 +210,7 @@ void sweep_backends(const std::string& path) {
         if (b.available && b.selectable && b.name != "vulkan") {
             DYNAMIC_SECTION("backend " << b.name) {
                 model.use_backend(b);
-                check_outw(model);
+                check_outw(model, tol_for(b.name));
             }
         }
     }
@@ -182,7 +218,7 @@ void sweep_backends(const std::string& path) {
     // comment at its declaration for why it is hoisted before `model`).
     DYNAMIC_SECTION("backend " << fb.name) {
         model.use_backend(fb);
-        check_outw(model);
+        check_outw(model, fb_tol);
     }
 }
 }  // namespace
@@ -204,8 +240,15 @@ TEST_CASE("amortized LM head byte-exact: F32 head (layout guard)",
 }
 
 // Quantized head: exercises matvec_batch's register-blocked path (the
-// one-read-per-batch kernel that the amortization exists for).
-TEST_CASE("amortized LM head byte-exact: quantized head",
+// one-read-per-batch kernel that the amortization exists for). On AVX
+// one token takes llama.cpp's Q4_K / Q6_K rows and a batch the sse4
+// order (i#1244, DESIGN 16): after 16 layers of Llama 3.2 1B Q4_K_M the
+// logits differ by up to 0.49 (each layer's Q8_K activations can round
+// to the next step), with the same top token on every row. So sse4 on an
+// AVX CPU (and its fallback copy) is held within 1 of the per-token
+// logits and the same argmax; every other backend, metal's
+// batch-invariant mode among them, stays bit for bit.
+TEST_CASE("amortized LM head tracks per-token: quantized head",
           "[batch][outw]") {
     if (!std::filesystem::exists(q4k_path())) {
         SKIP("Q4_K model not present (llama-3.2-1b-q4_k_m.gguf)");
@@ -217,5 +260,5 @@ TEST_CASE("amortized LM head byte-exact: quantized head",
         Mode() { locus::backend::metal::set_batch_invariant(true); }
         ~Mode() { locus::backend::metal::reset_batch_invariant(); }
     } const mode;
-    sweep_backends(q4k_path());
+    sweep_backends(q4k_path(), 1.0f);
 }

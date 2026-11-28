@@ -402,7 +402,29 @@ TEST_CASE("metal matmuls match the CPU matvec per token",
     Context& ctx = Context::get();
     std::mt19937 rng(17);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    // Rows and tokens off the 64 x 32 tile, strided token rows.
+    // Both prefill tiles on every Mac (i#1074: the default is the GPU
+    // family's), the caller's LOCUS_METAL_MM_TILE put back after.
+    struct EnvGuard {
+        std::string old;
+        bool had = false;
+        EnvGuard() {
+            if (const char* e = std::getenv("LOCUS_METAL_MM_TILE")) {
+                old = e;
+                had = true;
+            }
+        }
+        ~EnvGuard() {
+            if (had) {
+                ::setenv("LOCUS_METAL_MM_TILE", old.c_str(), 1);
+            } else {
+                ::unsetenv("LOCUS_METAL_MM_TILE");
+            }
+        }
+    } guard;
+    const char* tile = GENERATE("64", "128");
+    ::setenv("LOCUS_METAL_MM_TILE", tile, 1);
+    CAPTURE(tile);
+    // Rows and tokens off both tiles (64 or 128 x 32), strided rows.
     for (const TensorType ty :
          {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0,
           TensorType::kQ4_0, TensorType::kQ5_0, TensorType::kF32,
@@ -1795,24 +1817,32 @@ TEST_CASE("the default backend follows metal_forward's gate",
             ? "vulkan"
             : std::string(locus::backend::best_backend().name);
 
+    // Off Apple, a usable CUDA device takes what cuda_forward takes
+    // (i#1253), qwen2 among them.
+    const auto* cu = locus::backend::find_backend("cuda");
+    const bool cuda = cu != nullptr && cu->available && cu->selectable;
+    const std::string first = metal ? "metal" : cuda ? "cuda" : best;
+
     const auto img = qwen_tiny::lm("qwen2");
     const auto g = locus::gguf::GgufFile::parse(img);
     auto model = locus::model::TransformerModel::load(g);
     // qwen2's attention is one metal_forward takes. The boot line's
     // reason comes with the pick.
     std::string why;
-    CHECK(model.use_backend_for("", KvType::kF32, &why).name ==
-          (metal ? "metal" : best));
-    CHECK(model.active_backend().name == (metal ? "metal" : best));
+    CHECK(model.use_backend_for("", KvType::kF32, &why).name == first);
+    CHECK(model.active_backend().name == first);
     if (metal) {
         CHECK(why == "default; metal_forward takes this model");
     }
+    // An f16 cache too (i#1245: the tools' default on Metal).
+    CHECK(model.use_backend_for("", KvType::kF16, &why).name ==
+          (metal ? "metal" : best));
     // metal_forward declines a quantized cache.
     CHECK(model.use_backend_for("", KvType::kQ8, &why).name == best);
     if (metal) {
         CHECK(why == "default; metal_forward does not take this model: "
-                     "a q8 KV cache (metal_forward takes f32); metal would "
-                     "be used if it did");
+                     "a q8 KV cache (metal_forward takes f32 and f16); metal "
+                     "would be used if it did");
     }
     // An explicit choice wins.
     const char* cpu =
@@ -2528,5 +2558,63 @@ TEST_CASE("bench: metal decode over several sequences", "[.bench][metal]") {
                 }
             }
         }
+    }
+}
+
+// A hidden bench (i#1074): the prefill matmul on Llama 3.2 1B's shapes
+// (512 tokens), 10 copies in one batch after a warm one; prints TFLOPS
+// per type and shape. Run: locus_tests "[.metal-mm-bench]".
+TEST_CASE("metal prefill matmul throughput", "[.metal-mm-bench]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    Context& ctx = Context::get();
+    constexpr std::uint32_t kTok = 512;
+    constexpr int kReps = 10;
+    std::mt19937 rng(3);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const TensorType ty :
+         {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0}) {
+        double flop = 0, sec = 0;
+        for (const auto& [rows, cols] :
+             {std::pair<std::uint32_t, std::uint32_t>{2048, 2048},
+              {512, 2048}, {8192, 2048}, {2048, 8192}}) {
+            const auto w = random_weights(ty, rows, cols, 1);
+            std::vector<float> x(std::size_t{kTok} * cols);
+            for (auto& v : x) {
+                v = dist(rng);
+            }
+            Context::Buffer wb = ctx.upload(w);
+            Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
+            Context::Buffer ob =
+                ctx.alloc(std::size_t{kTok} * rows * sizeof(float));
+            std::lock_guard lk(mb::device_mutex());
+            const auto run = [&](int reps) {
+                ctx.begin_batch();
+                for (int i = 0; i < reps; ++i) {
+                    REQUIRE(mb::record_matmul(ctx, ty, rows, cols, kTok, wb,
+                                              0, xb, 0, cols, ob, 0, rows,
+                                              false));
+                }
+                ctx.end_batch();
+            };
+            run(1);
+            const auto t0 = std::chrono::steady_clock::now();
+            run(kReps);
+            const double s = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+            const double f = 2.0 * rows * cols * kTok * kReps;
+            std::printf("type %d %5u x %5u: %.2f TFLOPS\n",
+                        static_cast<int>(ty), rows, cols, f / s * 1e-12);
+            flop += f;
+            sec += s;
+            ctx.free(wb);
+            ctx.free(xb);
+            ctx.free(ob);
+        }
+        std::printf("type %d all shapes: %.2f TFLOPS\n",
+                    static_cast<int>(ty), flop / sec * 1e-12);
     }
 }

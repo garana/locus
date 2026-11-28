@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -142,6 +144,60 @@ TEST_CASE("use_backend refuses a backend this machine cannot run",
     CAPTURE(off->name);
     REQUIRE_THROWS_AS(model.use_backend(*off), std::invalid_argument);
     CHECK(&model.active_backend() == &best);
+}
+
+// i#1253: with no --backend, a host with a usable CUDA device runs a
+// model on CUDA when cuda_forward takes it (an f32 KV cache, weights
+// within the pool), else the CPU's best backend; without a device the
+// default is unchanged.
+TEST_CASE("the default backend is CUDA when the model fits the GPU",
+          "[e2e][backend][cuda]") {
+    if (std::getenv("LOCUS_BACKEND") != nullptr) {
+        SKIP("LOCUS_BACKEND is set");
+    }
+    using locus::kv::KvType;
+    const std::string models = std::string(LOCUS_SOURCE_DIR) + "/tests/models/";
+    const std::string small = models + "qwen2.5-0.5b-instruct-q8_0.gguf";
+    if (!std::filesystem::exists(small)) {
+        SKIP(small + " absent");
+    }
+    auto g = locus::gguf::GgufFile::open(small);
+    auto model = locus::model::TransformerModel::load(g);
+    std::string why;
+    const auto& got = model.use_backend_for("", KvType::kF32, &why);
+    CAPTURE(why);
+    const auto* cu = locus::backend::find_backend("cuda");
+    const bool cuda = cu != nullptr && cu->available && cu->selectable;
+    const auto* mt = locus::backend::find_backend("metal");
+    if (mt != nullptr && mt->available && mt->selectable) {
+        SKIP("a Metal host: its own default");
+    }
+    if (!cuda) {
+        // No device: the default is the CPU's best, as before.
+        CHECK(&got == &locus::backend::best_backend());
+        return;
+    }
+    // Fits (0.5 GB of weights): CUDA.
+    CHECK(std::string_view(got.name) == "cuda");
+    CHECK(why.find("fits the CUDA device") != std::string::npos);
+    // A KV cache that is not f32 (q8 here): cuda_forward declines it,
+    // so the CPU.
+    const auto& q8 = model.use_backend_for("", KvType::kQ8, &why);
+    CHECK(&q8 == &locus::backend::best_backend());
+    CHECK(why.find("KV cache that is not f32") != std::string::npos);
+    // Weights over the pool's budget (Orpheus 3B, 1.9 GB, on a 2 GB
+    // card): the CPU.
+    const std::string big = models + "orpheus-3b-0.1-ft-Q4_K_M.gguf";
+    if (std::filesystem::exists(big) && cu->ops.pool_budget != nullptr) {
+        auto gb = locus::gguf::GgufFile::open(big);
+        auto mb = locus::model::TransformerModel::load(gb);
+        if (std::filesystem::file_size(big) > cu->ops.pool_budget()) {
+            const auto& b = mb.use_backend_for("", KvType::kF32, &why);
+            CAPTURE(why);
+            CHECK(&b == &locus::backend::best_backend());
+            CHECK(why.find("does not take this model") != std::string::npos);
+        }
+    }
 }
 
 namespace {
@@ -560,13 +616,37 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
         const char* prompt;
         std::size_t prompt_tokens;
         const char* continuation;  // llama.cpp, 24 tokens
+        // A near-tie llama.cpp's token wins (DESIGN 16): at decode step
+        // tie_step the test checks |logit[tie_token] - logit[tie_other]|
+        // is under tie_bound, then feeds tie_token instead of the
+        // argmax. -1: no tie.
+        int tie_step = -1;
+        locus::tok::TokenId tie_token = 0, tie_other = 0;
+        float tie_bound = 0.0f;
     };
     const Golden goldens[] = {
+        // Step 2, after "\n    ": " if" (421) against ' """\n' (3190),
+        // 0.09 to 0.13 apart on neon and metal, and the CPU softmax's
+        // exp (#1251) flips it on neon (-0.09; logits move about 0.1,
+        // as much as neon against metal on one commit).
         {"def fibonacci(n):", 4,
          "\n    if n <= 1:\n        return n\n    else:\n        "
-         "return fibonacci(n-1) + fibonacci"},
+         "return fibonacci(n-1) + fibonacci",
+         2, 421, 3190, 0.25f},
         {"x.append(item)\n\tif (n<2) return n;", 13,
          "\n\tfor (int i=2; i<n; i++) {\n\t\tif (x[i-1] > x"},
+    };
+    // The next token at decode step i: the argmax, or at gd's near-tie
+    // llama.cpp's token once its margin is checked.
+    const auto pick = [](const Golden& gd, int i,
+                         const std::vector<float>& logits) {
+        if (i != gd.tie_step) {
+            return locus::model::argmax(logits);
+        }
+        const float gap = logits[gd.tie_token] - logits[gd.tie_other];
+        CAPTURE(gap);
+        CHECK(std::abs(gap) < gd.tie_bound);
+        return gd.tie_token;
     };
     for (const char* be : backends) {
         model.use_backend(*locus::backend::find_backend(be));
@@ -588,7 +668,7 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
             }
             std::vector<locus::tok::TokenId> gen;
             for (int i = 0; i < 24; ++i) {
-                const auto next = locus::model::argmax(logits);
+                const auto next = pick(gd, i, logits);
                 gen.push_back(next);
                 REQUIRE(cache.ensure_capacity(seq, 1));
                 model.forward(next, cache, seq, ws, logits);
@@ -619,7 +699,7 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
             }
             std::vector<locus::tok::TokenId> gen;
             for (int i = 0; i < 24; ++i) {
-                const auto next = locus::model::argmax(logits);
+                const auto next = pick(gd, i, logits);
                 gen.push_back(next);
                 REQUIRE(cache.ensure_capacity(seq, 1));
                 model.forward(next, cache, seq, ws, logits);

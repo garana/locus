@@ -86,9 +86,13 @@ TEST_CASE("gpu_idle_warning flags a default CPU pick with a GPU usable",
                 "warning: the text model runs on the CPU (neon) by "
                 "default; a GPU is usable: pass --backend vulkan (or set "
                 "LOCUS_BACKEND=vulkan)");
+    }
+    SECTION("a usable CUDA device is the default's own call") {
+        // i#1253: the default takes cuda when cuda_forward takes the
+        // model, so a CPU pick beside it was chosen: no warning.
         const Backend list_cuda[] = {cpu, cuda};
-        REQUIRE(gpu_idle_warning(true, cpu, list_cuda, false).find(
-                    "--backend cuda") != std::string::npos);
+        REQUIRE(gpu_idle_warning(true, cpu, list_cuda, false).empty());
+        REQUIRE(gpu_idle_warning(true, cuda, list_cuda, false).empty());
     }
     SECTION("an explicit choice does not warn") {
         const Backend list[] = {cpu, vk};
@@ -110,8 +114,7 @@ TEST_CASE("gpu_idle_warning flags a default CPU pick with a GPU usable",
         const Backend list[] = {cpu, vk};
         REQUIRE(gpu_idle_warning(true, cpu, list, false).empty());
         const Backend list_both[] = {cpu, vk, cuda};
-        REQUIRE(gpu_idle_warning(true, cpu, list_both, false).find(
-                    "--backend cuda") != std::string::npos);
+        REQUIRE(gpu_idle_warning(true, cpu, list_both, false).empty());
     }
 }
 

@@ -1836,31 +1836,21 @@ void softmax_fast_inplace(std::span<float> x) {
     }
 }
 
-void softmax_inplace(std::span<float> x) {
-    if (cpu_fast()) {
-        softmax_fast_inplace(x);
-        return;
-    }
-    float mx = x[0];
-    for (float v : x) {
-        mx = std::max(mx, v);
-    }
-    float sum = 0.0f;
-    for (float& v : x) {
-        v = std::exp(v - mx);
-        sum += v;
-    }
-    for (float& v : x) {
-        v /= sum;
-    }
-}
+void softmax_inplace(std::span<float> x) { softmax_fast_inplace(x); }
 
 void silu_mul(std::span<const float> gate, std::span<const float> up,
               std::span<float> out) {
     assert(gate.size() == up.size() && gate.size() == out.size());
-    for (std::size_t i = 0; i < gate.size(); ++i) {
+    const std::size_t n = gate.size();
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const V4f g = load4(gate.data() + i);
+        store4(out.data() + i,
+               g / (1.0f + exp_poly(-g)) * load4(up.data() + i));
+    }
+    for (; i < n; ++i) {
         const float g = gate[i];
-        out[i] = g / (1.0f + std::exp(-g)) * up[i];
+        out[i] = g / (1.0f + exp_poly(-g)) * up[i];
     }
 }
 
@@ -2983,8 +2973,15 @@ void group_norm(std::span<float> x, std::uint32_t ch, std::uint32_t plane,
 }
 
 void silu(std::span<float> x) {
-    for (float& v : x) {
-        v = v / (1.0f + std::exp(-v));
+    // exp_fast's polynomial four lanes at a time, as silu_mul.
+    const std::size_t n = x.size();
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const V4f v = load4(x.data() + i);
+        store4(x.data() + i, v / (1.0f + exp_poly(-v)));
+    }
+    for (; i < n; ++i) {
+        x[i] = x[i] / (1.0f + exp_poly(-x[i]));
     }
 }
 

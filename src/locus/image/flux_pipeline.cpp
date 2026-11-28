@@ -185,8 +185,10 @@ std::pair<std::uint32_t, std::uint32_t> FluxPipeline::reference_size(
 
 std::vector<float> FluxPipeline::generate_from(
     std::span<const float> latent, const Request& req, const backend::Ops& op,
-    const std::function<bool()>& alive, Timing* timing) const {
+    const std::function<bool()>& alive, Timing* timing,
+    const backend::Ops* enc_op) const {
     validate(req);
+    const backend::Ops& eop = enc_op != nullptr ? *enc_op : op;
     const std::uint32_t h = req.height / 8, w = req.width / 8;
     if (latent.size() != std::size_t{kLatentCh} * h * w) {
         throw std::invalid_argument("flux: latent is not 16 x h/8 x w/8");
@@ -208,17 +210,17 @@ std::vector<float> FluxPipeline::generate_from(
 
     const auto t0 = Clock::now();
     const auto clip_ids = clip_tok_->encode(req.prompt, clip_->context());
-    const auto pooled = clip_->encode(clip_ids, op).pooled;
+    const auto pooled = clip_->encode(clip_ids, eop).pooled;
     if (alive && !alive()) return {};
     const auto ids = t5_ids(req.prompt, req.max_sequence_length);
-    const auto text = t5_->encode(ids, op);
+    const auto text = t5_->encode(ids, eop);
     // T5-XXL (9.5 GB) and the 12B DiT (23.8 GB in BF16) together pass
     // what a 36 GB Apple GPU can hold (its submits then fail), so on
     // Vulkan each leaves the GPU before the other runs. Their BF16
     // tensors are imported in place from the mappings, so taking them
     // back costs no copy.
     const bool vk = &op == &backend::vulkan_image_ops();
-    if (vk) {
+    if (&eop == &backend::vulkan_image_ops()) {
         backend::vulkan_release_weights(t5_bytes_.data(), t5_bytes_.size());
     }
     const auto n_txt = static_cast<std::uint32_t>(ids.size());
@@ -248,7 +250,7 @@ std::vector<float> FluxPipeline::generate_from(
                     static_cast<float>(r.rgb[i * 3 + c]) / 255.0f * 2.0f - 1.0f;
             }
         }
-        const auto lat = vae_->encode(img, rh, rw, op);
+        const auto lat = vae_->encode(img, rh, rw, eop);
         ref_tok = FluxSampler::pack(lat, kLatentCh, rh / 8, rw / 8);
         ref_ids = FluxSampler::image_ids(rh / 16, rw / 16, 1.0f);
         n_ref = (rh / 16) * (rw / 16);
@@ -296,7 +298,7 @@ std::vector<float> FluxPipeline::generate_from(
     }
     const auto t2 = Clock::now();
     const auto lat = FluxSampler::unpack(x, kLatentCh, h, w);
-    auto img = vae_->decode(lat, h, w, op);
+    auto img = vae_->decode(lat, h, w, eop);
     const auto t3 = Clock::now();
     if (timing != nullptr) *timing = {ms(t0, t1), ms(t1, t2), ms(t2, t3)};
     return img;
@@ -304,12 +306,13 @@ std::vector<float> FluxPipeline::generate_from(
 
 std::vector<std::uint8_t> FluxPipeline::generate(
     const Request& req, const backend::Ops& op,
-    const std::function<bool()>& alive, Timing* timing) const {
+    const std::function<bool()>& alive, Timing* timing,
+    const backend::Ops* enc_op) const {
     validate(req);  // before the noise: a bad size costs nothing
     const std::size_t n =
         std::size_t{kLatentCh} * (req.height / 8) * (req.width / 8);
     const auto latent = PixArtPipeline::normal_latent(req.seed, n);
-    const auto img = generate_from(latent, req, op, alive, timing);
+    const auto img = generate_from(latent, req, op, alive, timing, enc_op);
     if (img.empty()) return {};
     return SdVaeDecoder::to_rgb8(img, req.height, req.width);
 }
