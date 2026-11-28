@@ -581,9 +581,10 @@ NEON). There it is a capability win, not a speed win.
   streamed models. Independent
   matvecs reading the same input (q/k/v, gate/up) share one pool
   dispatch, and decode attention spreads its heads across the pool.
-  Idle workers spin 500 us for the next dispatch before sleeping: one
-  a performance core but one where the OS reports core tiers (Apple),
-  none elsewhere; `LOCUS_POOL_SPIN=N` sets the count. On the M4 Max
+  Idle workers spin 500 us for the next dispatch before sleeping. Where
+  the OS reports core tiers (Apple), the count of spinners is the
+  performance cores less one; elsewhere it is none. `LOCUS_POOL_SPIN=N`
+  sets the count. On the M4 Max
   with none (as on Linux), neon decode is 14 to 18% slower and prefill
   2 to 8% (i#1198).
 - R9.2, static pinning: `LOCUS_PIN_STATIC=1` mlocks every non-expert
