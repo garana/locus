@@ -39,7 +39,21 @@ on MoltenVK.
 
 Recommended: `--backend metal` for text, the default since #1042
 (metal for the models its forward takes, else vulkan). Images and
-video take the GPU through Vulkan by themselves. Concurrent clients
+video take the GPU through Vulkan by themselves. Its KV cache stays
+f32 by default: f16 (`--kv-type f16`, the M4's default, #1245) is no
+gain on this GPU family. Decode tok/s after the prompt, main 6e13558f,
+f32 against f16, 3 rounds:
+
+| model, prompt         | f32               | f16               |
+|-----------------------|-------------------|-------------------|
+| Llama 1B Q8_0, 501    | 105.6 105.7 105.7 | 105.1 104.9 105.2 |
+| Llama 1B Q8_0, 2101   | 94.3 82.9 93.8    | 94.8 92.4 94.3    |
+| Llama 1B Q4_K_M, 501  | 153.9 155.5 155.8 | 152.3 155.0 153.9 |
+| Llama 1B Q4_K_M, 2101 | 131.1 129.0 129.7 | 131.6 133.6 133.0 |
+| Qwen2.5 Q8_0, 501     | 184.6 186.8 183.6 | 183.1 184.6 183.5 |
+| Qwen2.5 Q8_0, 2123    | 163.5 161.3 164.1 | 159.2 144.4 154.5 |
+
+Concurrent clients
 decode together since #1184; locus-server, Llama 1B, 128 tokens a
 client, tok/s in all:
 
@@ -98,10 +112,13 @@ efficiency), 32 GPU cores; arm64 with neon, dotprod and i8mm; 36 GB;
 macOS.
 
 Recommended: `--backend metal` for text, the default since #1042: it
-leads Vulkan on every prefill and on most decode rows. On the decode
-of Orpheus and Qwen3-Coder the two are within 1%. Concurrent clients
-decode together since #1184; locus-server, Llama 1B, 128 tokens a
-client, tok/s in all:
+leads Vulkan on every prefill and on most decode rows. Its KV cache is
+f16 by default (#1245): Llama 1B decode after a 2101-token prompt,
+Q8_0 191.2 -> 200.8 and Q4_K_M 244.8 -> 260.8 tok/s against f32
+(llama.cpp at depth 2048: 206.2 and 278.9), prefill and short-context
+decode level. On the decode of Orpheus and Qwen3-Coder the two are
+within 1%. Concurrent clients decode together since #1184;
+locus-server, Llama 1B, 128 tokens a client, tok/s in all:
 
 | model  | clients | Metal before #1184 | Metal, invariant | Metal, not invariant | Vulkan |
 |--------|---------|--------------------|------------------|----------------------|--------|
@@ -140,7 +157,12 @@ cost above.
   results are close to the default's but not bit-identical.
 - FLUX.1 Kontext Q8_0, one DiT step: 512 x 512 Vulkan 4.88 s, Metal
   4.30 s; 1024 x 1024 Vulkan 17.6 s, Metal 16.4 s (#1044). The server
-  serves images on Vulkan today (#1057).
+  runs the FLUX DiT on Metal, CLIP, T5 and the VAE on Vulkan (#1057):
+  a served 4-step image, warm, 256 x 256 10.7 s against 25.2 s with
+  the DiT on Vulkan, 512 x 512 19.8 against 31.2 s, 1024 x 1024 64.8
+  against 80.7 s. PixArt the same way: a served 512 x 512, 20-step
+  image, warm, denoise 7.7 s against 11.3 s, whole image 9.4 s against
+  12.8 s.
 
 Against llama.cpp (Homebrew, ggml 1.1.1; 2026-11-27), main 5443ecf5,
 so the CPU rows are before #1232's block-32 change (its Q8_0 prefill
@@ -169,12 +191,12 @@ GPU of compute capability 5.0. Measured on an Intel Core i5-2400
 (Sandy Bridge, 4 cores), 32 GB RAM without ECC, and a GTX 750 Ti (2
 GB; driver 580.178.04, CUDA 12.6); Ubuntu 24.04, GCC 13.
 
-Automatic: the CPU backend `sse4` (its AVX build). locus does not move
-to CUDA by itself: pass `--backend cuda`.
-
-Recommended: `--backend cuda` for dense models that fit in 2 GB (1.7x
-to 3.2x the CPU's decode, 9.7x to 12x its prefill); the CPU default
-for larger ones.
+Automatic: CUDA when its one-submit forward takes the model (a dense
+llama or qwen2, an f32 KV cache, weights within the weight pool, about
+80% of free VRAM: 1.7x to 3.2x the CPU's decode, 9.7x to 12x its
+prefill); else the CPU backend `sse4` (its AVX build), which beats
+CUDA's per-op path on models that do not fit the 2 GB card. The
+`backend:` line at startup says which and why.
 
 Against llama.cpp (e8e6c7a, built here: CUDA for sm_50 with `-ngl 99`,
 and CPU-only, 4 threads; 2026-11-27), main 6e13558f, `--backend cuda`
@@ -231,10 +253,12 @@ Qwen2.5's decode leaves its small matmuls' launch overhead bare.
 - Tests on this host run with the Vulkan drivers hidden
   (`VK_LOADER_DRIVERS_DISABLE='*'`): Vulkan compute on this card
   faulted (Xid 13) and froze the host twice.
-- `LOCUS_CPU_FAST=1` gained 1 to 7% on the dense rows (#1059), near the
-  noise: the default stays, as it reproduces the goldens. On the DiT
-  step it cuts the self attention (12.2 to 10.4 s, #1062) but not the
-  whole step (one run each).
+- What `LOCUS_CPU_FAST=1` used to switch on this host is the default
+  now: the polynomial-exp softmax and SiLU (#1251; prefill 1 to 2%
+  faster, and the DiT step's self attention 12.2 to 10.4 s, #1062) and
+  llama.cpp's AVX Q4_K / Q6_K rows for one token (#1252; Llama 3.2 1B
+  Q4_K_M decode 9% faster through `forward()`). The flag has nothing
+  left to switch here.
 - Vulkan on this card has 2 GB of device memory and no host import:
   an MoE whose experts do not fit routes on the host and runs the
   picked experts on the CPU (i#1174), the rest on the GPU. Qwen1.5-MoE

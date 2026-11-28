@@ -1823,11 +1823,15 @@ TEST_CASE("an expert server's batched call gives its single calls' bits",
     }
 }
 
-TEST_CASE("expert_out_batch gives expert_out's bits on Qwen1.5-MoE",
+TEST_CASE("expert_out_batch tracks expert_out on Qwen1.5-MoE",
           "[moe][pipeline][qwen]") {
     // The real quant types (Q4_K gate and up, Q8_0 down, 1408 wide), in
-    // both activation modes: a batched call's reply must be the bits of
-    // single calls, so an expert host on either keeps the owner's sum.
+    // both activation modes: a batched call's reply tracks single calls.
+    // Not bit for bit (DESIGN 16): on AVX one token takes llama.cpp's
+    // Q4_K / Q6_K rows and a batch the sse4 order (i#1244). An expert
+    // host still gives the owner its own bits, since a call has the same
+    // shape on both ("a forward with remote experts is one process's
+    // bits").
     const std::string path = std::string(LOCUS_SOURCE_DIR) +
                              "/tests/models/Qwen1.5-MoE-A2.7B.Q4_K_M.gguf";
     if (!std::filesystem::exists(path)) {
@@ -1854,8 +1858,10 @@ TEST_CASE("expert_out_batch gives expert_out's bits on Qwen1.5-MoE",
                     INFO("q8 " << q8 << " layer " << layer << " expert " << e
                                << " row " << q);
                     model.expert_out(layer, e, {xs.data() + q * E, E}, d, ws);
-                    CHECK(std::memcmp(d.data(), ds.data() + q * E,
-                                      E * sizeof(float)) == 0);
+                    for (std::uint32_t j = 0; j < E; ++j) {
+                        CHECK(ds[std::size_t{q} * E + j] ==
+                              Catch::Approx(d[j]).epsilon(1e-3).margin(1e-4));
+                    }
                 }
             }
         }

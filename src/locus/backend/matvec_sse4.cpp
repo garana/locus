@@ -16,7 +16,6 @@
 #include "iq_grids.h"
 
 namespace locus::backend {
-bool cpu_fast();  // cpu_ops.cpp: LOCUS_CPU_FAST is set
 // matvec_sse4_avx.cpp compiles this file again with AVX enabled, into
 // sse4_avx:: (variants.hpp).
 #if defined(LOCUS_SSE4_AVX_VARIANT)
@@ -2588,9 +2587,10 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
         return;
     }
 #if defined(LOCUS_SSE4_AVX_VARIANT)
-    // i#801: LOCUS_CPU_FAST takes llama.cpp's Q4_K / Q6_K rows (another
-    // float order), before the default path's buffers are allocated.
-    if (cpu_fast() && self::matvec_q8k_llama_avx(w, x, out)) {
+    // i#801, i#1244: one token takes llama.cpp's Q4_K / Q6_K rows (its
+    // float order; Llama 3.2 1B Q4_K_M decode 9% faster on an i5-2400),
+    // before the default path's buffers are allocated.
+    if (self::matvec_q8k_llama_avx(w, x, out)) {
         return;
     }
 #endif
@@ -2617,11 +2617,76 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
     }
 }
 
-void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
-                           std::span<float> out_batch, std::uint32_t n) {
+namespace {
+
+/** Whether a path quantizes to Q8_0 blocks of 32 (else Q8_K). */
+bool block32_path(Q8Path p) {
+    return p == Q8Path::kBlock32 || p == Q8Path::kBlock32Nib ||
+           p == Q8Path::kBlock32Q5;
+}
+
+}  // namespace
+
+bool q8k_batch_size_sse4(const Mat& w, std::uint32_t n, QuantBatch& b) {
     const std::size_t cols = w.cols;
     const Q8Path path = q8_path(w.type, cols);
     if (path == Q8Path::kOther) {
+        return false;
+    }
+    b.n = n;
+    if (block32_path(path)) {
+        b.d.resize(cols / 32 * n);
+        b.qs.resize(cols * n);
+        b.bsums.clear();
+        b.q6off.clear();
+        return true;
+    }
+    const std::size_t nb = cols / 256;
+    b.d.resize(nb * n);
+    b.qs.resize(cols * n);
+    b.bsums.resize(nb * 16 * n);
+    b.q6off.resize(w.type == gguf::TensorType::kQ6_K ? nb * 128 * n : 0);
+    return true;
+}
+
+void q8k_batch_quantize_sse4(const Mat& w, std::span<const float> x_batch,
+                             std::uint32_t t0, std::uint32_t t1,
+                             QuantBatch& b) {
+    const std::size_t cols = w.cols;
+    const Q8Path path = q8_path(w.type, cols);
+    if (block32_path(path)) {
+        const std::size_t nb = cols / 32;
+        for (std::uint32_t t = t0; t < t1; ++t) {
+            quantize_activation_q8_0(x_batch.subspan(t * cols, cols),
+                                     b.d.data() + t * nb,
+                                     b.qs.data() + t * cols);
+        }
+        return;
+    }
+    const std::size_t nb = cols / 256;
+    // Q2_K, Q3_K and the IQ types read the plain order; Q4_K..Q6_K the
+    // lane_pairs_mask one.
+    const bool shuffle =
+        path == Q8Path::kK && w.type != gguf::TensorType::kQ3_K;
+    const bool q6k = w.type == gguf::TensorType::kQ6_K;
+    for (std::uint32_t t = t0; t < t1; ++t) {
+        quantize_q8k_sse4(x_batch.subspan(t * cols, cols), shuffle,
+                          b.d.data() + t * nb, b.qs.data() + t * cols,
+                          b.bsums.data() + t * nb * 16);
+        // Q6_K's offset terms (32 * the q8 pair sums) depend on the
+        // token alone: taken once per token, not once per row and group.
+        if (q6k) {
+            q6_k_offsets_sse4(b.qs.data() + t * cols, nb,
+                              b.q6off.data() + t * nb * 128);
+        }
+    }
+}
+
+void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
+                           std::span<float> out_batch, std::uint32_t n) {
+    const std::size_t cols = w.cols;
+    thread_local QuantBatch b;
+    if (!self::q8k_batch_size_sse4(w, n, b)) {
         // Other types: n per-token calls, scattered row-major.
         thread_local std::vector<float> tmp;
         tmp.resize(w.rows);
@@ -2633,27 +2698,29 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
         }
         return;
     }
-    // Each token quantized once; then each weight row is dotted with a
-    // tile of tokens while it stays in cache, the tile sized so its
-    // quantized activations stay in L2 (about 96 KB). Every (row,
-    // token) runs the per-token kernel, so the bits match it.
+    self::q8k_batch_quantize_sse4(w, x_batch, 0, n, b);
+    self::matvec_q8k_batch_pre_sse4(w, b, out_batch, n);
+}
+
+void matvec_q8k_batch_pre_sse4(const Mat& w, const QuantBatch& b,
+                               std::span<float> out_batch, std::uint32_t n) {
+    const std::size_t cols = w.cols;
+    const Q8Path path = q8_path(w.type, cols);
+    // Each weight row is dotted with a tile of tokens while it stays in
+    // cache, the tile sized so its quantized activations stay in L2
+    // (about 96 KB). Every (row, token) runs the per-token kernel, so
+    // the bits match it.
     const std::uint32_t tile = static_cast<std::uint32_t>(
         std::max<std::size_t>(1, (std::size_t{96} << 10) / cols));
     const std::size_t row_bytes = mat_row_bytes(w);
     if (path == Q8Path::kBlock32Nib || path == Q8Path::kBlock32Q5) {
-        // Q4_0 / IQ4_NL / Q5_0: each token quantized once, then each
-        // row over a tile of tokens while it is in cache, four tokens a
-        // decoded block (row_block32_xt4_sse4), the rest one by one.
+        // Q4_0 / IQ4_NL / Q5_0: each row over a tile of tokens while it
+        // is in cache, four tokens a decoded block
+        // (row_block32_xt4_sse4), the rest one by one.
         const bool q5 = path == Q8Path::kBlock32Q5;
         const std::size_t nb = cols / 32;
-        thread_local std::vector<float> xd;
-        thread_local std::vector<std::int8_t> xq;
-        xd.resize(nb * n);
-        xq.resize(cols * n);
-        for (std::uint32_t t = 0; t < n; ++t) {
-            quantize_activation_q8_0(x_batch.subspan(t * cols, cols),
-                                     xd.data() + t * nb, xq.data() + t * cols);
-        }
+        const std::vector<float>& xd = b.d;
+        const std::vector<std::int8_t>& xq = b.qs;
         const bool iq4nl = w.type == gguf::TensorType::kIQ4_NL;
         for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
             const std::uint32_t t1 = std::min(n, t0 + tile);
@@ -2690,14 +2757,8 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
     }
     if (path == Q8Path::kBlock32) {
         const std::size_t nb = cols / 32;
-        thread_local std::vector<float> xd;
-        thread_local std::vector<std::int8_t> xq;
-        xd.resize(nb * n);
-        xq.resize(cols * n);
-        for (std::uint32_t t = 0; t < n; ++t) {
-            quantize_activation_q8_0(x_batch.subspan(t * cols, cols),
-                                     xd.data() + t * nb, xq.data() + t * cols);
-        }
+        const std::vector<float>& xd = b.d;
+        const std::vector<std::int8_t>& xq = b.qs;
         for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
             const std::uint32_t t1 = std::min(n, t0 + tile);
             for (std::uint32_t r = 0; r < w.rows; ++r) {
@@ -2723,34 +2784,12 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
         return;
     }
     const std::size_t nb = cols / 256;
-    thread_local std::vector<float> hd;
-    thread_local std::vector<std::int8_t> hqs;
-    thread_local std::vector<std::int16_t> hbs;
-    hd.resize(nb * n);
-    hqs.resize(cols * n);
-    hbs.resize(nb * 16 * n);
-    const bool shuffle =
-        path == Q8Path::kK && w.type != gguf::TensorType::kQ3_K;
     const bool q4k = w.type == gguf::TensorType::kQ4_K;
     const bool q6k = w.type == gguf::TensorType::kQ6_K;
-    // Q6_K's offset terms (32 * the q8 pair sums) depend on the token
-    // alone: taken once per token here, not once per row and group
-    // (i#1198). The same integers, so the same bits.
-    thread_local std::vector<std::int16_t> hq6;
-    hq6.resize(q6k ? nb * 128 * n : 0);
-    for (std::uint32_t t = 0; t < n; ++t) {
-        quantize_q8k_sse4(x_batch.subspan(t * cols, cols), shuffle,
-                          hd.data() + t * nb, hqs.data() + t * cols,
-                          hbs.data() + t * nb * 16);
-        if (q6k) {
-            q6_k_offsets_sse4(hqs.data() + t * cols, nb,
-                              hq6.data() + t * nb * 128);
-        }
-    }
     const auto act = [&](std::uint32_t t) {
-        return Q8kAct{hd.data() + t * nb, hqs.data() + t * cols,
-                      hbs.data() + t * nb * 16,
-                      q6k ? hq6.data() + t * nb * 128 : nullptr};
+        return Q8kAct{b.d.data() + t * nb, b.qs.data() + t * cols,
+                      b.bsums.data() + t * nb * 16,
+                      q6k ? b.q6off.data() + t * nb * 128 : nullptr};
     };
     for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
         const std::uint32_t t1 = std::min(n, t0 + tile);

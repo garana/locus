@@ -310,9 +310,12 @@ class TransformerModel {
      * Picks this model's backend and uses it (i#867). An explicit
      * choice (--backend, else LOCUS_BACKEND) is resolve_backend's. The
      * default: on a host with Metal, Metal when its whole-token forward
-     * takes this model with a cache of kv_type (metal_forward declines
-     * a cache that is not f32), else Vulkan where it is usable (not Metal's
-     * per-op path), else best_backend(); elsewhere best_backend().
+     * takes this model with a cache of kv_type (metal_forward takes
+     * f32 and f16), else Vulkan where it is usable (not Metal's
+     * per-op path), else best_backend(); on a host with a usable CUDA
+     * device, CUDA when cuda_forward takes this model with a cache of
+     * kv_type (f32 only, its weights within the pool's budget: i#1253),
+     * else best_backend(); elsewhere best_backend().
      *
      * @param choice The --backend value, empty for none.
      * @param kv_type The KV cache type the model will run with.

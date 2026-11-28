@@ -4,10 +4,13 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "json.hpp"
+#include "locus/backend/metal/context.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
@@ -144,13 +147,19 @@ TEST_CASE("pixart pipeline draws the reference image",
     req.prompt = "A small red apple on a wooden table, soft morning light.";
     req.steps = 8;
     const auto x = read_f32(kDir + "golden/pixart/dit_in.f32");
-    // The server's choice: the GPU when the Vulkan device imports host
-    // memory (the per-stage tests cover the CPU too).
+    // The server's choice (pixart_engine in server.cpp): T5 and the VAE
+    // on the GPU when the Vulkan device imports host memory, and the DiT
+    // on Metal where it is usable and LOCUS_PIXART_METAL is not 0
+    // (i#1057), else as the rest (the per-stage tests cover the CPU too).
     const bool gpu = locus::backend::vulkan_imports_host_memory();
-    const auto& op = gpu ? locus::backend::vulkan_image_ops()
-                         : locus::backend::best_backend().ops;
+    const auto& rest = gpu ? locus::backend::vulkan_image_ops()
+                           : locus::backend::best_backend().ops;
+    const char* pm = std::getenv("LOCUS_PIXART_METAL");
+    const bool metal = (pm == nullptr || std::string_view(pm) != "0") &&
+                       locus::backend::metal::Context::usable();
+    const auto& op = metal ? locus::backend::metal::image_ops() : rest;
     PixArtPipeline::Timing tm;
-    const auto img = pipe->generate_from(x, req, op, {}, &tm);
+    const auto img = pipe->generate_from(x, req, op, {}, &tm, &rest);
     REQUIRE(img.size() == std::size_t{3} * 512 * 512);
     const auto rgb = locus::image::SdVaeDecoder::to_rgb8(img, 512, 512);
     const auto png = locus::image::encode_png(rgb, 512, 512);

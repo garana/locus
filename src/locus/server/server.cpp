@@ -30,6 +30,8 @@
 #include "locus/http/loop_server.hpp"
 #include "locus/backend/fallbacks.hpp"
 #include "locus/backend/gpu_metrics.hpp"
+#include "locus/backend/metal/context.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/image/classifier.hpp"
@@ -120,6 +122,38 @@ EngineChoice diffusion_engine() {
     }
     const backend::Backend& cpu = backend::best_backend();
     return {cpu.name, &cpu.ops};
+}
+
+/** FLUX.1's engine (schnell, dev, Kontext): the Metal image ops where a
+ *  Metal device is usable (i#1057): metal::Seq runs a whole DiT step,
+ *  and gives the device lock up between batches, so Metal text decode
+ *  waits at most one block. M4 Max, Q8_0 DiT step, Metal against
+ *  Vulkan: 512 px 2.8 s against 4.1 s, 1024 px 10.7 s against 14.1 s.
+ *  LOCUS_FLUX_METAL=0, or no Metal device: diffusion_engine(). */
+EngineChoice flux_engine() {
+    static const bool on = [] {
+        const char* e = std::getenv("LOCUS_FLUX_METAL");
+        return e == nullptr || std::string_view(e) != "0";
+    }();
+    if (on && backend::metal::Context::usable()) {
+        return {"metal", &backend::metal::image_ops()};
+    }
+    return diffusion_engine();
+}
+
+/** PixArt's DiT engine: as flux_engine (i#1057), the Metal image ops
+ *  where a Metal device is usable; T5 and the VAE stay on
+ *  diffusion_engine(). LOCUS_PIXART_METAL=0 keeps diffusion_engine()
+ *  for the DiT too. */
+EngineChoice pixart_engine() {
+    static const bool on = [] {
+        const char* e = std::getenv("LOCUS_PIXART_METAL");
+        return e == nullptr || std::string_view(e) != "0";
+    }();
+    if (on && backend::metal::Context::usable()) {
+        return {"metal", &backend::metal::image_ops()};
+    }
+    return diffusion_engine();
 }
 
 /** Janus's vision tower: the GPU as for the diffusion models; else the
@@ -1541,6 +1575,7 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
     } else if (be == "cuda") {
         devices_.push_back({"cuda", backend::cuda_device_name()});
     }
+    // FLUX on Metal still runs CLIP, T5 and the VAE there.
     if ((pixart_ || flux_ || qwen_edit_ || qwen_image_) && be != "vulkan" &&
         diffusion_engine().name == "vulkan") {
         devices_.push_back({"vulkan", backend::vulkan_device_name()});
@@ -1630,9 +1665,20 @@ std::vector<std::pair<std::string, std::string>> OpenAiServer::engines()
         out.emplace_back("image input (Qwen2.5-VL)",
                          engine_label(active.name));
     }
-    if (flux_ || pixart_) {
-        out.emplace_back(flux_ ? "images (FLUX.1)" : "images (PixArt)",
-                         diffusion);
+    const std::string flux =
+        flux_engine().name == diffusion_engine().name
+            ? diffusion
+            : engine_label(flux_engine().name) +
+                  "; CLIP, T5 and the VAE on " + diffusion;
+    if (flux_) {
+        out.emplace_back("images (FLUX.1)", flux);
+    } else if (pixart_) {
+        out.emplace_back(
+            "images (PixArt)",
+            pixart_engine().name == diffusion_engine().name
+                ? diffusion
+                : engine_label(pixart_engine().name) +
+                      "; T5 and the VAE on " + diffusion);
     }
     if (qwen_image_) {
         out.emplace_back("images (Qwen-Image)",
@@ -1642,7 +1688,7 @@ std::vector<std::pair<std::string, std::string>> OpenAiServer::engines()
         out.emplace_back("image edits (Qwen-Image-Edit)",
                          diffusion + "; its language model on the CPU");
     } else if (flux_ && flux_->may_edit()) {
-        out.emplace_back("image edits (FLUX.1 Kontext)", diffusion);
+        out.emplace_back("image edits (FLUX.1 Kontext)", flux);
     }
     if (ltxv_) {
         out.emplace_back("video (LTX-Video)", diffusion);
@@ -4014,14 +4060,16 @@ void OpenAiServer::install_routes() {
                 // A discrete GPU would copy 12 GB of weights into the
                 // pool, evicting the LLM's. With these ops the DiT's
                 // attention and the VAE's convolutions run on the GPU
-                // too; T5's attention stays on the CPU.
-                const auto& op = *diffusion_engine().ops;
+                // too; T5's attention stays on the CPU. On Apple the
+                // DiT takes Metal (pixart_engine), the rest these.
+                const auto& op = *pixart_engine().ops;
                 image::PixArtPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {
                     const auto lk = try_image_lock(image_mu_, res, 60);
                     if (!lk.owns_lock()) return;
-                    rgb = pixart_->generate(p, op, ctx.client_alive, &took);
+                    rgb = pixart_->generate(p, op, ctx.client_alive, &took,
+                                            diffusion_engine().ops);
                 }
                 if (rgb.empty()) {
                     res.status = 499;  // the client went away
@@ -4139,13 +4187,14 @@ void OpenAiServer::install_routes() {
                     p.lora = &lora_set;
                 }
                 p.seed = read_seed(body);
-                // With host-memory import (as for PixArt) the DiT runs
-                // each step on the GPU, activations resident
-                // (FluxDit::forward_vulkan); CLIP, T5 and the VAE run
-                // per op. Without it, the CPU backend. A GPU step holds
-                // the Vulkan lock for its whole length, so text
-                // generation on the same GPU waits for it.
-                const auto& op = *diffusion_engine().ops;
+                // On Metal (flux_engine) or with Vulkan host-memory
+                // import, the DiT runs each step on the GPU, activations
+                // resident; CLIP, T5 and the VAE run per op on
+                // diffusion_engine()'s ops. Else the CPU backend. A
+                // Vulkan step holds the Vulkan lock for its whole
+                // length, so text generation on the same GPU waits for
+                // it; a Metal step gives the lock up between batches.
+                const auto& op = *flux_engine().ops;
                 if (edit) {
                     // FluxKontextPipeline's size rule: the aspect at
                     // max_area pixels, 1024 x 1024 by default; a given
@@ -4164,7 +4213,8 @@ void OpenAiServer::install_routes() {
                 {
                     const auto lk = try_image_lock(image_mu_, res, 60);
                     if (!lk.owns_lock()) return;
-                    rgb = flux_->generate(p, op, ctx.client_alive, &took);
+                    rgb = flux_->generate(p, op, ctx.client_alive, &took,
+                                          diffusion_engine().ops);
                 }
                 if (rgb.empty()) {
                     res.status = 499;  // the client went away

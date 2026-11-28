@@ -117,11 +117,14 @@ model the server loaded:
 | FLUX.1       | `--image-model <dir>`         | WxH (*)             | `steps` (28, 4 for schnell; up to 100), `guidance_scale` (3.5), `max_sequence_length` (512), `seed`, `lora`, `lora_scale` |
 
 (*) `size` is any "WxH" with both sides multiples of 16, up to 2048 a
-side and 1024 x 1024 pixels in all; the default is 1024x1024. On a
-Vulkan GPU with unified memory the DiT runs each step on the GPU: on
-an M4 Max, a 256x256 image with 16 steps takes about 35 s, and one
-step at 1024x1024 about 17 s; while a step runs, text generation on
-the same GPU waits for it. Elsewhere FLUX runs on the CPU, minutes
+side and 1024 x 1024 pixels in all; the default is 1024x1024. On
+Apple the DiT runs each step on Metal (CLIP, T5 and the VAE on
+Vulkan; `LOCUS_FLUX_METAL=0` keeps the DiT on Vulkan): on an M4 Max a
+256x256 image with 4 steps takes about 11 s, and one step at
+1024x1024 about 13 s; text generation on Metal waits at most one
+transformer block. On another Vulkan GPU with unified memory the DiT
+runs each step there, and text generation on the same GPU waits for
+the whole step. Elsewhere FLUX runs on the CPU, minutes
 per image even at 256 (the same 256x256 request takes about 490 s on
 an M2 Pro's CPU).
 

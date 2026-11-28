@@ -149,6 +149,9 @@ int main(int argc, char** argv) {
         std::string why;
         const auto& backend =
             model.use_backend_for(args.choice, args.kv_type, &why);
+        if (!args.kv_type_set) {
+            args.kv_type = locus_tools::default_kv_type(backend.name);
+        }
         locus::backend::vulkan_set_prefill_f16(args.prefill_f16);
         auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
         auto& tok = *tok_ptr;

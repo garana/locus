@@ -137,6 +137,9 @@ class FluxPipeline {
      * @param op The backend ops (a CPU backend).
      * @param alive Polled before each transformer call; false cancels.
      * @param timing Filled when not null.
+     * @param enc_op The ops for CLIP, T5 and the VAE when not null (else
+     *     op): the DiT on Metal and these on Vulkan or the CPU, since
+     *     Metal runs T5's BF16 batches on the scalar CPU (i#1057).
      * @returns width * height * 3 bytes, row-major RGB, or empty when
      *     cancelled.
      * @throws std::invalid_argument on a bad request.
@@ -144,7 +147,9 @@ class FluxPipeline {
     std::vector<std::uint8_t> generate(const Request& req,
                                        const backend::Ops& op,
                                        const std::function<bool()>& alive,
-                                       Timing* timing = nullptr) const;
+                                       Timing* timing = nullptr,
+                                       const backend::Ops* enc_op = nullptr)
+        const;
 
     /**
      * The loop and the decode from a given start latent (for tests: the
@@ -154,11 +159,11 @@ class FluxPipeline {
      * @returns [3][height][width] in about [-1, 1], or empty when
      *     cancelled.
      */
-    std::vector<float> generate_from(std::span<const float> latent,
-                                     const Request& req,
-                                     const backend::Ops& op,
-                                     const std::function<bool()>& alive,
-                                     Timing* timing = nullptr) const;
+    std::vector<float> generate_from(
+        std::span<const float> latent, const Request& req,
+        const backend::Ops& op, const std::function<bool()>& alive,
+        Timing* timing = nullptr,
+        const backend::Ops* enc_op = nullptr) const;
 
     /**
      * The pipeline's T5 ids: the prompt with </s>, truncated to
