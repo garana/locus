@@ -2131,9 +2131,10 @@ struct BlockQ8_0Act {
 /**
  * One block of ggml's quantize_row_q8_0 (its NEON form): d = amax / 127
  * rounded to f16 into *d_out; the 32 quants round x / d (with 1 / d from
- * the unrounded d) to nearest even into qs. A NaN product quantizes to
- * 0 (converting it to an integer is undefined; arm64 gives 0, x86
- * INT_MIN), as the NEON path; a NaN x is skipped by the max.
+ * the unrounded d) to nearest even into qs. A non-finite product (NaN,
+ * or +-inf when 1 / d overflows for an amax under about 3.7e-37)
+ * quantizes to 0 on every path (converting it to an integer is
+ * undefined, i#1269); a NaN x is skipped by the max.
  *
  * On x86-64 the block runs in SSE2 (i#1198: the scalar form was 8.6% of
  * a CPU prefill): _mm_max_ps with the running max second skips a NaN as
@@ -2185,10 +2186,14 @@ inline void quantize_block32_act(const float* xb, float* d_out,
                          _mm_packus_epi16(a, b));
     }
 #else
+    // A non-finite product (NaN, or +-inf when 1 / d overflows) is 0, as
+    // the SSE2 form's masked low byte gives: converting inf to an
+    // integer is undefined (i#1269).
     for (int j = 0; j < 32; ++j) {
         const float v = xb[j] * id;
-        qs[j] = std::isnan(v) ? 0
-                              : static_cast<std::int8_t>(std::nearbyint(v));
+        qs[j] = std::isfinite(v)
+                    ? static_cast<std::int8_t>(std::nearbyint(v))
+                    : std::int8_t{0};
     }
 #endif
 }
